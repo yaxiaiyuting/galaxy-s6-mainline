@@ -305,6 +305,32 @@ adb reboot      # → loader → g9209-console.py --boot
 
 ---
 
+## 4.5 备选方案（若"运行时加载"仍 wedge，但 T0-T2 安全）
+
+zenlte 是**开机早期**加载 exynosdrm（initramfs/rc），我们是在 GNOME 跑起来后 modprobe。
+若 T0-T2 安全、T3 在 fbcon 接管时挂死（H1），生产方案改为"开机早期加载"，模拟 zenlte：
+
+1. 先把模块装进 rootfs（rootfs 在 /dev/sda20，持久）：
+   ```sh
+   # host → phone
+   python3 bringup/df_send_file.py linux-6.6/drivers/gpu/drm/exynos/exynosdrm.ko /tmp/exynosdrm.ko
+   # phone
+   mkdir -p /lib/modules/6.6.0-dirty/extra
+   cp /tmp/exynosdrm.ko /lib/modules/6.6.0-dirty/extra/
+   depmod -a
+   ```
+2. `/etc/modprobe.d/exynosdrm.conf`（参数按 T5/T7 验证过的组合先写好）：
+   ```
+   options exynosdrm aperture=1 fbdev=1 clear=0 sysmmu=1 timing=1 clockdiv=0 commit=1
+   ```
+3. `/etc/modules-load.d/exynosdrm.conf`：`exynosdrm`
+   （systemd-modules-load.service 在 sysinit 阶段、gdm 之前加载 ⇒ 无 mutter 占着 simpledrm，
+   fbcon 接管时序与 zenlte 一致）
+4. 若早期加载仍有问题，退回 `aperture=0`（保留 simpledrm，仅保留 exynos card 备用）或删掉两个配置文件回滚。
+
+> 注意：`CONFIG_DRM_EXYNOS=y`（内置）已实测会在 `exynos_drm_init` 卡死（p220），
+> **必须保持 =m + modules-load.d 早期加载**，不要改回 =y。
+
 ## 5. 风险与回滚
 
 - 每次 wedge 需要物理复位（可能打断用户使用）→ 测试按 T0→T7 由安全到危险排序，**绝不跳级**。

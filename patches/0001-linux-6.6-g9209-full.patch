@@ -595,10 +595,10 @@ index 000000000..e112fb2a2
 +};
 diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
 new file mode 100644
-index 000000000..2185346ee
+index 000000000..011f04a00
 --- /dev/null
 +++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
-@@ -0,0 +1,964 @@
+@@ -0,0 +1,1321 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Samsung Galaxy S6 (SM-G9209, zeroflte, Exynos 7420) — mainline Linux 6.6
@@ -615,6 +615,7 @@ index 000000000..2185346ee
 +#include <dt-bindings/pinctrl/samsung.h>
 +#include <dt-bindings/interrupt-controller/irq.h>
 +#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/linux-event-codes.h>
 +#include "exynos7.dtsi"
 +
 +/ {
@@ -854,6 +855,134 @@ index 000000000..2185346ee
 +	memory@40000000 {
 +		device_type = "memory";
 +		reg = <0x0 0x40000000 0x0 0xc0000000>;
++	};
++};
++
++/*
++ * DSH 2026-10-20: 物理键 —— POWER / VOL+ / VOL- / HOME（来自 vendor `gpio_keys`）
++ *
++ * vendor 原始定义（ctc_stock.dts:7746-7786）：
++ *   button@1 KEY_POWER      gpios = <&gpa2 2 0x0f>   ← phandle 0x24 = gpa2
++ *   button@2 KEY_VOLUMEDOWN gpios = <&gpa0 3 0x0f>   ← phandle 0x41 = gpa0
++ *   button@3 KEY_VOLUMEUP   gpios = <&gpa0 2 0x0f>
++ *   button@4 KEY_HOMEPAGE   gpios = <&gpa0 5 0x0f>
++ *
++ * BACK / RECENT 两个电容键**不在这里**：它们由独立的 Cypress
++ * CY8CMBR31x5 触摸键控制器上报（i2c 0x20 / IRQ gpa0-0），节点见下面的
++ * "i2c-touchkey"。stmfts 触摸屏本身不上报按键 —— vendor STM 驱动只有
++ * 在 DTS 里存在 `stm,num_touchkey` 属性时才启用按键功能，而
++ * ctc_stock.dts / exynos7420-zeroflte_*.dts 的 touchscreen 节点都没有它。
++ */
++/ {
++	gpio-keys {
++		compatible = "gpio-keys";
++		pinctrl-names = "default";
++		pinctrl-0 = <&key_power_pins>, <&key_volup_pins>,
++			    <&key_voldown_pins>, <&key_home_pins>;
++
++		power_key: key-power {
++			label = "Power";
++			gpios = <&gpa2 2 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_POWER>;
++			wakeup-source;
++		};
++
++		volup_key: key-volup {
++			label = "Volume Up";
++			gpios = <&gpa0 2 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_VOLUMEUP>;
++		};
++
++		voldown_key: key-voldown {
++			label = "Volume Down";
++			gpios = <&gpa0 3 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_VOLUMEDOWN>;
++		};
++
++		home_key: key-home {
++			label = "Home";
++			gpios = <&gpa0 5 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_HOMEPAGE>;
++			wakeup-source;
++		};
++	};
++};
++
++&pinctrl_alive {
++	key_power_pins: key-power-pins {
++		samsung,pins = "gpa2-2";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
++	};
++
++	key_volup_pins: key-volup-pins {
++		samsung,pins = "gpa0-2";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
++	};
++
++	key_voldown_pins: key-voldown-pins {
++		samsung,pins = "gpa0-3";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
++	};
++
++	key_home_pins: key-home-pins {
++		samsung,pins = "gpa0-5";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
++	};
++};
++
++/*
++ * ==========================================================================
++ * DSH 2026-10-20: 电容键 BACK / RECENT —— Cypress CY8CMBR31x5
++ * ==========================================================================
++ *
++ * 硬件事实（证据见 ctc_stock.dts:4875-4891、
++ * exynos7420-zeroflte_chn_01.dts:915-936、
++ * vendor 驱动 drivers/input/keyboard/cypress_20075/cypress-touchkey.c:
++ *   73-74、1071-1089、2430-2445、2573-2610）：
++ *
++ *   - 与 STM 触摸屏相互独立的触摸键 IC，I2C 地址 0x20。
++ *   - 原厂挂在 hsi2c3@14E70000（SPI 460）：SDA=gpd1-2，SCL=gpd1-3。
++ *     该控制器的时钟门控在 CMU_PERIC1(0x14C80000，属于死区
++ *     0x14C00000-0x14CE0000)，绝不能碰；这里用 i2c-gpio 在同两根线上
++ *     软件模拟 I2C。gpd1 所在的 pinctrl_bus0(0x13470000) 已实测可访问
++ *     （现有 s2mpb02/s2mps15 的 i2c-gpio 就在同一 bank 的 gpg3 上工作）。
++ *   - IRQ = gpa0-0，低有效、下降沿（vendor request_threaded_irq 用
++ *     IRQF_TRIGGER_FALLING）。
++ *   - 核心电源 vtouch_3.3v = S2MPS15 LDO21。原厂 DTS 标
++ *     `regulator-boot-on`，vendor 驱动 `cypress,boot-on-ldo = "true"`
++ *     时也**不会**去 enable 它 —— 即 S-Boot 已经打开并移交给内核。
++ *     本 DTS 不声明该 LDO：未在 DT 中声明的 regulator 其 constraints
++ *     为空，regulator core 的 late cleanup 会跳过它，不会被关掉。
++ *   - 状态寄存器 0x03：每个键 2 bit，0b01=按下，0b10=抬起
++ *     （vendor 驱动 touchkey_keycode[] = { 0, KEY_RECENT, KEY_BACK }，
++ *      即 bit[1:0]=RECENT、bit[3:2]=BACK）。
++ *     主线没有 Android 专用的 KEY_RECENT(254)，用语义等价的
++ *     KEY_APPSELECT(580) 代替。
++ *   - 固件（cypress/cypress_zerof.fw）烧在 IC 内部 flash，原厂驱动只在
++ *     版本不匹配时才走 ISP 重刷；主线驱动不刷固件，只读状态寄存器。
++ * ==========================================================================
++ */
++/ {
++	i2c_touchkey: i2c-touchkey {
++		compatible = "i2c-gpio";
++		#address-cells = <1>;
++		#size-cells = <0>;
++		sda-gpios = <&gpd1 2 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpd1 3 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		i2c-gpio,timeout-ms = <100>;
++
++		touchkey@20 {
++			compatible = "cypress,mbr31x5-touchkey";
++			reg = <0x20>;
++			interrupt-parent = <&gpa0>;
++			interrupts = <0 IRQ_TYPE_EDGE_FALLING>;
++			linux,keycodes = <KEY_APPSELECT KEY_BACK>;
++		};
 +	};
 +};
 +
@@ -1563,6 +1692,234 @@ index 000000000..2185346ee
 +	};
 +};
 +#endif /* DSH_ENABLE_PCIE_WIFI */
++
++/*
++ * ==========================================================================
++ * 蓝牙 (Bluetooth) —— BCM4358 combo 芯片，HCI 走 UART4 (0x11460000)
++ * ==========================================================================
++ *
++ * 硬件接法（全部来自 vendor 3.10 树，详见 文档/05-专项/蓝牙移植-20261020.md）：
++ *
++ *   arch/arm64/boot/dts/exynos7420-zero_common.dtsi:1771
++ *     bluetooth {
++ *         compatible = "broadcom,bcm4358";
++ *         gpios = <&gpf4 1 0>, <&gpr3 4 0>, <&gpa2 1 0xf>;
++ *     };
++ *   三个 GPIO 依次是 BT_EN / BT_WAKE / BT_HOST_WAKE。
++ *
++ *   arch/arm64/boot/dts/exynos7420-zero_common.dtsi:129
++ *     serial_4: uart@11460000 { pinctrl-0 = <&uart_bt_active ...>; status = "okay"; };
++ *
++ *   arch/arm64/boot/dts/exynos7420-pinctrl.dtsi:192
++ *     uart_bt_active: samsung,pins = "gpz1-3", "gpz1-2", "gpz1-1", "gpz1-0";
++ *                    samsung,pin-function = <2>;      即 function 2 = UART
++ *
++ * vendor 内核在**本机**跑出来的实测日志（G9209-fix/evidence-stuck-20260929-223950/
++ * last_kmsg.log）逐条对上了：
++ *   1099: 11460000.uart: ttySAC4 at MMIO 0x11460000 (irq = 123) is a S3C6400/10
++ *   1069: dma-pl330 11420000.adma: Loaded driver for PL330 DMAC-3412784
++ *   1505: [BT] bcm4358_bluetooth_probe.
++ *   1506: of_get_named_gpio_flags exited with status 142   ← gpf4-1  (BT_EN)
++ *   1507: of_get_named_gpio_flags exited with status 219   ← gpr3-4  (BT_WAKE)
++ *   1508: of_get_named_gpio_flags exited with status 17    ← gpa2-1  (BT_HOST_WAKE)
++ *   （142/219/17 按 vendor pinctrl-exynos.c 的 bank 表算出来正好是上述三个脚，
++ *     见 drivers/pinctrl/pinctrl-exynos.c:1315-1390）
++ *
++ * 三个 GPIO 所在 pinctrl 块都已经是"硬件实测可访问"的（见本文件 UFS 一节）：
++ *   gpf4 = pinctrl_bus1  (0x14870000)   实测可读 ✓
++ *   gpr3 = pinctrl_fsys1 (0x15690000)   实测可读 ✓
++ *   gpa2 = pinctrl_alive (0x10580000)   电源键 gpa2-2 已在用 ✓
++ *
++ * --------------------------------------------------------------------------
++ * ⚠ 唯一未经实测的地址：CMU_AUD (0x114C0000)
++ * --------------------------------------------------------------------------
++ * BT UART 的 PCLK/SCLK 来自 CMU_AUD：
++ *   vendor exynos7420.dtsi:604  clocks = <&clock 416>, <&clock 432>, <&clock 455>;
++ *   mainline exynos7.dtsi:354  clocks = <&cmu_aud PCLK_UART>, <&cmu_aud SCLK_UART>;
++ * 而本文件第 538 行按"所有 CMU 先禁用"的策略把 clock-controller@114c0000 关了。
++ *
++ * 0x114C0000 **不在**已知死区（0x14C00000..0x14CE0000 / 0x10570000 /
++ * 0x105D0000 / 0x13650000），但也**没有** loader 侧 mrd 实测记录。
++ * 按照"未实测地址不要从内核直接读"的约定，这里默认关闭。
++ *
++ *   ⇒ 上机前先做：uniLoader 里 `watchdog arm` 然后 `mrd 114c0000` / `mrd 11460000`
++ *   ⇒ 读得出来再把下面的 DSH_ENABLE_BT 改成 1 重新编译
++ *
++ * --------------------------------------------------------------------------
++ * 为什么走 hci_ldisc(btattach) 而不是 serdev
++ * --------------------------------------------------------------------------
++ * drivers/tty/serial/samsung_tty.c 里 grep 不到任何 serdev 代码，即这条
++ * UART 不是 serdev controller，hci_bcm 的 serdev 驱动绑不上。
++ * 只能走老的 line-discipline 路径：
++ *     btattach -B /dev/ttySAC0 -P bcm -S 115200
++ * 这条路径下 hci_bcm 的 bcm->dev 恒为 NULL（bcm_open() 找不到 bcm_device），
++ * 于是它不碰 BT_EN/IRQ（正好由下面的 gpio-hog 负责），但 bcm_setup() 仍然会
++ * 调用 btbcm_initialize() 从 /lib/firmware/brcm/ 下载 BCM4358A3 补丁。
++ */
++#define DSH_ENABLE_BT 0
++
++#if DSH_ENABLE_BT
++
++/*
++ * 只需要把 samsung_tty 的 port index 逼到 [0, CONFIG_SERIAL_SAMSUNG_UARTS) 里。
++ * 这个符号在 drivers/tty/serial/Kconfig:251 是**没有 prompt 的 int**，
++ * 没法从 .config 改成 5，所以这里用 alias 把它钉成 0（=> /dev/ttySAC0）。
++ * 注意：serial0 只是编号，物理上它仍然是 UART4 @0x11460000。
++ */
++/ {
++	aliases {
++		serial0 = &serial_4;
++	};
++};
++
++/* CMU_AUD：提供 PCLK_UART / SCLK_UART —— 见上面 ⚠ 说明，启用前必须先探测。 */
++&{/soc@0/clock-controller@114c0000} {
++	status = "okay";
++};
++
++/* BT UART 引脚 gpz1-0..3（pinctrl@114B0000 / AUD，function 2 = UART） */
++&pinctrl_aud {
++	bt_uart_bus: bt-uart-bus {
++		samsung,pins = "gpz1-3", "gpz1-2", "gpz1-1", "gpz1-0";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_2>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
++	};
++};
++
++/*
++ * BT_HOST_WAKE：gpa2-1。电气配置与 vendor 完全一致
++ * （exynos7420-pinctrl.dtsi:76：function 0 = 普通输入，pud 0 = 无上下拉）。
++ * ldisc 路径不请求中断，所以不需要 EINT；将来改 serdev 时 samsung gpio
++ * 驱动会在 request_irq 时自动把该脚切到 EINT 功能。
++ */
++&pinctrl_alive {
++	bt_host_wake: bt-host-wake {
++		samsung,pins = "gpa2-1";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_INPUT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++	};
++};
++
++/*
++ * BT_EN / BT_WAKE 用 gpio-hog 在开机时把电平定死：
++ *   BT_EN   (gpf4-1) = 高 → 给 BCM4358 上电
++ *   BT_WAKE (gpr3-4) = 低 → 主机暂不唤醒芯片
++ * 不用 regulator-fixed，是因为 ldisc 路径下 hci_bcm 不会去拿 vddio/shutdown，
++ * 没有消费者的 regulator 不如 hog 直观。
++ * 副作用：无法从用户态复位 BT；要强制重新上电就删掉这两段 hog，
++ * 改用 gpioset 手动拉一次 0→1（具体步骤见移植文档的"上机验证"一节）。
++ */
++&gpf4 {
++	bt-en-hog {
++		gpio-hog;
++		gpios = <1 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "bt_en";
++	};
++};
++
++&gpr3 {
++	bt-wake-hog {
++		gpio-hog;
++		gpios = <4 GPIO_ACTIVE_HIGH>;
++		output-low;
++		line-name = "bt_wake";
++	};
++};
++
++&serial_4 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&bt_uart_bus &bt_host_wake>;
++	status = "okay";
++};
++
++#endif /* DSH_ENABLE_BT */
++
++/*
++ * ==========================================================================
++ * DSH 2026-10-20: NXP PN548AD（PN66T）NFC —— SM-G9209 国行
++ *
++ * 硬件（vendor ctc_stock.dts:5323-5369 + exynos7420.dtsi:844-859 +
++ *       exynos7420-zero_common.dtsi:458-500）：
++ *   - 芯片：NXP PN66T = PN548AD + eSE（Android 原厂 HAL 日志 Product: PN66T，
++ *           FW 10.1.22；见 G9209-fix/文档/05-专项/NFC-NXP移植完成报告.md）
++ *   - 接口：I2C（不是 SPI），7bit 地址 0x2B
++ *   - 总线：hsi2c_6 @ 0x14E00000，SDA=gpj0-0，SCL=gpj0-1（GPJ0 整组引脚）
++ *   - VEN  = gpf1-5（高有效，芯片 load switch；pinctrl_alive，安全）
++ *   - FIRM = gpf5-4（固件下载模式；pinctrl_alive，安全）
++ *   - IRQ  = gpa0-6（上升沿；pinctrl_alive，安全）
++ *   - CLK_REQ = gpa2-6 —— 原厂 Exynos pn547 驱动在 CONFIG_NFC_PN547_CLK_BBCLK2=n
++ *           时根本不解析该 GPIO，芯片自带时钟，主线不需要
++ *   - I2C 1.8V = S2MPS15 LDO20 "VDD20_1P8_AP"（vendor 驱动 probe 时 enable；
++ *           上机前必须确认它已打开，见移植报告）
++ *   - eSE：独立 NXP P61，挂 SPI（gpg4-0..3）+ LDO23 "VDD_1.8V_ESE"，
++ *          与 NFC 读卡/HCE 无关，本节点不涉及，也不需要 TEE。
++ *
++ * 驱动：主线 nxp-nci（CONFIG_NFC_NXP_NCI + NFC_NXP_NCI_I2C），
++ *      compatible = "nxp,pn547", "nxp,nxp-nci-i2c"。
++ *      完全相同的接法（nfc@2b / IRQ 上升沿 / enable+firmware GPIO）已存在于
++ *      msm8916-samsung-serranove.dts，主线对该芯片有现成支持。
++ *
++ * ★★ 为什么默认 disabled（DSH_ENABLE_NFC=0）★★
++ *   GPJ0 的 pinmux/pull 寄存器在 pinctrl@14cd0000，而该块属于实测
++ *   "一读就 AXI 挂死"的死区 0x14C00000-0x14CE0000
++ *   （见 文档/05-专项/硬件实测-PERIC1不可访问-20261018.md，p117/p215 实锤）。
++ *   hsi2c_6 的时钟门控又在 CMU_PERIC1(0x14C80000)，同一死区。
++ *   ⇒ Linux 既不能把 GPJ0 复用到 hsi2c6（不能写 0x14CD0000），
++ *     也不能打开 HSI2C6 门控（不能写 0x14C80000）；
++ *   ⇒ 也不能退化成 i2c-gpio —— GPJ0 的 GPIO 寄存器同样在 0x14CD0000。
++ *   这和 MAX77843 的情况本质不同：那颗芯片用的是 gpd2（pinctrl_bus0
++ *   0x13470000，已实测可访问），所以 i2c-gpio 能救；NFC 没有这个退路。
++ *
++ *   只有下面两种前提之一成立，才能把 DSH_ENABLE_NFC 改成 1：
++ *     ① 硬件实测证明 S-Boot 已经把 GPJ0-0/1 复用成 hsi2c6(func2)，
++ *        且 PCLK_HSI2C6 门控是开的（可能性低，但必须实测，不能猜）；
++ *     ② 由 uniLoader 在跳转前替内核完成 GPJ0 pinmux + CMU_PERIC1 门控
++ *        （这超出 NFC 子代理的改动范围，需要 Lead 决策）。
++ *   打开后还必须确认 LDO20(VDD20_1P8_AP) 已上电，否则 I2C 上拉没电。
++ *   打开前务必按移植报告里的"单变量上机验证"步骤做，否则可能 AXI 挂死。
++ * ==========================================================================
++ */
++/ {
++	hsi2c6_clk: clock-hsi2c6 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <133000000>;
++		clock-output-names = "sclk_hsi2c6";
++	};
++};
++
++#define DSH_ENABLE_NFC 0
++
++&hsi2c_6 {
++	/* 固定时钟顶替 CMU_PERIC1 的 PCLK_HSI2C6：i2c-exynos5 只用
++	 * clk_get_rate() 算分频，真实门控状态取决于 S-Boot/uniLoader。 */
++	clocks = <&hsi2c6_clk>;
++	clock-names = "hsi2c";
++
++	/* GPJ0 的 pinmux 在死区 0x14CD0000：绝不能引用 hs_i2c6_bus，
++	 * 否则 pinctrl 一 probe 就挂死（与 p117 触摸同一机制）。 */
++	/delete-property/ pinctrl-names;
++	/delete-property/ pinctrl-0;
++
++	clock-frequency = <400000>;
++#if DSH_ENABLE_NFC
++	status = "okay";
++#else
++	status = "disabled";
++#endif
++
++	nfc@2b {
++		compatible = "nxp,pn547", "nxp,nxp-nci-i2c";
++		reg = <0x2b>;
++
++		interrupt-parent = <&gpa0>;
++		interrupts = <6 IRQ_TYPE_EDGE_RISING>;
++
++		enable-gpios = <&gpf1 5 GPIO_ACTIVE_HIGH>;
++		firmware-gpios = <&gpf5 4 GPIO_ACTIVE_HIGH>;
++	};
++};
 diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
 index 7b236994f..e96add776 100644
 --- a/arch/arm64/kernel/head.S
@@ -3840,6 +4197,269 @@ index e5a5b9e8b..fa0ebf85b 100644
  	priv->scl = i2c_gpio_get_desc(dev, "scl", 1, gflags);
  	if (IS_ERR(priv->scl))
  		return PTR_ERR(priv->scl);
+diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
+index 1d0c5f4c0..cac4ab120 100644
+--- a/drivers/input/keyboard/Kconfig
++++ b/drivers/input/keyboard/Kconfig
+@@ -809,4 +809,15 @@ config KEYBOARD_CYPRESS_SF
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called cypress-sf.
+ 
++config KEYBOARD_CYPRESS_MBR_TOUCHKEY
++	tristate "Cypress CY8CMBR31x5 touchkey support"
++	depends on I2C
++	help
++	  Say Y here to enable support for the Cypress CY8CMBR31x5
++	  capacitive touch key controller, used for the BACK and RECENT
++	  keys on Samsung Galaxy S6 (zeroflte) and similar Exynos boards.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called cypress-mbr-touchkey.
++
+ endif
+diff --git a/drivers/input/keyboard/Makefile b/drivers/input/keyboard/Makefile
+index aecef00c5..2ca663bf5 100644
+--- a/drivers/input/keyboard/Makefile
++++ b/drivers/input/keyboard/Makefile
+@@ -18,6 +18,7 @@ obj-$(CONFIG_KEYBOARD_CAP11XX)		+= cap11xx.o
+ obj-$(CONFIG_KEYBOARD_CLPS711X)		+= clps711x-keypad.o
+ obj-$(CONFIG_KEYBOARD_CROS_EC)		+= cros_ec_keyb.o
+ obj-$(CONFIG_KEYBOARD_CYPRESS_SF)	+= cypress-sf.o
++obj-$(CONFIG_KEYBOARD_CYPRESS_MBR_TOUCHKEY)	+= cypress-mbr-touchkey.o
+ obj-$(CONFIG_KEYBOARD_DLINK_DIR685)	+= dlink-dir685-touchkeys.o
+ obj-$(CONFIG_KEYBOARD_EP93XX)		+= ep93xx_keypad.o
+ obj-$(CONFIG_KEYBOARD_GOLDFISH_EVENTS)	+= goldfish_events.o
+diff --git a/drivers/input/keyboard/cypress-mbr-touchkey.c b/drivers/input/keyboard/cypress-mbr-touchkey.c
+new file mode 100644
+index 000000000..52751c98a
+--- /dev/null
++++ b/drivers/input/keyboard/cypress-mbr-touchkey.c
+@@ -0,0 +1,225 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Cypress CY8CMBR31x5 (MBR) capacitive touch key controller
++ *
++ * The CY8CMBR31x5 is a CapSense "MBR" controller used on several Samsung
++ * Exynos boards (e.g. Galaxy S6 "zeroflte") to report the capacitive BACK
++ * and RECENT keys.  It is a separate I2C device from the touchscreen
++ * controller and keeps its firmware in internal flash, so the host only
++ * has to read the key status register.
++ *
++ * Register 0x03 contains one two-bit field per key:
++ *
++ *   0b00 - no event
++ *   0b01 - key pressed
++ *   0b10 - key released
++ *
++ * The controller asserts its (active low) interrupt line whenever a key
++ * changes state; the register is read from the threaded interrupt handler.
++ * The bit layout matches the Samsung 3.10 driver this was ported from
++ * (drivers/input/keyboard/cypress_20075/cypress-touchkey.c).
++ */
++
++#include <linux/bits.h>
++#include <linux/device.h>
++#include <linux/i2c.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/property.h>
++#include <linux/slab.h>
++
++#define MBR_TOUCHKEY_KEYCODE_REG	0x03
++#define MBR_TOUCHKEY_FW_VER_REG		0x04
++#define MBR_TOUCHKEY_KEY_MASK		GENMASK(1, 0)
++#define MBR_TOUCHKEY_KEY_PRESS		0x01
++#define MBR_TOUCHKEY_MAX_KEYS		4
++#define MBR_TOUCHKEY_DEV_NAME		"mbr-touchkey"
++
++struct mbr_touchkey_data {
++	struct i2c_client *client;
++	struct input_dev *input;
++	u32 keycodes[MBR_TOUCHKEY_MAX_KEYS];
++	bool pressed[MBR_TOUCHKEY_MAX_KEYS];
++	int num_keycodes;
++};
++
++static irqreturn_t mbr_touchkey_irq_handler(int irq, void *dev_id)
++{
++	struct mbr_touchkey_data *touchkey = dev_id;
++	int val;
++	int i;
++
++	val = i2c_smbus_read_byte_data(touchkey->client,
++				       MBR_TOUCHKEY_KEYCODE_REG);
++	if (val < 0) {
++		dev_err_ratelimited(&touchkey->client->dev,
++				    "failed to read key status: %d\n", val);
++		return IRQ_HANDLED;
++	}
++
++	for (i = 0; i < touchkey->num_keycodes; i++) {
++		unsigned int state = (val >> (2 * i)) & MBR_TOUCHKEY_KEY_MASK;
++		bool press = state & MBR_TOUCHKEY_KEY_PRESS;
++
++		/*
++		 * 0b00 means "no event" and must not be reported as a
++		 * release: the controller only writes 0b10 on release.
++		 * 0b01 (and the unexpected 0b11) mean the key is down.
++		 */
++		if (!state)
++			continue;
++
++		if (press) {
++			if (touchkey->pressed[i])
++				continue;
++			touchkey->pressed[i] = true;
++			input_report_key(touchkey->input,
++					 touchkey->keycodes[i], 1);
++		} else {
++			touchkey->pressed[i] = false;
++			input_report_key(touchkey->input,
++					 touchkey->keycodes[i], 0);
++		}
++	}
++
++	input_sync(touchkey->input);
++
++	return IRQ_HANDLED;
++}
++
++static int mbr_touchkey_probe(struct i2c_client *client)
++{
++	struct mbr_touchkey_data *touchkey;
++	struct input_dev *input;
++	int val;
++	int error;
++	int i;
++
++	if (!i2c_check_functionality(client->adapter,
++				     I2C_FUNC_SMBUS_BYTE_DATA))
++		return dev_err_probe(&client->dev, -EOPNOTSUPP,
++				     "I2C adapter lacks SMBus byte data support\n");
++
++	if (client->irq <= 0)
++		return dev_err_probe(&client->dev, -ENODEV,
++				     "missing interrupt\n");
++
++	touchkey = devm_kzalloc(&client->dev, sizeof(*touchkey), GFP_KERNEL);
++	if (!touchkey)
++		return -ENOMEM;
++
++	touchkey->client = client;
++
++	touchkey->num_keycodes =
++		device_property_read_u32_array(&client->dev, "linux,keycodes",
++					       touchkey->keycodes,
++					       MBR_TOUCHKEY_MAX_KEYS);
++	if (touchkey->num_keycodes <= 0) {
++		touchkey->keycodes[0] = KEY_BACK;
++		touchkey->keycodes[1] = KEY_MENU;
++		touchkey->num_keycodes = 2;
++	}
++
++	/* Sanity check: the controller must answer before we register input. */
++	val = i2c_smbus_read_byte_data(client, MBR_TOUCHKEY_KEYCODE_REG);
++	if (val < 0)
++		return dev_err_probe(&client->dev, val,
++				     "touchkey controller does not respond\n");
++
++	val = i2c_smbus_read_byte_data(client, MBR_TOUCHKEY_FW_VER_REG);
++	if (val >= 0)
++		dev_info(&client->dev, "Cypress MBR touchkey, firmware 0x%02x\n",
++			 val);
++	else
++		dev_warn(&client->dev, "cannot read firmware version: %d\n",
++			 val);
++
++	input = devm_input_allocate_device(&client->dev);
++	if (!input)
++		return -ENOMEM;
++
++	input->name = MBR_TOUCHKEY_DEV_NAME;
++	input->id.bustype = BUS_I2C;
++	input->dev.parent = &client->dev;
++
++	for (i = 0; i < touchkey->num_keycodes; i++)
++		input_set_capability(input, EV_KEY, touchkey->keycodes[i]);
++
++	touchkey->input = input;
++	i2c_set_clientdata(client, touchkey);
++
++	error = devm_request_threaded_irq(&client->dev, client->irq, NULL,
++					  mbr_touchkey_irq_handler,
++					  IRQF_ONESHOT,
++					  MBR_TOUCHKEY_DEV_NAME, touchkey);
++	if (error)
++		return dev_err_probe(&client->dev, error,
++				     "failed to request IRQ %d\n", client->irq);
++
++	error = input_register_device(input);
++	if (error)
++		return dev_err_probe(&client->dev, error,
++				     "failed to register input device\n");
++
++	return 0;
++}
++
++static int mbr_touchkey_suspend(struct device *dev)
++{
++	struct mbr_touchkey_data *touchkey = dev_get_drvdata(dev);
++	int i;
++
++	disable_irq(touchkey->client->irq);
++
++	for (i = 0; i < touchkey->num_keycodes; i++) {
++		if (touchkey->pressed[i]) {
++			touchkey->pressed[i] = false;
++			input_report_key(touchkey->input,
++					 touchkey->keycodes[i], 0);
++		}
++	}
++	input_sync(touchkey->input);
++
++	return 0;
++}
++
++static int mbr_touchkey_resume(struct device *dev)
++{
++	struct mbr_touchkey_data *touchkey = dev_get_drvdata(dev);
++
++	enable_irq(touchkey->client->irq);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(mbr_touchkey_pm_ops, mbr_touchkey_suspend,
++				mbr_touchkey_resume);
++
++static const struct of_device_id mbr_touchkey_of_match[] = {
++	{ .compatible = "cypress,mbr31x5-touchkey" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mbr_touchkey_of_match);
++
++static const struct i2c_device_id mbr_touchkey_id_table[] = {
++	{ MBR_TOUCHKEY_DEV_NAME, 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, mbr_touchkey_id_table);
++
++static struct i2c_driver mbr_touchkey_driver = {
++	.driver = {
++		.name = MBR_TOUCHKEY_DEV_NAME,
++		.of_match_table = mbr_touchkey_of_match,
++		.pm = pm_sleep_ptr(&mbr_touchkey_pm_ops),
++	},
++	.probe = mbr_touchkey_probe,
++	.id_table = mbr_touchkey_id_table,
++};
++module_i2c_driver(mbr_touchkey_driver);
++
++MODULE_AUTHOR("DSH");
++MODULE_DESCRIPTION("Cypress CY8CMBR31x5 touch key controller driver");
++MODULE_LICENSE("GPL");
 diff --git a/drivers/input/touchscreen/stmfts.c b/drivers/input/touchscreen/stmfts.c
 index 56e371fd8..bb88f3d38 100644
 --- a/drivers/input/touchscreen/stmfts.c
@@ -5481,10 +6101,10 @@ index a8a9fa6de..413aa2ce0 100644
  obj-$(CONFIG_CHARGER_RT5033)	+= rt5033_charger.o
 diff --git a/drivers/power/supply/max77843-charger.c b/drivers/power/supply/max77843-charger.c
 new file mode 100644
-index 000000000..4d654c6b6
+index 000000000..a03a573b9
 --- /dev/null
 +++ b/drivers/power/supply/max77843-charger.c
-@@ -0,0 +1,1133 @@
+@@ -0,0 +1,1143 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Charger driver for the Maxim MAX77843 companion PMIC
@@ -5807,6 +6427,7 @@ index 000000000..4d654c6b6
 +/* DSH: diagnostics + opt-in charging control                             */
 +/* ---------------------------------------------------------------------- */
 +
++static bool ignore_muic_cap;
 +static bool charge_enable;
 +static bool safe_bringup = true;
 +static int fast_chg_ma = 2100;
@@ -6221,6 +6842,14 @@ index 000000000..4d654c6b6
 +		  muic_type < ARRAY_SIZE(max77843_muic_chg_name)) ?
 +			max77843_muic_chg_name[muic_type] : "unknown");
 +
++	/* DSH: 强制忽略 MUIC 限流时跳过下面所有 cap */
++	if (ignore_muic_cap) {
++		dev_warn(chg->dev,
++			 "DSH-CHG ignore_muic_cap=1: bypassing MUIC charger-type caps, using configured %d mA input\n",
++			 input_ua / 1000);
++		muic_type = MAX77843_MUIC_CHG_DEDICATED;
++	}
++
 +	/* Never over-draw a host/PC USB port, whatever was configured */
 +	if (muic_type < 0 || muic_type == MAX77843_MUIC_CHG_USB ||
 +	    muic_type == MAX77843_MUIC_CHG_DOWNSTREAM ||
@@ -6367,6 +6996,7 @@ index 000000000..4d654c6b6
 +module_param_cb(charge_enable, &max77843_chg_charge_enable_ops,
 +		&charge_enable, 0644);
 +module_param_named(safe_bringup, safe_bringup, bool, 0644);
++module_param_named(ignore_muic_cap, ignore_muic_cap, bool, 0644);
 +module_param_named(fast_chg_ma, fast_chg_ma, int, 0644);
 +module_param_named(float_mv, float_mv, int, 0644);
 +module_param_named(input_limit_ma, input_limit_ma, int, 0644);

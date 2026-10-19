@@ -47,10 +47,10 @@ index a8a9fa6de..413aa2ce0 100644
  obj-$(CONFIG_CHARGER_RT5033)	+= rt5033_charger.o
 diff --git a/drivers/power/supply/max77843-charger.c b/drivers/power/supply/max77843-charger.c
 new file mode 100644
-index 000000000..4d654c6b6
+index 000000000..a03a573b9
 --- /dev/null
 +++ b/drivers/power/supply/max77843-charger.c
-@@ -0,0 +1,1133 @@
+@@ -0,0 +1,1143 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Charger driver for the Maxim MAX77843 companion PMIC
@@ -373,6 +373,7 @@ index 000000000..4d654c6b6
 +/* DSH: diagnostics + opt-in charging control                             */
 +/* ---------------------------------------------------------------------- */
 +
++static bool ignore_muic_cap;
 +static bool charge_enable;
 +static bool safe_bringup = true;
 +static int fast_chg_ma = 2100;
@@ -787,6 +788,14 @@ index 000000000..4d654c6b6
 +		  muic_type < ARRAY_SIZE(max77843_muic_chg_name)) ?
 +			max77843_muic_chg_name[muic_type] : "unknown");
 +
++	/* DSH: 强制忽略 MUIC 限流时跳过下面所有 cap */
++	if (ignore_muic_cap) {
++		dev_warn(chg->dev,
++			 "DSH-CHG ignore_muic_cap=1: bypassing MUIC charger-type caps, using configured %d mA input\n",
++			 input_ua / 1000);
++		muic_type = MAX77843_MUIC_CHG_DEDICATED;
++	}
++
 +	/* Never over-draw a host/PC USB port, whatever was configured */
 +	if (muic_type < 0 || muic_type == MAX77843_MUIC_CHG_USB ||
 +	    muic_type == MAX77843_MUIC_CHG_DOWNSTREAM ||
@@ -933,6 +942,7 @@ index 000000000..4d654c6b6
 +module_param_cb(charge_enable, &max77843_chg_charge_enable_ops,
 +		&charge_enable, 0644);
 +module_param_named(safe_bringup, safe_bringup, bool, 0644);
++module_param_named(ignore_muic_cap, ignore_muic_cap, bool, 0644);
 +module_param_named(fast_chg_ma, fast_chg_ma, int, 0644);
 +module_param_named(float_mv, float_mv, int, 0644);
 +module_param_named(input_limit_ma, input_limit_ma, int, 0644);

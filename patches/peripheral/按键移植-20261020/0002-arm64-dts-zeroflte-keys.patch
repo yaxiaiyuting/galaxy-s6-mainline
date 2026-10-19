@@ -1,0 +1,85 @@
+diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
+--- a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
+@@ -258,7 +258,7 @@
+ };
+ 
+ /*
+- * DSH 2026-10-20: 三大金刚键 + 音量键（来自 vendor `gpio_keys`）
++ * DSH 2026-10-20: 物理键 —— POWER / VOL+ / VOL- / HOME（来自 vendor `gpio_keys`）
+  *
+  * vendor 原始定义（ctc_stock.dts:7746-7786）：
+  *   button@1 KEY_POWER      gpios = <&gpa2 2 0x0f>   ← phandle 0x24 = gpa2
+@@ -266,8 +266,11 @@
+  *   button@3 KEY_VOLUMEUP   gpios = <&gpa0 2 0x0f>
+  *   button@4 KEY_HOMEPAGE   gpios = <&gpa0 5 0x0f>
+  *
+- * 注意：BACK / RECENT 不在这里 —— 它们是触摸控制器（stmfts）上报的电容键，
+- * 由触摸驱动处理，不在 gpio-keys 里。
++ * BACK / RECENT 两个电容键**不在这里**：它们由独立的 Cypress
++ * CY8CMBR31x5 触摸键控制器上报（i2c 0x20 / IRQ gpa0-0），节点见下面的
++ * "i2c-touchkey"。stmfts 触摸屏本身不上报按键 —— vendor STM 驱动只有
++ * 在 DTS 里存在 `stm,num_touchkey` 属性时才启用按键功能，而
++ * ctc_stock.dts / exynos7420-zeroflte_*.dts 的 touchscreen 节点都没有它。
+  */
+ / {
+ 	gpio-keys {
+@@ -330,6 +333,58 @@
+ 	};
+ };
+ 
++/*
++ * ==========================================================================
++ * DSH 2026-10-20: 电容键 BACK / RECENT —— Cypress CY8CMBR31x5
++ * ==========================================================================
++ *
++ * 硬件事实（证据见 ctc_stock.dts:4875-4891、
++ * exynos7420-zeroflte_chn_01.dts:915-936、
++ * vendor 驱动 drivers/input/keyboard/cypress_20075/cypress-touchkey.c:
++ *   73-74、1071-1089、2430-2445、2573-2610）：
++ *
++ *   - 与 STM 触摸屏相互独立的触摸键 IC，I2C 地址 0x20。
++ *   - 原厂挂在 hsi2c3@14E70000（SPI 460）：SDA=gpd1-2，SCL=gpd1-3。
++ *     该控制器的时钟门控在 CMU_PERIC1(0x14C80000，属于死区
++ *     0x14C00000-0x14CE0000)，绝不能碰；这里用 i2c-gpio 在同两根线上
++ *     软件模拟 I2C。gpd1 所在的 pinctrl_bus0(0x13470000) 已实测可访问
++ *     （现有 s2mpb02/s2mps15 的 i2c-gpio 就在同一 bank 的 gpg3 上工作）。
++ *   - IRQ = gpa0-0，低有效、下降沿（vendor request_threaded_irq 用
++ *     IRQF_TRIGGER_FALLING）。
++ *   - 核心电源 vtouch_3.3v = S2MPS15 LDO21。原厂 DTS 标
++ *     `regulator-boot-on`，vendor 驱动 `cypress,boot-on-ldo = "true"`
++ *     时也**不会**去 enable 它 —— 即 S-Boot 已经打开并移交给内核。
++ *     本 DTS 不声明该 LDO：未在 DT 中声明的 regulator 其 constraints
++ *     为空，regulator core 的 late cleanup 会跳过它，不会被关掉。
++ *   - 状态寄存器 0x03：每个键 2 bit，0b01=按下，0b10=抬起
++ *     （vendor 驱动 touchkey_keycode[] = { 0, KEY_RECENT, KEY_BACK }，
++ *      即 bit[1:0]=RECENT、bit[3:2]=BACK）。
++ *     主线没有 Android 专用的 KEY_RECENT(254)，用语义等价的
++ *     KEY_APPSELECT(580) 代替。
++ *   - 固件（cypress/cypress_zerof.fw）烧在 IC 内部 flash，原厂驱动只在
++ *     版本不匹配时才走 ISP 重刷；主线驱动不刷固件，只读状态寄存器。
++ * ==========================================================================
++ */
++/ {
++	i2c_touchkey: i2c-touchkey {
++		compatible = "i2c-gpio";
++		#address-cells = <1>;
++		#size-cells = <0>;
++		sda-gpios = <&gpd1 2 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpd1 3 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		i2c-gpio,timeout-ms = <100>;
++
++		touchkey@20 {
++			compatible = "cypress,mbr31x5-touchkey";
++			reg = <0x20>;
++			interrupt-parent = <&gpa0>;
++			interrupts = <0 IRQ_TYPE_EDGE_FALLING>;
++			linux,keycodes = <KEY_APPSELECT KEY_BACK>;
++		};
++	};
++};
++
+ /*
+  * 显示控制器 DECON（0x13930000）。
+  *

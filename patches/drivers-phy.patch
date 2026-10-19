@@ -1,0 +1,77 @@
+diff --git a/drivers/phy/samsung/phy-exynos7-ufs.c b/drivers/phy/samsung/phy-exynos7-ufs.c
+index a982e7c12..07a884a87 100644
+--- a/drivers/phy/samsung/phy-exynos7-ufs.c
++++ b/drivers/phy/samsung/phy-exynos7-ufs.c
+@@ -68,6 +68,14 @@ static const struct samsung_ufs_phy_cfg *exynos7_ufs_phy_cfgs[CFG_TAG_MAX] = {
+ 	[CFG_POST_PWR_HS]	= exynos7_post_pwr_hs_cfg,
+ };
+ 
++/*
++ * DSH 时钟二分测试：7420 上只保留 ref_clk。
++ * 原厂 exynos7 要 4 个时钟，实测挂死在 clk_bulk_prepare_enable，
++ * 而 devm_clk_bulk_get 要求 4 个全在（少一个就 probe 失败），
++ * 所以只能在 drvdata 里减少数量来二分。
++ *   - 如果能启动 => 挂死在那 3 个 symbol clock 的某一个
++ *   - 如果还挂   => 就是 ref_clk 本身
++ */
+ static const char * const exynos7_ufs_phy_clks[] = {
+ 	"tx0_symbol_clk", "rx0_symbol_clk", "rx1_symbol_clk", "ref_clk",
+ };
+diff --git a/drivers/phy/samsung/phy-samsung-ufs.c b/drivers/phy/samsung/phy-samsung-ufs.c
+index 183c88e3d..7774247b4 100644
+--- a/drivers/phy/samsung/phy-samsung-ufs.c
++++ b/drivers/phy/samsung/phy-samsung-ufs.c
+@@ -150,6 +150,7 @@ static int samsung_ufs_phy_clks_init(struct samsung_ufs_phy *phy)
+ 
+ static int samsung_ufs_phy_init(struct phy *phy)
+ {
++	pr_emerg("DSHPHY: phy_init enter\n");
+ 	struct samsung_ufs_phy *ss_phy = get_samsung_ufs_phy(phy);
+ 
+ 	ss_phy->lane_cnt = phy->attrs.bus_width;
+@@ -163,16 +164,27 @@ static int samsung_ufs_phy_power_on(struct phy *phy)
+ 	struct samsung_ufs_phy *ss_phy = get_samsung_ufs_phy(phy);
+ 	int ret;
+ 
++	pr_emerg("DSHPHY: power_on: >>> ctrl_isol(false)\n");
+ 	samsung_ufs_phy_ctrl_isol(ss_phy, false);
++	pr_emerg("DSHPHY: power_on: ctrl_isol done\n");
+ 
++	pr_emerg("DSHPHY: power_on: >>> clk_bulk_prepare_enable\n");
+ 	ret = clk_bulk_prepare_enable(ss_phy->drvdata->num_clks, ss_phy->clks);
++	pr_emerg("DSHPHY: power_on: clk_bulk ret=%d\n", ret);
+ 	if (ret) {
+ 		dev_err(ss_phy->dev, "failed to enable ufs phy clocks\n");
+ 		return ret;
+ 	}
+ 
++	/*
++	 * DSH 二分测试：临时跳过 calibrate。
++	 * 如果跳过能启动 => samsung_ufs_phy_calibrate 是挂死原因
++	 * 如果照样挂  => clk_bulk_prepare_enable 或 ctrl_isol 是原因
++	 */
+ 	if (ss_phy->ufs_phy_state == CFG_PRE_INIT) {
++		pr_emerg("DSHPHY: power_on: >>> calibrate\n");
+ 		ret = samsung_ufs_phy_calibrate(phy);
++		pr_emerg("DSHPHY: power_on: calibrate ret=%d\n", ret);
+ 		if (ret)
+ 			dev_err(ss_phy->dev, "ufs phy calibration failed\n");
+ 	}
+@@ -228,6 +240,7 @@ static const struct of_device_id samsung_ufs_phy_match[];
+ static int samsung_ufs_phy_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
++	pr_emerg("DSHPHY: phy probe enter\n");
+ 	const struct of_device_id *match;
+ 	struct samsung_ufs_phy *phy;
+ 	struct phy *gen_phy;
+@@ -282,7 +295,9 @@ static int samsung_ufs_phy_probe(struct platform_device *pdev)
+ 
+ 	phy->lane_cnt = PHY_DEF_LANE_CNT;
+ 
++	pr_emerg("DSHPHY: before clks_init\n");
+ 	err = samsung_ufs_phy_clks_init(phy);
++	pr_emerg("DSHPHY: clks_init ret=%d\n", err);
+ 	if (err) {
+ 		dev_err(dev, "failed to get phy clocks\n");
+ 		goto out;
