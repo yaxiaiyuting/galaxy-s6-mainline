@@ -71,12 +71,21 @@ else
 fi
 
 # ===== DSH: 切根到 UFS 上的 Debian =====
-# 所有日志同时写到 /dev/ttyGS0（USB 控制台可见）和 /dev/console（屏幕）
-DSH_TTY=/dev/ttyGS0
+#
+# DSH 2026-10-20: 日志改成「非阻塞 + 单目标」。
+#
+# 原来每行写两次（$DSH_TTY=ttyGS0 和 /dev/console，而 /dev/console 就是
+# ttyGS0，因为 bootargs 是 "console=tty0 console=ttyGS0" —— 后一个才是
+# 主 console）。ttyGS0 是 USB gadget 串口：宿主机要是没在读（比如上位机
+# 脚本断开重连的间隙），USB 流控会让手机侧 write() 一直阻塞，于是
+# /etc/rc 卡在一条日志上，启动看起来"卡死"几十秒。
+#
+# 现在：只写 /dev/console 一次，而且放后台写 —— 启动流程绝不等串口。
+# 最坏情况丢几条日志，换来启动不被宿主机读取速度绑架。
+DSH_TTY=/dev/console
 dsh_log()
 {
-    echo "G9209 $*" > $DSH_TTY 2>/dev/null
-    echo "G9209 $*" > /dev/console 2>/dev/null
+    { echo "G9209 $*" > $DSH_TTY 2>/dev/null; } &
 }
 
 dsh_try_switch_root()
@@ -116,7 +125,8 @@ dsh_try_switch_root()
 
     # ---- 挂载之后做 chroot 自检（这才是有效检测）----
     dsh_log "precheck: chroot test start"
-    if chroot /mnt /bin/sh -c 'echo PRECHECK-SH-OK; /sbin/init --version 2>&1 | head -3; uname -r' > /dev/ttyGS0 2>&1; then
+    # DSH: 加 timeout —— 串口阻塞时不要卡住 precheck
+    if timeout 15 chroot /mnt /bin/sh -c 'echo PRECHECK-SH-OK; /sbin/init --version 2>&1 | head -3; uname -r' > /dev/ttyGS0 2>&1; then
         dsh_log "precheck: chroot + /sbin/init OK"
     else
         dsh_log "precheck: chroot FAILED -- refuse to handover"
@@ -206,7 +216,8 @@ echo 'G9209 block'; ls /sys/class/block
 echo 'G9209 input'; grep -E '^N:|^H:' /proc/bus/input/devices
 echo 'G9209 UDC'; ls /sys/class/udc
 echo 'G9209 mounts'; cat /proc/mounts
-echo 'G9209 UFS probe result'; dmesg | grep -E 'ufs|UFS|scsi|sd[a-z]' | tail -40
+# DSH: 40 行 dmesg 灌 USB 串口会阻塞启动（同 dsh_log 的原因），改后台 + 减到 15 行
+{ echo 'G9209 UFS probe result'; dmesg | grep -E 'ufs|UFS|scsi|sd[a-z]' | tail -15; } > /dev/console 2>&1 &
 if [ -r /sys/firmware/devicetree/base/chosen/g9209,command ]; then
     CMD=$(tr -d '\000' < /sys/firmware/devicetree/base/chosen/g9209,command)
     echo 'G9209 COMMAND BEGIN'
