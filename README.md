@@ -259,7 +259,16 @@ adb reboot
 2. **GPU 电源域** —— 目前禁用 `power-domains` 让 GPU 常开；完整方案需要移植 vendor G3D 上电序列。
 3. **充电管理** —— charger 驱动是只读的，充电参数仍由 S-Boot 决定。
 4. **触摸坐标** —— DT 里 `touchscreen-size-x/y = <4096>`，可能需按实际面板校准。
-5. **多摄/指纹/传感器等** —— 未移植。
+5. **指纹** —— **不可移植**（已做完整调研，结论明确）：
+   - 芯片 Synaptics VFS7xxx（Viper），SPI4 @ 0x14D70000
+   - **致命障碍 1**：match-in-TEE —— 采集/匹配全在 Trustonic MobiCore trustlet（655KB 闭源二进制）里，
+     内核在 secure 模式下连 SPI 数据通道都没有。mainline 无 MobiCore 驱动，OP-TEE 读不了三星 trustlet。
+   - **致命障碍 2**：SPI4 的 pinmux（0x14CA0000）和时钟门控（0x14C80900/0x14C80A00）
+     都在本板 AXI 死区（0x14C00000–0x14CE0000）里，写就挂死。
+   - 结论：标记为 "TEE-only peripheral, not supportable"。
+     需要指纹登录请用 USB 指纹读卡器 + libfprint。
+   - 详见 `docs/指纹移植调研-20261020.md`（27KB 完整分析）
+6. **多摄/传感器等** —— 未移植。
 
 ---
 
