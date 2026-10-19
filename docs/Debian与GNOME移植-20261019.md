@@ -36,7 +36,7 @@ nokaslr kpti=off
 - 下载：`https://cdimage.debian.org/cdimage/cloud/bookworm/latest/debian-12-genericcloud-arm64.tar.xz`
 - 内容：`disk.raw`（3GB GPT），分区 1 = 2.9G ext4 Debian 12 rootfs
 - 已解压到宿主机 `/mnt/debroot`（loop 挂载 `disk.raw` 偏移 262144*512）
-- 已打包：`<HOME>/gnome-rootfs/debian-rootfs.tar.gz`（247MB）
+- 已打包：`/home/duanjb666/gnome-rootfs/debian-rootfs.tar.gz`（247MB）
 - **已写入手机 `/dev/sda20`**（26GB USERDATA）
 
 ### 3. switch_root 机制 ✅（部分成功）
@@ -195,19 +195,19 @@ apt install -y xfce4 xfce4-goodies
 
 | 文件 | 说明 |
 |---|---|
-| `<HOME>/linux7420/out/p185-padded.img` | **当前镜像**（8核 + nohz=off + switch_root）|
-| `<HOME>/linux7420/uniLoader/blob/ramdisk` | ramdisk（已改，含 switch_root）|
-| `<HOME>/linux7420/uniLoader/blob/ramdisk.bak-0022` | 原始 ramdisk（可回退）|
-| `<HOME>/linux7420/uniLoader/main/diag.c:60` | bootargs |
-| `<HOME>/gnome-rootfs/debian-rootfs.tar.gz` | Debian 12 rootfs（247MB）|
-| `<HOME>/gnome-rootfs/rootfs/disk.raw` | Debian 原始镜像（3GB）|
+| `/home/duanjb666/linux7420/out/p185-padded.img` | **当前镜像**（8核 + nohz=off + switch_root）|
+| `/home/duanjb666/linux7420/uniLoader/blob/ramdisk` | ramdisk（已改，含 switch_root）|
+| `/home/duanjb666/linux7420/uniLoader/blob/ramdisk.bak-0022` | 原始 ramdisk（可回退）|
+| `/home/duanjb666/linux7420/uniLoader/main/diag.c:60` | bootargs |
+| `/home/duanjb666/gnome-rootfs/debian-rootfs.tar.gz` | Debian 12 rootfs（247MB）|
+| `/home/duanjb666/gnome-rootfs/rootfs/disk.raw` | Debian 原始镜像（3GB）|
 | `/mnt/debroot` | 宿主机上 loop 挂载的 Debian rootfs |
 
 ## 五、构建入口
 
 **唯一正确的构建方式**：
 ```bash
-cd <HOME>/linux7420
+cd /home/duanjb666/linux7420
 ./build_mainline.sh pNNN
 ```
 

@@ -595,10 +595,10 @@ index 000000000..e112fb2a2
 +};
 diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
 new file mode 100644
-index 000000000..a0a0ed810
+index 000000000..2185346ee
 --- /dev/null
 +++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
-@@ -0,0 +1,925 @@
+@@ -0,0 +1,964 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Samsung Galaxy S6 (SM-G9209, zeroflte, Exynos 7420) — mainline Linux 6.6
@@ -857,9 +857,48 @@ index 000000000..a0a0ed810
 +	};
 +};
 +
-+/* 显示控制器：dtsi 里默认 disabled，这里使能（刻意不接 pd_disp） */
++/*
++ * 显示控制器 DECON（0x13930000）。
++ *
++ * 思路（来自 zenlte 主线移植验证过的方案）：
++ *   S-Boot 已经初始化好 DSI + panel 并持续扫描帧缓冲；Linux **不碰 DSI/panel**，
++ *   只接管 DECON —— 让 DEcon 直接扫描 GPU（panfrost）渲染出的 DMA-BUF，
++ *   实现零拷贝显示，解决 simpledrm 固定帧缓冲导致的 2K 屏卡顿。
++ *
++ * 刻意不接 pd_disp：zenlte 的 samsung,exynos7420-pd 缺 TZPC SMC，
++ *   实际用会挂；DECON 依赖 S-Boot 留下的电源状态即可。
++ */
 +&decon {
 +	status = "okay";
++
++	/*
++	 * DSH 2026-10-20: 必须有 i80-if-timings 子节点！
++	 *
++	 * exynos7_drm_decon.c:779 用 of_get_child_by_name(np, "i80-if-timings")
++	 * 判断 ctx->i80_if。没有它时走 DPI(视频)模式，需要 OF graph port 端点，
++	 * 而本板没有 DSI/panel 节点 → "no port node found" → 不创建 connector
++	 * → 黑屏。加上后走 i80 命令模式（MIPI DSI command mode），
++	 * 直接按 display-timings 驱动 S-Boot 已初始化的面板。
++	 */
++	i80-if-timings {
++	};
++
++	display-timings {
++		native-mode = <&decon_timing0>;
++
++		/* 1440x2560 @ ~60Hz，取自 zenlte 实测值 */
++		decon_timing0: timing0 {
++			clock-frequency = <222371232>;
++			hactive = <1440>;
++			vactive = <2560>;
++			hfront-porch = <1>;
++			hback-porch = <1>;
++			hsync-len = <1>;
++			vfront-porch = <1>;
++			vback-porch = <15>;
++			vsync-len = <1>;
++		};
++	};
 +};
 +
 +/*
@@ -1000,7 +1039,7 @@ index 000000000..a0a0ed810
 + * 同一套办法）。
 + * ==========================================================================
 + */
-+#define DSH_ENABLE_DISP_IOMMU 0
++#define DSH_ENABLE_DISP_IOMMU 1
 +
 +#if DSH_ENABLE_DISP_IOMMU
 +/*

@@ -1,0 +1,123 @@
+diff --git a/include/dt-bindings/clock/exynos7-clk.h b/include/dt-bindings/clock/exynos7-clk.h
+index fce33c705..d64446b13 100644
+--- a/include/dt-bindings/clock/exynos7-clk.h
++++ b/include/dt-bindings/clock/exynos7-clk.h
+@@ -48,7 +48,16 @@
+ #define CLK_SCLK_I2S1			14
+ #define CLK_ACLK_PERIC0_66		15
+ #define CLK_ACLK_PERIC1_66		16
+-#define TOP0_NR_CLK			17
++#define CLK_MOUT_ACLK_DISP_400		17
++#define CLK_DOUT_ACLK_DISP_400		18
++#define CLK_ACLK_DISP_400		19
++#define CLK_MOUT_SCLK_DECON_INT_ECLK	20
++#define CLK_DOUT_SCLK_DECON_INT_ECLK	21
++#define CLK_SCLK_DECON_INT_ECLK		22
++#define CLK_MOUT_SCLK_DECON_VCLK	23
++#define CLK_DOUT_SCLK_DECON_VCLK	24
++#define CLK_SCLK_DECON_VCLK		25
++#define TOP0_NR_CLK			26
+ 
+ /* TOP1 */
+ #define DOUT_ACLK_FSYS1_200		1
+@@ -117,7 +126,8 @@
+ #define SCLK_I2S1			25
+ #define SCLK_PCM1			26
+ #define SCLK_SPDIF			27
+-#define PERIC1_NR_CLK			28
++#define MOUT_ACLK_PERIC1_66_USER		28
++#define PERIC1_NR_CLK			29
+ 
+ /* PERIS */
+ #define PCLK_CHIPID			1
+@@ -125,7 +135,8 @@
+ #define PCLK_WDT			3
+ #define PCLK_TMU			4
+ #define SCLK_TMU			5
+-#define PERIS_NR_CLK			6
++#define PCLK_MCT			6
++#define PERIS_NR_CLK			7
+ 
+ /* FSYS0 */
+ #define ACLK_MMC2			1
+@@ -200,5 +211,35 @@
+ #define PCLK_I2S			3
+ #define PCLK_PCM			4
+ #define ACLK_ADMA			5
+-#define AUD_NR_CLK			6
++#define PCLK_UART			6
++#define SCLK_UART			7
++#define AUD_NR_CLK			8
++
++/* G3D */
++#define CLK_FOUT_G3D_PLL		1
++#define CLK_MOUT_ACLK_G3D_400		2
++#define CLK_DIV_ACLK_G3D		3
++#define CLK_DIV_PCLK_G3D		4
++#define CLK_ACLK_G3D			5
++#define CLK_PCLK_SYSREG_G3D		6
++#define CLK_PCLK_PMU_G3D		7
++#define G3D_NR_CLK			8
++
++/* DISP */
++#define CLK_FOUT_DISP_PLL			1
++#define CLK_MOUT_SUB_SCLK_DECON_INT_ECLK	2
++#define CLK_MOUT_SUB_SCLK_DECON_INT_VCLK	3
++#define CLK_DOUT_PCLK_DISP			4
++#define CLK_DOUT_SUB_SCLK_DECON_INT_ECLK	5
++#define CLK_DOUT_SUB_SCLK_DECON_INT_VCLK	6
++#define CLK_ACLK_DECON0				7
++#define CLK_PCLK_DECON0				8
++#define CLK_SCLK_DECON0_ECLK			9
++#define CLK_SCLK_DECON0_VCLK			10
++#define CLK_PCLK_DSIM0				11
++#define CLK_ACLK_DISP_RO_SYSMMU			12
++#define CLK_ACLK_DISP_RW_SYSMMU			13
++#define CLK_PCLK_DISP_RO_SYSMMU			14
++#define CLK_PCLK_DISP_RW_SYSMMU			15
++#define DISP_NR_CLK				16
+ #endif /* _DT_BINDINGS_CLOCK_EXYNOS7_H */
+diff --git a/include/linux/dsh_diag.h b/include/linux/dsh_diag.h
+new file mode 100644
+index 000000000..a6cf9b675
+--- /dev/null
++++ b/include/linux/dsh_diag.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_DSH_DIAG_H
++#define _LINUX_DSH_DIAG_H
++
++#define DSH_DIAG_MAGIC		0x4453484449414731UL
++#define DSH_DIAG_VERSION		1UL
++#define DSH_DIAG_RECORD_BYTES	608UL
++#define DSH_DIAG_TEXT_BYTES	512
++
++/* Board-local ARM64 ABI shared with the diagnostic loader.  Checksum is
++ * FNV-1a64 over all 608 bytes, treating the checksum field itself as zero.
++ * Keep the fields as 64-bit unsigned long words in the declared order.
++ */
++struct dsh_diag_record {
++	unsigned long magic;
++	unsigned long version;
++	unsigned long bytes;
++	unsigned long build_id;
++	unsigned long run_id;
++	unsigned long sequence;
++	unsigned long stage;
++	unsigned long initcall;
++	unsigned long caller;
++	unsigned long fmt;
++	unsigned long text_len;
++	unsigned long checksum;
++	char text[DSH_DIAG_TEXT_BYTES];
++};
++
++extern struct dsh_diag_record dsh_diag;
++
++void dsh_mark(unsigned long value);
++void dsh_diag_note(unsigned long stage, const char *message);
++void dsh_diag_panic(const char *message, unsigned long fmt,
++		    unsigned long caller);
++void dsh_diag_early_guard(void);
++
++#endif /* _LINUX_DSH_DIAG_H */

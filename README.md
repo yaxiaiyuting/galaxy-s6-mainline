@@ -22,7 +22,7 @@
 | **触摸屏** | ✅ | STMFTS（`/dev/input/event0`） |
 | **WiFi（BCM4358）** | ✅ | 5GHz，802.11ac，可连 AP |
 | **电池/电量计** | ✅ | MAX77843 fuel gauge（SOC/电压/电流/温度）|
-| **充电器状态** | ✅ | MAX77843 charger（只读，安全）|
+| **充电控制** | ✅ | MAX77843 charger：可开/关充电、调电流/电压（默认只读）|
 | **GNOME 交互** | ⚠️ | 能用，但 2K 屏 + 软件合成偏卡 |
 
 ---
@@ -117,7 +117,62 @@ MAX77843 在 `hsi2c_1`（`0x13650000`），但 CMU_PERIC0 的门控被 S-Boot �
 **修复**：改用 `i2c-gpio` 位翻转（`gpd2-2`=SDA、`gpd2-3`=SCL，100kHz），
 完全不碰 `0x13650000`。pinctrl_bus0（`0x13470000`）已实测可访问。
 
-### 8. 其他
+### 8. 主线上电后充电根本没开（CHG_EN=0）
+
+**症状**：插着 USB 线，电量只掉不涨。
+
+**根因**：S-Boot 给 Android 启动时 vendor charger 驱动会把 `CHG_CNFG_00` 写成 `0x05`
+（CHG_EN=1 | BUCK=1 开启充电）。但 uniLoader 和主线**都不碰 charger**，
+所以 Linux 拿到的还是 `0x04`（**CHG_EN=0**，充电关闭）。
+
+实测寄存器（p227 驱动 probe 打印）：
+```
+CHG_CNFG_00 = 0x04   → CHG_EN=0  ← 充电没开
+CHG_CNFG_02 = 0x89   → fast_chg = 450 mA
+CHG_CNFG_04 = 0x9c   → float = 4350 mV
+CHG_CNFG_06 = 0x0c   → 写保护解锁（bits[3:2]=0b11）
+CHG_CNFG_09 = 0x0e   → input_limit = 467 mA
+CHG_DTLS_01 = 0x38   → charger off
+CHG_INT_OK  = 0x5d   → CHGIN_OK=1（VBUS 有电）
+```
+
+**修复**：`max77843-charger.c` 实现可控写：
+- 解锁写保护（`CHG_CNFG_06` bits[3:2]=11）+ 每次写 readback 校验
+- 写序：输入限流 → 快充电流 → 浮充电压 → **最后** CHG_EN
+- `sysfs` 一次性命令：`echo safe|full|disable|dump|unlock|kick > /sys/class/power_supply/max77843-charger/charge_ctrl`
+- 默认**只读**（`charge_enable=0`），零风险
+
+**验证结果**（p227）：
+```
+W CHG_CNFG_09 input-limit = 0x0f (readback OK)
+W CHG_CNFG_02 fast-charge = 0x0a (readback OK)
+W CHG_CNFG_04 float-voltage = 0x1c (readback OK)
+W CHG_CNFG_00 enable = 0x05 (readback OK)     ← ★ CHG_EN=1
+after-enable: charge_state=fast-charge CC      ← ★ 进入恒流充电
+```
+
+**⚠️ 重要限制**：PC USB 口是 **SDP（500mA 上限）**。
+2K 屏 + WiFi + GPU 负载 > 500mA ⇒ 即使充电开启，仍可能净放电。
+**必须用墙充（DCP，可达 1800mA）**才能真充进去。
+
+### 9. 启动时串口终端卡住几十秒（rc 日志阻塞）
+
+**症状**：手机启动时串口终端输出卡住几十秒，时好时坏。
+
+**根因**：`rc` 的 `dsh_log()` 每行写两次 —— `$DSH_TTY=/dev/ttyGS0` 和 `/dev/console`，
+而 bootargs 是 `console=tty0 console=ttyGS0`（**后一个才是主 console**），
+所以 `/dev/console` **就是** ttyGS0 → 同一行写两遍。
+
+ttyGS0 是 USB gadget 串口：宿主机没在读（比如脚本断开重连的间隙）时，
+USB 流控让手机侧 `write()` 一直阻塞 → `/etc/rc` 卡在一条日志上 → 启动"卡死"。
+
+**修复**：
+1. `DSH_TTY=/dev/console`（单目标）
+2. `dsh_log` 改**后台写** `{ echo ...; } &` —— 启动绝不等串口
+3. UFS dmesg 转储 40 行 → 15 行 + 后台化
+4. chroot precheck 加 `timeout 15`
+
+### 10. 其他
 
 - **8 核必须 `nohz=off`**：tickless idle 会让 CPU 睡死（根因也是 CNTVOFF）
 - **bootargs 里的 `systemd.log_level=debug` 会把启动拖慢 10 倍**（USB 串口 115200 是瓶颈）
@@ -197,6 +252,10 @@ adb reboot
 
 1. **GNOME 交互偏卡** —— 2K 屏（1440×2560）+ simpledrm 固定帧缓冲，无法零拷贝呈现。
    根治需要移植 `exynos_drm`（DEcon + DSI），让 GPU 渲染结果直接扫描输出。
+   **进展（WIP）**：`DSH_ENABLE_DISP_IOMMU=1` 已开启，`exynosdrm.ko` 可作为模块加载，
+   IOMMU 成功 attach 到 DECON（`13930000.decon` → `13a00000/13a10000.sysmmu`）。
+   待解决：modprobe 后黑屏（疑似 fbcon console_lock 下第一轮 modeset 挂死，
+   或 SYSMMU identity-map 时机）。详见 `docs/exynos_drm移植-20261020.md`。
 2. **GPU 电源域** —— 目前禁用 `power-domains` 让 GPU 常开；完整方案需要移植 vendor G3D 上电序列。
 3. **充电管理** —— charger 驱动是只读的，充电参数仍由 S-Boot 决定。
 4. **触摸坐标** —— DT 里 `touchscreen-size-x/y = <4096>`，可能需按实际面板校准。
@@ -215,6 +274,8 @@ adb reboot
 | `docs/电池与启动问题-20261020.md` | NULL drv_data 排查过程 |
 | `docs/GPU加速-20261020.md` | panfrost 电源域方案（462 行）|
 | `docs/systemd根因与PID1修复-20261019.md` | PID1 handover（449 行）|
+| `docs/充电控制-20261020.md` | 充电寄存器全量诊断 + 可控写（新）|
+| `docs/exynos_drm移植-20261020.md` | exynos_drm 攻关记录（WIP）|
 | `docs/今晚总战报-20261019.md` | 总览 + 快速上手 |
 
 ---

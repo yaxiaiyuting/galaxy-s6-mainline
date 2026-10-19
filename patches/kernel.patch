@@ -1,0 +1,76 @@
+diff --git a/kernel/panic.c b/kernel/panic.c
+index ffa037fa7..e0ae76b12 100644
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -24,6 +24,7 @@
+ #include <linux/delay.h>
+ #include <linux/kexec.h>
+ #include <linux/panic_notifier.h>
++#include <linux/dsh_diag.h>
+ #include <linux/sched.h>
+ #include <linux/string_helpers.h>
+ #include <linux/sysrq.h>
+@@ -331,6 +332,13 @@ void panic(const char *fmt, ...)
+ 	if (len && buf[len - 1] == '\n')
+ 		buf[len - 1] = '\0';
+ 
++	/* Publish the selected panic CPU's formatted message before printk
++	 * or notifier paths can block. The record has its own cache flush
++	 * and never repurposes the probe exit guard in dsh_regs[23].
++	 */
++	dsh_diag_panic(buf, (unsigned long)fmt,
++		       (unsigned long)__builtin_return_address(0));
++
+ 	pr_emerg("Kernel panic - not syncing: %s\n", buf);
+ #ifdef CONFIG_DEBUG_BUGVERBOSE
+ 	/*
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index 266d02809..4026e335f 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -1636,7 +1636,11 @@ void __init timekeeping_init(void)
+ 	struct clocksource *clock;
+ 	unsigned long flags;
+ 
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4150);
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(50); } }	/* timekeeping_init 入口 */
+ 	read_persistent_wall_and_boot_offset(&wall_time, &boot_offset);
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4151);
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(51); } }	/* ★ 持久时钟读取完成 */
+ 	if (timespec64_valid_settod(&wall_time) &&
+ 	    timespec64_to_ns(&wall_time) > 0) {
+ 		persistent_clock_exists = true;
+@@ -1654,14 +1658,24 @@ void __init timekeeping_init(void)
+ 	 */
+ 	wall_to_mono = timespec64_sub(boot_offset, wall_time);
+ 
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4152);
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(52); } }	/* 即将取自旋锁 */
+ 	raw_spin_lock_irqsave(&timekeeper_lock, flags);
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4153);
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(53); } }	/* ★★ 自旋锁已获取 */
+ 	write_seqcount_begin(&tk_core.seq);
+ 	ntp_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4154);
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(54); } }	/* ntp_init 完成 */
+ 
+ 	clock = clocksource_default_clock();
+ 	if (clock->enable)
+ 		clock->enable(clock);
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4155);
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(55); } }	/* ★★ clocksource enable 完成 */
+ 	tk_setup_internals(tk, clock);
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4156);
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(56); } }	/* ★★★ tk_setup_internals 完成 */
+ 
+ 	tk_set_xtime(tk, &wall_time);
+ 	tk->raw_sec = 0;
+@@ -1672,6 +1686,8 @@ void __init timekeeping_init(void)
+ 
+ 	write_seqcount_end(&tk_core.seq);
+ 	raw_spin_unlock_irqrestore(&timekeeper_lock, flags);
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4157);
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(57); } }	/* ★★★ timekeeping_init 完全结束 */
+ }
+ 
+ /* time in seconds when suspend began for persistent clock */

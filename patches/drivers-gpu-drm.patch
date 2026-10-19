@@ -1,16 +1,84 @@
 diff --git a/drivers/gpu/drm/exynos/exynos7_drm_decon.c b/drivers/gpu/drm/exynos/exynos7_drm_decon.c
-index 0156a5e94..2e1aa6f0c 100644
+index 0156a5e94..ae04e0e39 100644
 --- a/drivers/gpu/drm/exynos/exynos7_drm_decon.c
 +++ b/drivers/gpu/drm/exynos/exynos7_drm_decon.c
-@@ -9,6 +9,7 @@
+@@ -9,6 +9,8 @@
  
  #include <linux/clk.h>
  #include <linux/component.h>
 +#include <linux/delay.h>
++#include <linux/module.h>
  #include <linux/kernel.h>
  #include <linux/of.h>
  #include <linux/of_address.h>
-@@ -81,10 +82,8 @@ static const enum drm_plane_type decon_win_types[WINDOWS_NR] = {
+@@ -33,6 +35,56 @@
+  * DECON stands for Display and Enhancement controller.
+  */
+ 
++
++/*
++ * DSH 2026-10-20: DECON TRIGCON 位定义（i80 命令模式用）。
++ * 原 zenlte 补丁用了这些宏但没带定义；位值取自 Samsung 3.10 vendor
++ * 源码 drivers/video/exynos/decon_7420/regs-decon.h:334-343。
++ */
++/* DSH: DECON TRIGCON 寄存器偏移（vendor regs-decon.h:334） */
++#define TRIGCON				0x06B0
++
++#ifndef TRIGCON_SWTRIGEN_I80_RGB
++#define TRIGCON_SWTRIGEN_I80_RGB	(1 << 0)
++#define TRIGCON_SWTRIGCMD_I80_RGB	(1 << 1)
++#define TRIGCON_HWTRIG_INV_I80_RGB	(1 << 2)
++#define TRIGCON_HWTRIGEN_I80_RGB	(1 << 3)
++#define TRIGCON_HWTRIGMASK_DISPIF0	(1 << 4)
++#define TRIGCON_HWTRIGMASK_DISPIF1	(1 << 5)
++#define TRIGCON_HWTRIG_AUTO_MASK	(1 << 6)
++#endif
++
++/* DSH 2026-10-20: bootloader framebuffer geometry, parsed from /chosen DT. */
++struct dsh_boot_fb {
++	phys_addr_t base;
++	size_t size;
++};
++
++/*
++ * DSH 2026-10-20: staged bring-up kill switches (defaults = zenlte behaviour).
++ *
++ *   sysmmu=1 : identity-map the S-Boot framebuffer and enable the DISP SYSMMUs
++ *              in decon_atomic_enable() (the risky part on this board)
++ *   clear=1  : run decon_clear_channels() at bind time (disables S-Boot's
++ *              still-running WINCONx_ENWIN window)
++ *   timing=1 : program VIDTCON0..4 from display-timings in decon_commit()
++ *   clockdiv=1: program VCLKCON1/2 pixel-clock divider (computed from the
++ *              *fake* fixed-clock rates: 148.5MHz -> clkdiv=0xff, likely wrong)
++ *   commit=1 : run decon_commit() at all
++ */
++bool dsh_disp_sysmmu = true;
++module_param_named(sysmmu, dsh_disp_sysmmu, bool, 0644);
++bool dsh_disp_clear = true;
++module_param_named(clear, dsh_disp_clear, bool, 0644);
++bool dsh_disp_timing = true;
++module_param_named(timing, dsh_disp_timing, bool, 0644);
++bool dsh_disp_clockdiv = true;
++module_param_named(clockdiv, dsh_disp_clockdiv, bool, 0644);
++bool dsh_disp_commit = true;
++module_param_named(commit, dsh_disp_commit, bool, 0644);
++
++#define DSH_DISP_TAG "DSH-DISP"
++
+ #define MIN_FB_WIDTH_FOR_16WORD_BURST 128
+ 
+ #define WINDOWS_NR	2
+@@ -56,6 +108,9 @@ struct decon_context {
+ 	atomic_t			wait_vsync_event;
+ 
+ 	struct drm_encoder *encoder;
++
++	/* DSH: bootloader framebuffer info (from /chosen/framebuffer@...) */
++	struct dsh_boot_fb boot_fb;
+ };
+ 
+ static const struct of_device_id decon_driver_dt_match[] = {
+@@ -81,10 +136,8 @@ static const enum drm_plane_type decon_win_types[WINDOWS_NR] = {
  	DRM_PLANE_TYPE_CURSOR,
  };
  
@@ -22,7 +90,7 @@ index 0156a5e94..2e1aa6f0c 100644
  	if (ctx->suspended)
  		return;
  
-@@ -100,9 +99,8 @@ static void decon_wait_for_vblank(struct exynos_drm_crtc *crtc)
+@@ -100,35 +153,48 @@ static void decon_wait_for_vblank(struct exynos_drm_crtc *crtc)
  		DRM_DEV_DEBUG_KMS(ctx->dev, "vblank wait timed out.\n");
  }
  
@@ -33,7 +101,18 @@ index 0156a5e94..2e1aa6f0c 100644
  	unsigned int win, ch_enabled = 0;
  
  	/* Check if any channel is enabled. */
-@@ -118,7 +116,7 @@ static void decon_clear_channels(struct exynos_drm_crtc *crtc)
+ 	for (win = 0; win < WINDOWS_NR; win++) {
+ 		u32 val = readl(ctx->regs + WINCON(win));
+ 
++		pr_err(DSH_DISP_TAG " decon: WINCON%u=%08x enwin=%d\n",
++		       win, val, !!(val & WINCONx_ENWIN));
+ 		if (val & WINCONx_ENWIN) {
+ 			val &= ~WINCONx_ENWIN;
+ 			writel(val, ctx->regs + WINCON(win));
+ 			ch_enabled = 1;
+ 		}
+ 	}
++	pr_err(DSH_DISP_TAG " decon: clear_channels ch_enabled=%u\n", ch_enabled);
  
  	/* Wait for vsync, as disable channel takes effect at next vsync */
  	if (ch_enabled)
@@ -42,16 +121,69 @@ index 0156a5e94..2e1aa6f0c 100644
  }
  
  static int decon_ctx_initialize(struct decon_context *ctx,
-@@ -126,7 +124,7 @@ static int decon_ctx_initialize(struct decon_context *ctx,
+ 			struct drm_device *drm_dev)
  {
++	int ret;
++
  	ctx->drm_dev = drm_dev;
  
 -	decon_clear_channels(ctx->crtc);
-+	decon_clear_channels(ctx);
++	pr_err(DSH_DISP_TAG " decon: ctx_initialize i80=%d clear=%d\n",
++	       ctx->i80_if, dsh_disp_clear);
++	if (dsh_disp_clear) {
++		decon_clear_channels(ctx);
++		pr_err(DSH_DISP_TAG " decon: clear_channels done\n");
++	} else {
++		pr_err(DSH_DISP_TAG " decon: clear_channels SKIPPED\n");
++	}
  
- 	return exynos_drm_register_dma(drm_dev, ctx->dev, &ctx->dma_priv);
+-	return exynos_drm_register_dma(drm_dev, ctx->dev, &ctx->dma_priv);
++	ret = exynos_drm_register_dma(drm_dev, ctx->dev, &ctx->dma_priv);
++	pr_err(DSH_DISP_TAG " decon: register_dma ret=%d\n", ret);
++	return ret;
  }
-@@ -199,7 +197,8 @@ static void decon_commit(struct exynos_drm_crtc *crtc)
+ 
+ static void decon_ctx_remove(struct decon_context *ctx)
+@@ -162,7 +228,18 @@ static void decon_commit(struct exynos_drm_crtc *crtc)
+ 	if (mode->htotal == 0 || mode->vtotal == 0)
+ 		return;
+ 
+-	if (!ctx->i80_if) {
++	pr_err(DSH_DISP_TAG " decon: commit enter i80=%d commit=%d timing=%d clockdiv=%d\n",
++	       ctx->i80_if, dsh_disp_commit, dsh_disp_timing, dsh_disp_clockdiv);
++	pr_err(DSH_DISP_TAG " decon: mode clk=%d hd=%d vd=%d htotal=%d vtotal=%d vclk_rate=%lu\n",
++	       mode->clock, mode->hdisplay, mode->vdisplay,
++	       mode->htotal, mode->vtotal, clk_get_rate(ctx->vclk));
++
++	if (!dsh_disp_commit) {
++		pr_err(DSH_DISP_TAG " decon: commit SKIPPED (commit=0)\n");
++		return;
++	}
++
++	if (dsh_disp_timing && !ctx->i80_if) {
+ 		int vsync_len, vbpd, vfpd, hsync_len, hbpd, hfpd;
+ 	      /* setup vertical timing values. */
+ 		vsync_len = mode->crtc_vsync_end - mode->crtc_vsync_start;
+@@ -189,29 +266,43 @@ static void decon_commit(struct exynos_drm_crtc *crtc)
+ 	}
+ 
+ 	/* setup horizontal and vertical display size. */
+-	val = VIDTCON4_LINEVAL(mode->vdisplay - 1) |
+-	       VIDTCON4_HOZVAL(mode->hdisplay - 1);
+-	writel(val, ctx->regs + VIDTCON4);
+-
+-	writel(mode->vdisplay - 1, ctx->regs + LINECNT_OP_THRESHOLD);
++	if (dsh_disp_timing) {
++		val = VIDTCON4_LINEVAL(mode->vdisplay - 1) |
++		       VIDTCON4_HOZVAL(mode->hdisplay - 1);
++		writel(val, ctx->regs + VIDTCON4);
++
++		writel(mode->vdisplay - 1, ctx->regs + LINECNT_OP_THRESHOLD);
++	} else {
++		pr_err(DSH_DISP_TAG " decon: VIDTCON/display-size writes SKIPPED (timing=0)\n");
++	}
+ 
+ 	/*
  	 * fields of register with prefix '_F' would be updated
  	 * at vsync(same as dma start)
  	 */
@@ -61,7 +193,32 @@ index 0156a5e94..2e1aa6f0c 100644
  	writel(val, ctx->regs + VIDCON0);
  
  	clkdiv = decon_calc_clkdiv(ctx, mode);
-@@ -227,7 +226,9 @@ static int decon_enable_vblank(struct exynos_drm_crtc *crtc)
+-	if (clkdiv > 1) {
+-		val = VCLKCON1_CLKVAL_NUM_VCLK(clkdiv - 1);
+-		writel(val, ctx->regs + VCLKCON1);
+-		writel(val, ctx->regs + VCLKCON2);
++	if (dsh_disp_clockdiv) {
++		if (clkdiv > 1) {
++			val = VCLKCON1_CLKVAL_NUM_VCLK(clkdiv - 1);
++			writel(val, ctx->regs + VCLKCON1);
++			writel(val, ctx->regs + VCLKCON2);
++		}
++		pr_err(DSH_DISP_TAG " decon: clkdiv=%u VCLKCON1/2 written\n", clkdiv);
++	} else {
++		pr_err(DSH_DISP_TAG " decon: clkdiv=%u SKIPPED (clockdiv=0)\n", clkdiv);
+ 	}
+ 
+ 	val = readl(ctx->regs + DECON_UPDATE);
+ 	val |= DECON_UPDATE_STANDALONE_F;
+ 	writel(val, ctx->regs + DECON_UPDATE);
++
++	pr_err(DSH_DISP_TAG " decon: after commit VIDCON0=%08x VIDTCON4=%08x VCLKCON1=%08x DECON_UPDATE=%08x\n",
++	       readl(ctx->regs + VIDCON0), readl(ctx->regs + VIDTCON4),
++	       readl(ctx->regs + VCLKCON1), readl(ctx->regs + DECON_UPDATE));
+ }
+ 
+ static int decon_enable_vblank(struct exynos_drm_crtc *crtc)
+@@ -227,7 +318,9 @@ static int decon_enable_vblank(struct exynos_drm_crtc *crtc)
  
  		val |= VIDINTCON0_INT_ENABLE;
  
@@ -72,7 +229,7 @@ index 0156a5e94..2e1aa6f0c 100644
  			val |= VIDINTCON0_INT_FRAME;
  			val &= ~VIDINTCON0_FRAMESEL0_MASK;
  			val |= VIDINTCON0_FRAMESEL0_VSYNC;
-@@ -251,7 +252,9 @@ static void decon_disable_vblank(struct exynos_drm_crtc *crtc)
+@@ -251,7 +344,9 @@ static void decon_disable_vblank(struct exynos_drm_crtc *crtc)
  		val = readl(ctx->regs + VIDINTCON0);
  
  		val &= ~VIDINTCON0_INT_ENABLE;
@@ -83,9 +240,12 @@ index 0156a5e94..2e1aa6f0c 100644
  			val &= ~VIDINTCON0_INT_FRAME;
  
  		writel(val, ctx->regs + VIDINTCON0);
-@@ -408,6 +411,14 @@ static void decon_update_plane(struct exynos_drm_crtc *crtc,
+@@ -407,7 +502,17 @@ static void decon_update_plane(struct exynos_drm_crtc *crtc,
+ 
  	/* buffer start address */
  	val = (unsigned long)exynos_drm_fb_dma_addr(fb, 0);
++	pr_err(DSH_DISP_TAG " decon: update_plane win=%u fb=%ux%u fmt=%08x pitch=%u dma=%08lx\n",
++	       win, fb->width, fb->height, fb->format->format, pitch, val);
  	writel(val, ctx->regs + VIDW_BUF_START(win));
 +	/*
 +	 * The window runs in triple buffer mode; program all three buffer
@@ -98,7 +258,7 @@ index 0156a5e94..2e1aa6f0c 100644
  
  	padding = (pitch / cpp) - fb->width;
  
-@@ -508,6 +519,29 @@ static void decon_atomic_flush(struct exynos_drm_crtc *crtc)
+@@ -508,6 +613,34 @@ static void decon_atomic_flush(struct exynos_drm_crtc *crtc)
  
  	for (i = 0; i < WINDOWS_NR; i++)
  		decon_shadow_protect_win(ctx, i, false);
@@ -111,7 +271,10 @@ index 0156a5e94..2e1aa6f0c 100644
 +	 */
 +	if (ctx->i80_if) {
 +		u32 val = readl(ctx->regs + TRIGCON);
++		u32 upd = readl(ctx->regs + DECON_UPDATE);
 +
++		pr_err(DSH_DISP_TAG " decon: flush TRIGCON in=%08x DECON_UPDATE in=%08x\n",
++		       val, upd);
 +		val &= ~(TRIGCON_HWTRIG_INV_I80_RGB | TRIGCON_HWTRIGEN_I80_RGB |
 +			 TRIGCON_HWTRIGMASK_DISPIF0 |
 +			 TRIGCON_HWTRIGMASK_DISPIF1);
@@ -119,16 +282,18 @@ index 0156a5e94..2e1aa6f0c 100644
 +		       TRIGCON_HWTRIGEN_I80_RGB | TRIGCON_HWTRIGMASK_DISPIF0 |
 +		       TRIGCON_HWTRIGMASK_DISPIF1 | TRIGCON_HWTRIG_AUTO_MASK;
 +		writel(val, ctx->regs + TRIGCON);
-+		writel(readl(ctx->regs + DECON_UPDATE) |
-+		       DECON_UPDATE_STANDALONE_F, ctx->regs + DECON_UPDATE);
++		writel(upd | DECON_UPDATE_STANDALONE_F, ctx->regs + DECON_UPDATE);
 +		writel(readl(ctx->regs + TRIGCON) | TRIGCON_SWTRIGCMD_I80_RGB,
 +		       ctx->regs + TRIGCON);
++		pr_err(DSH_DISP_TAG " decon: flush TRIGCON out=%08x DECON_UPDATE out=%08x\n",
++		       readl(ctx->regs + TRIGCON),
++		       readl(ctx->regs + DECON_UPDATE));
 +	}
 +
  	exynos_crtc_handle_event(crtc);
  }
  
-@@ -515,17 +549,24 @@ static void decon_init(struct decon_context *ctx)
+@@ -515,17 +648,24 @@ static void decon_init(struct decon_context *ctx)
  {
  	u32 val;
  
@@ -157,13 +322,25 @@ index 0156a5e94..2e1aa6f0c 100644
  }
  
  static void decon_atomic_enable(struct exynos_drm_crtc *crtc)
-@@ -542,6 +583,29 @@ static void decon_atomic_enable(struct exynos_drm_crtc *crtc)
+@@ -536,19 +676,77 @@ static void decon_atomic_enable(struct exynos_drm_crtc *crtc)
+ 	if (!ctx->suspended)
+ 		return;
+ 
++	pr_err(DSH_DISP_TAG " decon: atomic_enable enter i80=%d sysmmu=%d\n",
++	       ctx->i80_if, dsh_disp_sysmmu);
++
+ 	ret = pm_runtime_resume_and_get(ctx->dev);
+ 	if (ret < 0) {
+ 		DRM_DEV_ERROR(ctx->dev, "failed to enable DECON device.\n");
  		return;
  	}
- 
-+	if (ctx->i80_if) {
++	pr_err(DSH_DISP_TAG " decon: pm_resume ret=%d clocks pclk=%lu aclk=%lu eclk=%lu vclk=%lu\n",
++	       ret, clk_get_rate(ctx->pclk), clk_get_rate(ctx->aclk),
++	       clk_get_rate(ctx->eclk), clk_get_rate(ctx->vclk));
++
++	if (ctx->i80_if && dsh_disp_sysmmu) {
 +		phys_addr_t fb = 0;
-+		int i;
++		int i, map_ret = -1;
 +
 +		/*
 +		 * The bootloader's framebuffer is still being scanned by DECON
@@ -175,19 +352,71 @@ index 0156a5e94..2e1aa6f0c 100644
 +		for (i = 0; i < WINDOWS_NR; i++) {
 +			phys_addr_t addr = readl(ctx->regs + VIDW_BUF_START(i));
 +
++			pr_err(DSH_DISP_TAG " decon: VIDW_BUF_START%d=%pa\n",
++			       i, &addr);
 +			if (addr && (!fb || addr < fb))
 +				fb = addr;
 +		}
-+		if (fb)
-+			exynos_iommu_map_identity(ctx->dev, fb, SZ_64M);
++		/*
++		 * Prefer the /chosen simple-framebuffer address: that is what
++		 * S-Boot is certainly scanning.  If it is known, map a range
++		 * from whichever of (DT fb, VIDW_BUF_START) is lower so both
++		 * are covered.
++		 */
++		if (ctx->boot_fb.base && (!fb || ctx->boot_fb.base < fb))
++			fb = ctx->boot_fb.base;
++		if (fb) {
++			size_t map_size = SZ_64M;
++
++			/*
++			 * When the /chosen framebuffer is the thing being
++			 * mapped, only reserve its real size (16 MB) instead
++			 * of a blanket 64 MB, to reduce IOVA overlap with
++			 * the subsequent DMA allocations.
++			 */
++			if (ctx->boot_fb.base && ctx->boot_fb.size &&
++			    fb == ctx->boot_fb.base)
++				map_size = ctx->boot_fb.size;
++			map_ret = exynos_iommu_map_identity(ctx->dev, fb, map_size);
++		}
++		pr_err(DSH_DISP_TAG " decon: identity fb=%pa boot_fb=%pa ret=%d, enabling sysmmu...\n",
++		       &fb, &ctx->boot_fb.base, map_ret);
++		exynos_iommu_master_ready(ctx->dev);
++		pr_err(DSH_DISP_TAG " decon: sysmmu enabled\n");
++	} else if (ctx->i80_if) {
++		pr_err(DSH_DISP_TAG " decon: sysmmu/identity SKIPPED (sysmmu=0)\n");
 +	}
-+
-+	exynos_iommu_master_ready(ctx->dev);
-+
+ 
  	decon_init(ctx);
++	pr_err(DSH_DISP_TAG " decon: decon_init done\n");
  
  	/* if vblank was enabled status, enable it again. */
-@@ -601,14 +665,17 @@ static irqreturn_t decon_irq_handler(int irq, void *dev_id)
+ 	if (test_and_clear_bit(0, &ctx->irq_flags))
+ 		decon_enable_vblank(ctx->crtc);
+ 
++	pr_err(DSH_DISP_TAG " decon: calling commit...\n");
+ 	decon_commit(ctx->crtc);
++	pr_err(DSH_DISP_TAG " decon: atomic_enable done\n");
+ 
+ 	ctx->suspended = false;
+ }
+@@ -589,9 +787,15 @@ static const struct exynos_drm_crtc_ops decon_crtc_ops = {
+ static irqreturn_t decon_irq_handler(int irq, void *dev_id)
+ {
+ 	struct decon_context *ctx = (struct decon_context *)dev_id;
++	static unsigned int dsh_irq_cnt;
+ 	u32 val, clear_bit;
+ 
+ 	val = readl(ctx->regs + VIDINTCON1);
++	if (dsh_irq_cnt < 8) {
++		dsh_irq_cnt++;
++		pr_err(DSH_DISP_TAG " decon: irq#%u VIDINTCON1=%08x i80=%d\n",
++		       dsh_irq_cnt, val, ctx->i80_if);
++	}
+ 
+ 	clear_bit = ctx->i80_if ? VIDINTCON1_INT_I80 : VIDINTCON1_INT_FRAME;
+ 	if (val & clear_bit)
+@@ -601,14 +805,17 @@ static irqreturn_t decon_irq_handler(int irq, void *dev_id)
  	if (!ctx->drm_dev)
  		goto out;
  
@@ -212,8 +441,103 @@ index 0156a5e94..2e1aa6f0c 100644
  	}
  out:
  	return IRQ_HANDLED;
+@@ -622,11 +829,13 @@ static int decon_bind(struct device *dev, struct device *master, void *data)
+ 	unsigned int i;
+ 	int ret;
+ 
++	pr_err(DSH_DISP_TAG " decon: bind enter\n");
+ 	ret = decon_ctx_initialize(ctx, drm_dev);
+ 	if (ret) {
+ 		DRM_DEV_ERROR(dev, "decon_ctx_initialize failed.\n");
+ 		return ret;
+ 	}
++	pr_err(DSH_DISP_TAG " decon: bind ctx_initialize ok\n");
+ 
+ 	for (i = 0; i < WINDOWS_NR; i++) {
+ 		ctx->configs[i].pixel_formats = decon_formats;
+@@ -648,9 +857,16 @@ static int decon_bind(struct device *dev, struct device *master, void *data)
+ 		return PTR_ERR(ctx->crtc);
+ 	}
+ 
+-	if (ctx->encoder)
+-		exynos_dpi_bind(drm_dev, ctx->encoder);
++	if (ctx->encoder) {
++		ret = exynos_dpi_bind(drm_dev, ctx->encoder);
++		pr_err(DSH_DISP_TAG " decon: bind dpi_bind ret=%d\n", ret);
++		if (ret)
++			return ret;
++	} else {
++		pr_err(DSH_DISP_TAG " decon: bind NO encoder!\n");
++	}
+ 
++	pr_err(DSH_DISP_TAG " decon: bind done crtc=%px\n", ctx->crtc);
+ 	return 0;
+ 
+ }
+@@ -673,6 +889,40 @@ static const struct component_ops decon_component_ops = {
+ 	.unbind = decon_unbind,
+ };
+ 
++/*
++ * DSH 2026-10-20: find the S-Boot framebuffer described under /chosen.
++ * uniLoader injects a "simple-framebuffer" node with reg = base,size.
++ * Mapping this one-to-one in the IOMMU domain is much more robust than
++ * reading VIDW_BUF_START back from the DECON (those registers may be in an
++ * unexpected triple-buffer state).
++ */
++static void dsh_decon_find_boot_fb(struct decon_context *ctx)
++{
++	struct device_node *chosen, *fb;
++	struct resource res;
++
++	ctx->boot_fb.base = 0;
++	ctx->boot_fb.size = 0;
++
++	chosen = of_find_node_by_path("/chosen");
++	if (!chosen)
++		return;
++
++	for_each_child_of_node(chosen, fb) {
++		if (!of_device_is_compatible(fb, "simple-framebuffer"))
++			continue;
++		if (of_address_to_resource(fb, 0, &res))
++			continue;
++		ctx->boot_fb.base = res.start;
++		ctx->boot_fb.size = resource_size(&res);
++		of_node_put(fb);
++		break;
++	}
++	of_node_put(chosen);
++	pr_err(DSH_DISP_TAG " decon: boot_fb base=%pa size=%#zx\n",
++	       &ctx->boot_fb.base, ctx->boot_fb.size);
++}
++
+ static int decon_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -690,6 +940,8 @@ static int decon_probe(struct platform_device *pdev)
+ 	ctx->dev = dev;
+ 	ctx->suspended = true;
+ 
++	dsh_decon_find_boot_fb(ctx);
++
+ 	i80_if_timings = of_get_child_by_name(dev->of_node, "i80-if-timings");
+ 	if (i80_if_timings)
+ 		ctx->i80_if = true;
+@@ -750,7 +1002,11 @@ static int decon_probe(struct platform_device *pdev)
+ 
+ 	pm_runtime_enable(dev);
+ 
++	pr_err(DSH_DISP_TAG " decon: probe i80=%d pclk=%lu aclk=%lu eclk=%lu vclk=%lu encoder=%px\n",
++	       ctx->i80_if, clk_get_rate(ctx->pclk), clk_get_rate(ctx->aclk),
++	       clk_get_rate(ctx->eclk), clk_get_rate(ctx->vclk), ctx->encoder);
+ 	ret = component_add(dev, &decon_component_ops);
++	pr_err(DSH_DISP_TAG " decon: probe component_add ret=%d\n", ret);
+ 	if (ret)
+ 		goto err_disable_pm_runtime;
+ 
 diff --git a/drivers/gpu/drm/exynos/exynos_drm_dma.c b/drivers/gpu/drm/exynos/exynos_drm_dma.c
-index a971590b8..89aa77ef2 100644
+index a971590b8..8d7750996 100644
 --- a/drivers/gpu/drm/exynos/exynos_drm_dma.c
 +++ b/drivers/gpu/drm/exynos/exynos_drm_dma.c
 @@ -6,6 +6,7 @@
@@ -224,7 +548,21 @@ index a971590b8..89aa77ef2 100644
  #include <linux/platform_device.h>
  
  #include <drm/drm_print.h>
-@@ -112,9 +113,22 @@ int exynos_drm_register_dma(struct drm_device *drm, struct device *dev,
+@@ -96,11 +97,13 @@ int exynos_drm_register_dma(struct drm_device *drm, struct device *dev,
+ 			    void **dma_priv)
+ {
+ 	struct exynos_drm_private *priv = drm->dev_private;
++	int ret;
+ 
+ 	if (!priv->dma_dev) {
+ 		priv->dma_dev = dev;
+ 		DRM_INFO("Exynos DRM: using %s device for DMA mapping operations\n",
+ 			 dev_name(dev));
++		pr_err("DSH-DISP dma: dma_dev=%s\n", dev_name(dev));
+ 	}
+ 
+ 	if (!IS_ENABLED(CONFIG_EXYNOS_IOMMU))
+@@ -112,17 +115,34 @@ int exynos_drm_register_dma(struct drm_device *drm, struct device *dev,
  		if (IS_ENABLED(CONFIG_ARM_DMA_USE_IOMMU))
  			mapping = arm_iommu_create_mapping(&platform_bus_type,
  				EXYNOS_DEV_ADDR_START, EXYNOS_DEV_ADDR_SIZE);
@@ -249,11 +587,31 @@ index a971590b8..89aa77ef2 100644
  			mapping = ERR_PTR(-ENODEV);
  
  		if (IS_ERR(mapping))
+ 			return PTR_ERR(mapping);
+ 		priv->mapping = mapping;
++		pr_err("DSH-DISP dma: mapping=%px (domain) from %s\n",
++		       mapping, dev_name(priv->dma_dev));
+ 	}
+ 
+-	return drm_iommu_attach_device(drm, dev, dma_priv);
++	ret = drm_iommu_attach_device(drm, dev, dma_priv);
++	pr_err("DSH-DISP dma: attach %s ret=%d\n", dev_name(dev), ret);
++	return ret;
+ }
+ 
+ void exynos_drm_unregister_dma(struct drm_device *drm, struct device *dev,
 diff --git a/drivers/gpu/drm/exynos/exynos_drm_drv.c b/drivers/gpu/drm/exynos/exynos_drm_drv.c
-index 8399256cb..2ac553c37 100644
+index 8399256cb..9d977ddd5 100644
 --- a/drivers/gpu/drm/exynos/exynos_drm_drv.c
 +++ b/drivers/gpu/drm/exynos/exynos_drm_drv.c
-@@ -15,6 +15,7 @@
+@@ -9,12 +9,14 @@
+ 
+ #include <linux/component.h>
+ #include <linux/dma-mapping.h>
++#include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/uaccess.h>
  
  #include <drm/drm_atomic.h>
  #include <drm/drm_atomic_helper.h>
@@ -261,23 +619,87 @@ index 8399256cb..2ac553c37 100644
  #include <drm/drm_drv.h>
  #include <drm/drm_file.h>
  #include <drm/drm_fourcc.h>
-@@ -241,6 +242,16 @@ static int exynos_drm_bind(struct device *dev)
+@@ -36,6 +38,22 @@
+ #define DRIVER_DESC	"Samsung SoC DRM"
+ #define DRIVER_DATE	"20180330"
+ 
++/*
++ * DSH 2026-10-20: DECON bring-up kill switches for staged validation.
++ * Defaults are the zenlte/upstream behaviour.
++ *
++ *   aperture=0 : keep simpledrm (do not remove the bootloader framebuffer)
++ *   fbdev=0    : skip exynos_drm_fbdev_setup() so the first atomic modeset
++ *                (and thus decon_atomic_enable) only happens when a userspace
++ *                client explicitly does one.
++ */
++bool dsh_disp_aperture = true;
++module_param_named(aperture, dsh_disp_aperture, bool, 0644);
++bool dsh_disp_fbdev = true;
++module_param_named(fbdev, dsh_disp_fbdev, bool, 0644);
++
++#define DSH_DISP_TAG "DSH-DISP"
++
+ /*
+  * Interface history:
+  *
+@@ -241,6 +259,25 @@ static int exynos_drm_bind(struct device *dev)
  	unsigned int clone_mask;
  	int ret;
  
++	pr_err(DSH_DISP_TAG " bind: enter (%s), aperture=%d fbdev=%d\n",
++	       dev_name(dev), dsh_disp_aperture, dsh_disp_fbdev);
++
 +	/*
 +	 * Remove the bootloader's simple-framebuffer (simpledrm) before taking
 +	 * over.  Otherwise userspace ends up with two DRM devices/connectors
 +	 * (simpledrm + exynos) driving the same panel, which confuses touch
 +	 * input mapping and per-monitor scaling.
 +	 */
-+	ret = drm_aperture_remove_framebuffers(&exynos_drm_driver);
-+	if (ret)
-+		return ret;
++	if (dsh_disp_aperture) {
++		pr_err(DSH_DISP_TAG " bind: drm_aperture_remove_framebuffers()\n");
++		ret = drm_aperture_remove_framebuffers(&exynos_drm_driver);
++		if (ret)
++			return ret;
++		pr_err(DSH_DISP_TAG " bind: simpledrm removed\n");
++	} else {
++		pr_err(DSH_DISP_TAG " bind: keep simpledrm (aperture=0)\n");
++	}
 +
  	drm = drm_dev_alloc(&exynos_drm_driver, dev);
  	if (IS_ERR(drm))
  		return PTR_ERR(drm);
+@@ -270,7 +307,9 @@ static int exynos_drm_bind(struct device *dev)
+ 		encoder->possible_clones = clone_mask;
+ 
+ 	/* Try to bind all sub drivers. */
++	pr_err(DSH_DISP_TAG " bind: component_bind_all()...\n");
+ 	ret = component_bind_all(drm->dev, drm);
++	pr_err(DSH_DISP_TAG " bind: component_bind_all ret=%d\n", ret);
+ 	if (ret)
+ 		goto err_mode_config_cleanup;
+ 
+@@ -284,12 +323,20 @@ static int exynos_drm_bind(struct device *dev)
+ 	drm_kms_helper_poll_init(drm);
+ 
+ 	/* register the DRM device */
++	pr_err(DSH_DISP_TAG " bind: drm_dev_register()...\n");
+ 	ret = drm_dev_register(drm, 0);
++	pr_err(DSH_DISP_TAG " bind: drm_dev_register ret=%d\n", ret);
+ 	if (ret < 0)
+ 		goto err_cleanup_poll;
+ 
+-	exynos_drm_fbdev_setup(drm);
++	if (dsh_disp_fbdev) {
++		pr_err(DSH_DISP_TAG " bind: exynos_drm_fbdev_setup()...\n");
++		exynos_drm_fbdev_setup(drm);
++	} else {
++		pr_err(DSH_DISP_TAG " bind: fbdev setup SKIPPED (fbdev=0)\n");
++	}
+ 
++	pr_err(DSH_DISP_TAG " bind: done\n");
+ 	return 0;
+ 
+ err_cleanup_poll:
 diff --git a/drivers/gpu/drm/exynos/exynos_drm_drv.h b/drivers/gpu/drm/exynos/exynos_drm_drv.h
 index 81d501efd..126904316 100644
 --- a/drivers/gpu/drm/exynos/exynos_drm_drv.h
@@ -302,6 +724,20 @@ index 81d501efd..126904316 100644
  #ifdef CONFIG_DRM_EXYNOS_DPI
  struct drm_encoder *exynos_dpi_probe(struct device *dev);
  int exynos_dpi_remove(struct drm_encoder *encoder);
+diff --git a/drivers/gpu/drm/exynos/regs-decon7.h b/drivers/gpu/drm/exynos/regs-decon7.h
+index 5bc5f1db5..50c63e6a8 100644
+--- a/drivers/gpu/drm/exynos/regs-decon7.h
++++ b/drivers/gpu/drm/exynos/regs-decon7.h
+@@ -220,6 +220,9 @@
+ 
+ /* Interrupt control register */
+ #define VIDINTCON0				0x500
++/* DSH 2026-10-20: i80 命令模式中断使能（vendor regs-decon.h 同款位） */
++#define VIDINTCON0_INT_I80_EN		(1 << 17)
++
+ 
+ #define VIDINTCON0_WAKEUP_MASK			(0x3f << 26)
+ #define VIDINTCON0_INTEXTRAEN			(1 << 21)
 diff --git a/drivers/gpu/drm/tiny/simpledrm-g9209-copy.h b/drivers/gpu/drm/tiny/simpledrm-g9209-copy.h
 new file mode 100644
 index 000000000..acd5c5188
