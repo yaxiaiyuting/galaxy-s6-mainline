@@ -595,10 +595,10 @@ index 000000000..e112fb2a2
 +};
 diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
 new file mode 100644
-index 000000000..011f04a00
+index 000000000..13b659d8f
 --- /dev/null
 +++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
-@@ -0,0 +1,1321 @@
+@@ -0,0 +1,1392 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Samsung Galaxy S6 (SM-G9209, zeroflte, Exynos 7420) — mainline Linux 6.6
@@ -874,8 +874,29 @@ index 000000000..011f04a00
 + * ctc_stock.dts / exynos7420-zeroflte_*.dts 的 touchscreen 节点都没有它。
 + */
 +/ {
++	/*
++	 * DSH 2026-10-20: 改用 gpio-keys-polled（轮询），不用 EINT 中断。
++	 *
++	 * 实测：gpio 引脚配置正确（in hi IRQ ACTIVE LOW），IRQ 也注册了，
++	 * 但 /proc/interrupts 里 Power/VolumeUp/VolumeDown/Home 的计数永远是 0
++	 * —— Exynos7420 的 EINT 路径在本板没打通（wakeup-eint 控制器问题）。
++	 *
++	 * 轮询式完全不碰 EINT，靠 20ms 定时器读引脚，可靠但功耗略高。
++	 * 本机不休眠，这点功耗可接受。
++	 */
++	/*
++	 * DSH 2026-10-20: 按键暂时完全禁用。
++	 *
++	 * 实测：gpio 引脚配置正确、IRQ 注册成功，但 Exynos7420 的 EINT 在本板
++	 * 永远不触发（/proc/interrupts 计数恒为 0），且按下按键会导致整机重启。
++	 * 改用 gpio-keys-polled 轮询后仍不稳定。
++	 *
++	 * 用户决定先不要按键，优先保证系统稳定可用。后续再单独攻关。
++	 */
 +	gpio-keys {
-+		compatible = "gpio-keys";
++		status = "disabled";
++		compatible = "gpio-keys-polled";
++		poll-interval = <20>;
 +		pinctrl-names = "default";
 +		pinctrl-0 = <&key_power_pins>, <&key_volup_pins>,
 +			    <&key_voldown_pins>, <&key_home_pins>;
@@ -1628,6 +1649,15 @@ index 000000000..011f04a00
 +#define DSH_ENABLE_PCIE_WIFI 1
 +
 +#if DSH_ENABLE_PCIE_WIFI
++&pinctrl_fsys1 {
++	bt_wake_pin: bt-wake-pin {
++		samsung,pins = "gpr3-4";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_OUTPUT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS7_PIN_DRV_LV4>;
++	};
++};
++
 +&pinctrl_bus1 {
 +	pcie1_clkreq: pcie1-clkreq {
 +		samsung,pins = "gpf0-6";
@@ -1756,7 +1786,34 @@ index 000000000..011f04a00
 + * 于是它不碰 BT_EN/IRQ（正好由下面的 gpio-hog 负责），但 bcm_setup() 仍然会
 + * 调用 btbcm_initialize() 从 /lib/firmware/brcm/ 下载 BCM4358A3 补丁。
 + */
-+#define DSH_ENABLE_BT 0
++/*
++ * DSH 2026-10-20: AUD PLL 的 fixed-clock 替身。
++ *
++ * `sclk_uart`(CMU_AUD, 供 UART4/蓝牙用) 的父链是：
++ *   mout_aud_pll_user = { "fin_pll", "fout_aud_pll" }
++ *     -> dout_aud_cdclk -> dout_sclk_uart -> sclk_uart
++ *
++ * 而 `fout_aud_pll` 由 exynos7_clk_topc_init() 注册（clk-exynos7.c:183），
++ * CMU_TOPC @ 0x10570000 是死区、DTS 里 disabled -> PLL 从未注册 ->
++ * mux 父表里第二项是 NULL。S-Boot 若把 mux 选在 PLL 那一档，
++ * clk_get_rate() 返回 0，samsung-uart 报
++ *   "Failed to get clock rate for clk_uart_baud0"
++ * 波特率设不了 -> hci0 tx timeout -> 蓝牙不通（实测 p236）。
++ *
++ * 用一个固定时钟补上这个名字即可。48 MHz 是 AUD PLL 的典型输出，
++ * 且 UART 分频寄存器由 S-Boot 配好、内核只读，速率数值只影响
++ * 软件计算出的分频值，不影响真实时钟树。
++ */
++/ {
++	fout_aud_pll: clock-aud-pll {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <48000000>;
++		clock-output-names = "fout_aud_pll";
++	};
++};
++
++#define DSH_ENABLE_BT 1
 +
 +#if DSH_ENABLE_BT
 +
@@ -1809,27 +1866,41 @@ index 000000000..011f04a00
 + * 副作用：无法从用户态复位 BT；要强制重新上电就删掉这两段 hog，
 + * 改用 gpioset 手动拉一次 0→1（具体步骤见移植文档的"上机验证"一节）。
 + */
-+&gpf4 {
-+	bt-en-hog {
-+		gpio-hog;
-+		gpios = <1 GPIO_ACTIVE_HIGH>;
-+		output-high;
-+		line-name = "bt_en";
++/*
++ * DSH 2026-10-20: 蓝牙 BT_EN / BT_WAKE 的 pinmux。
++ *
++ * gpio-hog 只是"申请并驱动" GPIO，不会把引脚功能切成输出 ——
++ * 必须显式给 pinctrl。对照 WiFi 的 wl-en：PCIe 节点 pinctrl-0 里有
++ * cfg_wlanen（gpf4-6, EXYNOS_PIN_FUNC_OUTPUT），所以 wl-en hog 能显示
++ * "out hi"；而 bt_en 之前是 "in hi"（引脚没切功能），导致 BCM4358
++ * 收不到使能、HCI reset 超时。
++ */
++&pinctrl_bus1 {
++	bt_en_pin: bt-en-pin {
++		samsung,pins = "gpf4-1";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_OUTPUT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS7_PIN_DRV_LV4>;
 +	};
++
 +};
 +
-+&gpr3 {
-+	bt-wake-hog {
-+		gpio-hog;
-+		gpios = <4 GPIO_ACTIVE_HIGH>;
-+		output-low;
-+		line-name = "bt_wake";
-+	};
-+};
++/*
++ * DSH: gpio-hog 已移除。
++ * 实测 hog 只 request 了 GPIO（gpioinfo 显示 [used]），但从没把方向设成
++ * output（debugfs 一直是 "in hi"），也没设 pinmux 功能 —— 于是：
++ *   1) BCM4358 收不到 BT_EN，HCI reset 超时
++ *   2) hog 持有 line，用户态 gpioset 报 "Device or resource busy"
++ * 改为：DTS 里只保留 pinmux（bt_en_pin/bt_wake_pin，已在 serial_4 的
++ * pinctrl-0 里设成 OUTPUT），由 rootfs 的 systemd service 用 gpioset
++ * 在开机时把 BT_EN 拉高。这样既能看到真实电平，也方便手动调试。
++ */
++
++/* DSH: bt-wake hog 同样移除，见上面 bt-en 的说明 */
 +
 +&serial_4 {
 +	pinctrl-names = "default";
-+	pinctrl-0 = <&bt_uart_bus &bt_host_wake>;
++	pinctrl-0 = <&bt_uart_bus &bt_host_wake &bt_en_pin &bt_wake_pin>;
 +	status = "okay";
 +};
 +

@@ -1,0 +1,12 @@
+[Unit]
+Description=G9209: enable MAX77843 charging at boot
+After=systemd-modules-load.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'echo safe > /sys/class/power_supply/max77843-charger/charge_ctrl'
+
+[Install]
+WantedBy=multi-user.target
