@@ -206,7 +206,7 @@ rodata=off keep_bootcon mitigations=off nokaslr kpti=off
 ## 六、构建与验证
 
 ```bash
-cd /home/duanjb666/linux7420/bringup
+cd <HOME>/linux7420/bringup
 # 1. 编译 pmsg-init 并重建 ramdisk（替换 init + etc/rc）
 python3 build_pmsg_ramdisk.py /tmp/base-ramdisk.gz /tmp/ramdisk-new.gz
 # 2. 安装
@@ -260,7 +260,7 @@ G9209 PID1 HANDOVER root=/mnt init=/sbin/init pid=1
 + 与真 rc 逻辑一致的 stub rc
 + 真实 Debian 12 rootfs（disk.raw 副本）
 
-**串口证据**（`/home/duanjb666/vmtest/serial2.log`，267KB）：
+**串口证据**（`<HOME>/vmtest/serial2.log`，267KB）：
 
 ```
 [0.650] Run /init as init process
@@ -287,9 +287,9 @@ G9209 PID1 HANDOVER root=/mnt init=/sbin/init pid=1
 
 **复跑命令**：
 ```bash
-cd /home/duanjb666/vmtest
+cd <HOME>/vmtest
 qemu-system-aarch64 -M virt -cpu cortex-a72 -smp 4 -m 3072 -nographic -no-reboot \
-  -kernel /home/duanjb666/linux7420/linux-6.6/arch/arm64/boot/Image \
+  -kernel <HOME>/linux7420/linux-6.6/arch/arm64/boot/Image \
   -initrd test-initramfs.gz \
   -append "console=ttyAMA0 loglevel=8 panic=10" \
   -drive id=dsk,file=disk.raw,format=raw,if=none -device virtio-blk-device,drive=dsk
