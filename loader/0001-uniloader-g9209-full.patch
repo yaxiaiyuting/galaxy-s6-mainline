@@ -1,0 +1,5074 @@
+diff --git a/Makefile b/Makefile
+index 34e99a4..76f804a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -260,7 +260,7 @@ ifeq ($(ARCH), arm)
+ KBUILD_CFLAGS += -march=armv7-a -mfloat-abi=soft -mtune=cortex-a9
+ KBUILD_AFLAGS += -march=armv7-a -mfloat-abi=soft -mtune=cortex-a9
+ else
+-KBUILD_CFLAGS += -march=armv8-a -mtune=cortex-a53 -mcpu=cortex-a53
++KBUILD_CFLAGS += -march=armv8-a -mtune=cortex-a53 -mcpu=cortex-a53 -mgeneral-regs-only -mstrict-align
+ KBUILD_AFLAGS += -march=armv8-a -mtune=cortex-a53 -mcpu=cortex-a53
+ endif
+ 
+diff --git a/arch/aarch64/Makefile b/arch/aarch64/Makefile
+index 5973c6d..ec7bbd0 100644
+--- a/arch/aarch64/Makefile
++++ b/arch/aarch64/Makefile
+@@ -4,3 +4,4 @@
+ 
+ obj-$(CONFIG_POSITION_INDEPENDENT) += aarch64/reloc.o
+ obj-y += aarch64/start.o aarch64/load-kernel.o aarch64/memcpy.o
++obj-$(CONFIG_SAMSUNG_ZEROFLTE) += aarch64/probe.o
+diff --git a/arch/aarch64/load-kernel.c b/arch/aarch64/load-kernel.c
+index 8eee041..7406f52 100644
+--- a/arch/aarch64/load-kernel.c
++++ b/arch/aarch64/load-kernel.c
+@@ -6,12 +6,155 @@
+ 
+ #include <main/boot.h>
+ #include <string.h>
++#include <lib/debug.h>	/* DSH: 拷贝进度打印 */
++#include <drivers/usb-console.h>
++#include <main/dsh-diag.h>
++
++static volatile unsigned long copy_done;
++static volatile unsigned long copy_src;
++static volatile unsigned long copy_dst;
++static volatile unsigned long fault_active;
++
++/* No return: the caller's registers were not saved by the fatal vectors. */
++void dsh_loader_fault(unsigned long esr, unsigned long far,
++		      unsigned long elr, unsigned long el)
++{
++	if (!fault_active) {
++		fault_active = 1;
++		printk(KERN_EMERG, "[LOADER FAULT] EL%lu ESR=%016lx\n", el, esr);
++		printk(KERN_EMERG, "[LOADER FAULT] FAR=%016lx PC=%016lx\n", far, elr);
++		printk(KERN_EMERG, "[LOADER FAULT] src=%08lx dst=%08lx done=%lu\n",
++		       copy_src, copy_dst, copy_done);
++	}
++	for (;;)
++		asm volatile("wfe");
++}
++
++static void copy_checked(void *dst, const void *src, unsigned long size)
++{
++	const unsigned long chunk_size = 2UL * 1024 * 1024;
++	unsigned long done = 0;
++
++	copy_src = (unsigned long)src;
++	copy_dst = (unsigned long)dst;
++	copy_done = 0;
++	/* Bound linker-provided lengths before calculating addresses. */
++	if (!size || size > 29360128UL || copy_src < 0x40000000UL ||
++	    copy_src > 0x100000000UL - size || copy_dst < 0x40000000UL ||
++	    copy_dst > 0x100000000UL - size ||
++	    (copy_dst < copy_src + size && copy_src < copy_dst + size)) {
++		printk(KERN_EMERG, "[copy] invalid range/size: %lu; stopped\n", size);
++		for (;;)
++			asm volatile("wfe");
++	}
++	while (done < size) {
++		unsigned long n = size - done;
++		if (n > chunk_size)
++			n = chunk_size;
++		/*
++		 * DSH: 一律使用逐字节的易失访问来拷贝。
++		 *
++		 * 之前非 8 字节对齐时会走 __optimized_memcpy（汇编版），注释里
++		 * 自己承认"may issue unaligned paired accesses"，而 MMU 关闭时
++		 * 对 Device 内存做非对齐成对访问会触发对齐异常 —— 实测表现为
++		 * 偶发的 [LOADER FAULT] ESR=...（initramfs 大小 3,946,234 字节，
++		 * 末端 2 字节不对齐，最后一块正好命中）。
++		 *
++		 * 总共只拷 ~25 MB，速度不是瓶颈，正确性优先。用 volatile 逐字节
++		 * 循环可以确保编译器不会把它优化回成对访问。
++		 */
++		{
++			volatile unsigned char *d = (volatile unsigned char *)dst + done;
++			const volatile unsigned char *s2 =
++				(const volatile unsigned char *)src + done;
++			unsigned long k;
++			for (k = 0; k < n; k++)
++				d[k] = s2[k];
++		}
++		/* DSH: 同样用逐字节易失比较，避免 memcmp 生成非对齐成对访问。*/
++		{
++			volatile unsigned char *d = (volatile unsigned char *)dst + done;
++			const volatile unsigned char *s2 =
++				(const volatile unsigned char *)src + done;
++			unsigned long k;
++			for (k = 0; k < n; k++) {
++				if (d[k] != s2[k]) {
++					printk(KERN_EMERG,
++					       "[copy] VERIFY FAILED at offset %lu\n",
++					       done + k);
++					for (;;)
++						asm volatile("wfe");
++				}
++			}
++		}
++		done += n;
++		copy_done = done;
++		printk(KERN_WARNING, "[copy] verified %lu/%lu bytes\n", done, size);
++	}
++}
+ 
+ void arch_load_kernel(void* kernel, void* dt, void* ramdisk)
+ {
+-	memcpy((void*)CONFIG_PAYLOAD_ENTRY, kernel, (unsigned long) &kernel_size);
++	/* Stop the firmware's watchdog before copying or waiting for a host. */
++	if (!usb_console_watchdog_stop()) {
++		printk(KERN_ERR, "[wdt] initial stop failed; kernel entry blocked; use reboot recovery\n");
++		usb_console_start();
++		for (;;) usb_console_poll();
++	}
++	printk(KERN_WARNING, "[copy] kernel: src=%016lx dst=%08x bytes=%lu\n",
++	       (unsigned long)kernel, CONFIG_PAYLOAD_ENTRY, (unsigned long)&kernel_size);
++	copy_checked((void*)CONFIG_PAYLOAD_ENTRY, kernel, (unsigned long) &kernel_size);
++	printk(KERN_WARNING, "[copy] kernel OK dst[0]=%016lx\n",
++	       *(volatile unsigned long *)CONFIG_PAYLOAD_ENTRY);
+ #ifndef CONFIG_RAMDISK_NO_COPY
+-	__optimized_memcpy((void*)CONFIG_RAMDISK_ENTRY, ramdisk, (unsigned long) &ramdisk_size);
++	printk(KERN_WARNING, "[copy] ramdisk: src=%016lx dst=%08x bytes=%lu\n",
++	       (unsigned long)ramdisk, CONFIG_RAMDISK_ENTRY, (unsigned long)&ramdisk_size);
++	copy_checked((void*)CONFIG_RAMDISK_ENTRY, ramdisk, (unsigned long) &ramdisk_size);
++	printk(KERN_WARNING, "[copy] ramdisk OK\n");
+ #endif
++	arch_diag(dt);
++	unsigned long diagnostic_test_mode = 0;
++	/* Replay earlier logs after the long kernel copy/cache flush has finished. */
++	usb_console_start();
++	for (;;) {
++		unsigned int stage = usb_console_wait();
++		if (!stage || stage == 0x10000) {
++			/* Normal boot runs without the diagnostic watchdog deadline. */
++			if (!usb_console_watchdog_stop()) {
++				printk(KERN_ERR, "[wdt] handoff stop failed; kernel entry blocked; USB remains active\n");
++				continue;
++			}
++			if (dsh_apply_user_command(dt)) {
++				printk(KERN_ERR, "[cmd] FDT update failed; USB remains active\n");
++				continue;
++			}
++			diagnostic_test_mode = stage == 0x10000;
++			break;
++		}
++		/* Each probe starts from the original Image, with its NOBITS tail
++		 * cleared too. Reusing mutated page tables would invalidate results. */
++		copy_checked((void *)CONFIG_PAYLOAD_ENTRY, kernel, (unsigned long)&kernel_size);
++		unsigned long image_size = ((volatile unsigned long *)CONFIG_PAYLOAD_ENTRY)[2];
++		unsigned long file_size = (unsigned long)&kernel_size;
++		if (image_size < file_size || image_size > 0x4000000UL) {
++			printk(KERN_ERR, "[probe] invalid Image memory size\n");
++			continue;
++		}
++		memset((void *)(CONFIG_PAYLOAD_ENTRY + file_size), 0, image_size - file_size);
++		if (dsh_arm_probe(stage)) continue;
++		dsh_arm_diag_record(0);
++		arch_prepare_probe(dt);
++		usb_console_watchdog_arm();
++		unsigned long result = arch_probe_kernel(dt, (void *)CONFIG_PAYLOAD_ENTRY);
++		usb_console_watchdog_stop();
++		dsh_report_probe(result);
++		/* Restore the payload before accepting a subsequent normal boot. */
++		copy_checked((void *)CONFIG_PAYLOAD_ENTRY, kernel, file_size);
++		memset((void *)(CONFIG_PAYLOAD_ENTRY + file_size), 0, image_size - file_size);
++	}
++	dsh_arm_diag_record(diagnostic_test_mode);
++	usb_console_stop();
++	arch_prepare_kernel(dt);
++	printk(KERN_NOTICE, "[handoff] jumping to kernel at %08x\n", CONFIG_PAYLOAD_ENTRY);
+ 	load_kernel_and_jump(dt, 0, 0, 0, (void*)CONFIG_PAYLOAD_ENTRY);
+ }
+diff --git a/arch/aarch64/probe.S b/arch/aarch64/probe.S
+new file mode 100644
+index 0000000..d2d693d
+--- /dev/null
++++ b/arch/aarch64/probe.S
+@@ -0,0 +1,109 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* EL1 diagnostic call/return. The kernel exits through an identity-mapped
++ * trampoline with M/C off; no loader C code runs under kernel page tables. */
++.text
++.balign 16
++.global arch_probe_kernel
++.type arch_probe_kernel, %function
++arch_probe_kernel:
++	adrp x9, dsh_probe_context
++	add x9, x9, :lo12:dsh_probe_context
++	stp x19, x20, [x9, #0]
++	stp x21, x22, [x9, #16]
++	stp x23, x24, [x9, #32]
++	stp x25, x26, [x9, #48]
++	stp x27, x28, [x9, #64]
++	stp x29, x30, [x9, #80]
++	mov x10, sp
++	str x10, [x9, #96]
++	mrs x10, daif
++	str x10, [x9, #104]
++	mrs x10, sctlr_el1
++	str x10, [x9, #112]
++	mrs x10, tcr_el1
++	str x10, [x9, #120]
++	mrs x10, mair_el1
++	str x10, [x9, #128]
++	mrs x10, ttbr0_el1
++	str x10, [x9, #136]
++	mrs x10, ttbr1_el1
++	str x10, [x9, #144]
++	mrs x10, vbar_el1
++	str x10, [x9, #152]
++	mrs x10, cpacr_el1
++	str x10, [x9, #160]
++	mrs x10, mdscr_el1
++	str x10, [x9, #168]
++	mrs x10, pmuserenr_el0
++	str x10, [x9, #176]
++	mrs x10, sp_el0
++	str x10, [x9, #184]
++	mrs x10, tpidr_el1
++	str x10, [x9, #192]
++	mrs x10, tpidrro_el0
++	str x10, [x9, #200]
++	mrs x10, tpidr_el0
++	str x10, [x9, #208]
++	msr daifset, #0xf
++	dsb sy
++	mov x16, x1
++	mov x1, xzr
++	mov x2, xzr
++	mov x3, xzr
++	br x16
++.size arch_probe_kernel, .-arch_probe_kernel
++
++.global dsh_probe_return
++.type dsh_probe_return, %function
++dsh_probe_return:
++	msr daifset, #0xf
++	adrp x9, dsh_probe_context
++	add x9, x9, :lo12:dsh_probe_context
++	ldr x10, [x9, #120]
++	msr tcr_el1, x10
++	ldr x10, [x9, #128]
++	msr mair_el1, x10
++	ldr x10, [x9, #136]
++	msr ttbr0_el1, x10
++	ldr x10, [x9, #144]
++	msr ttbr1_el1, x10
++	ldr x10, [x9, #152]
++	msr vbar_el1, x10
++	ldr x10, [x9, #160]
++	msr cpacr_el1, x10
++	ldr x10, [x9, #168]
++	msr mdscr_el1, x10
++	ldr x10, [x9, #176]
++	msr pmuserenr_el0, x10
++	ldr x10, [x9, #184]
++	msr sp_el0, x10
++	ldr x10, [x9, #192]
++	msr tpidr_el1, x10
++	ldr x10, [x9, #200]
++	msr tpidrro_el0, x10
++	ldr x10, [x9, #208]
++	msr tpidr_el0, x10
++	tlbi vmalle1
++	dsb sy
++	isb
++	ldr x10, [x9, #112]
++	msr sctlr_el1, x10
++	isb
++	ldp x19, x20, [x9, #0]
++	ldp x21, x22, [x9, #16]
++	ldp x23, x24, [x9, #32]
++	ldp x25, x26, [x9, #48]
++	ldp x27, x28, [x9, #64]
++	ldp x29, x30, [x9, #80]
++	ldr x10, [x9, #96]
++	mov sp, x10
++	ldr x10, [x9, #104]
++	msr daif, x10
++	ret
++.size dsh_probe_return, .-dsh_probe_return
++
++.bss
++.balign 64
++dsh_probe_context:
++	.skip 256
++.section .note.GNU-stack,"",%progbits
+diff --git a/arch/aarch64/start.S b/arch/aarch64/start.S
+index de454f9..b8f9a8e 100644
+--- a/arch/aarch64/start.S
++++ b/arch/aarch64/start.S
+@@ -41,6 +41,21 @@ ENTRY(_start)
+ 	str     xzr, [x0], #8
+ 	b       1b
+ 2:
++	/* Capture loader faults before entering C. All interrupts stay masked. */
++	msr daifset, #0xf
++	adrp x9, dsh_loader_vectors
++	add x9, x9, #:lo12:dsh_loader_vectors
++	mrs x10, CurrentEL
++	cmp x10, #0xc
++	b.eq 3f
++	cmp x10, #0x8
++	b.eq 4f
++	msr vbar_el1, x9
++	b 5f
++3:	msr vbar_el3, x9
++	b 5f
++4:	msr vbar_el2, x9
++5:	isb
+ 
+ 	/* Fall through */
+ 	adrp    x0, dtb             /* Load page of dtb */
+@@ -59,3 +74,30 @@ ENTRY(load_kernel_and_jump)
+ 	br	x4
+ END(load_kernel_and_jump)
+ 
++.balign 2048
++dsh_loader_vectors:
++	.rept 16
++	b dsh_loader_exception
++	.balign 128
++	.endr
++
++dsh_loader_exception:
++	mrs x3, CurrentEL
++	lsr x3, x3, #2
++	cmp x3, #3
++	b.eq 1f
++	cmp x3, #2
++	b.eq 2f
++	mrs x0, esr_el1
++	mrs x1, far_el1
++	mrs x2, elr_el1
++	b dsh_loader_fault
++1:	mrs x0, esr_el3
++	mrs x1, far_el3
++	mrs x2, elr_el3
++	b dsh_loader_fault
++2:	mrs x0, esr_el2
++	mrs x1, far_el2
++	mrs x2, elr_el2
++	b dsh_loader_fault
++
+diff --git a/board/samsung/board-zeroflte.c b/board/samsung/board-zeroflte.c
+index ac70d4a..66db8bb 100644
+--- a/board/samsung/board-zeroflte.c
++++ b/board/samsung/board-zeroflte.c
+@@ -16,6 +16,24 @@ int zeroflte_init(void)
+ {
+ 	/* Allow framebuffer to be written to */
+ 	*(int*) (DECON_F_BASE + HW_SW_TRIG_CONTROL) = 0x2058;
++
++	/*
++	 * DSH: Exynos7420 SMP 修复 —— 第一步（最小改动，只加这一条）。
++	 *
++	 * 背景：本板引导核是 A53（CPU0 mpidr=0x80000100，cluster 1），
++	 * A57 在 cluster 0。内核 smp_init() 第一次 PSCI CPU_ON 的目标就是
++	 * A57/ATLAS —— 这是本次启动中 ATLAS 第一次上电。
++	 * 主线缺少 7420 在 SMP 之前必须做的集群准备，所以第一次 CPU_ON 挂死。
++	 * maxcpus=1 全程不碰 ATLAS，所以能启动。
++	 *
++	 * 原厂内核里唯一在 smp_init() 之前执行的 7420 PMU 动作就是
++	 * early_initcall(exynos7420_atlas_dbg_pmu_init)：PMU 0x105c2440 |= 0x30000
++	 * （ATLAS_DBG wakeup）。这里在 loader 里提前做掉。
++	 *
++	 * 注意：一次只加这一条。如果 8 核能起来，根因就确认了。
++	 */
++	*(volatile unsigned int *)0x105c2440 |= (0x3u << 16);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 59795ee..944b9e5 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -5,3 +5,5 @@ lib-$(CONFIG_EXYNOS_ACPM) += samsung/exynos-acpm.o
+ lib-$(CONFIG_EXYNOS_SPEEDY) += samsung/exynos-speedy.o
+ lib-$(CONFIG_MEDIATEK_MCUSYS) += mediatek/mcusys.o
+ lib-$(CONFIG_TIMER_MTK_CPUXGPT) += timer/mtk_cpuxgpt.o
++lib-$(CONFIG_SAMSUNG_ZEROFLTE) += usb-console/console.o usb-console/usb_dwc3.o usb-console/ringbuffer.o
++lib-$(CONFIG_SAMSUNG_ZEROFLTE) += usb-console/muic.o
+diff --git a/drivers/usb-console/PROBES.md b/drivers/usb-console/PROBES.md
+new file mode 100644
+index 0000000..b86fa28
+--- /dev/null
++++ b/drivers/usb-console/PROBES.md
+@@ -0,0 +1,197 @@
++# SM-G9209 early-kernel USB probe
++
++This diagnostic mode runs the actual embedded Linux Image until a selected
++checkpoint, or until the diagnostic exception vector catches a fault. It
++then **ends that kernel run**, restores the saved loader CPU context, and
++reports the snapshot over the existing CDC connection. It never resumes
++the interrupted kernel invocation. It does not install a Linux gadget
++driver or provide a Linux runtime console.
++
++## Commands and checkpoints
++
++Use the first CDC port, identified by USB serial `G9209-UNILOADER` rather
++than an assumed `/dev/ttyACM` number. `probe N` accepts only **1 through 31**:
++
++| Checkpoint | Location |
++| --- | --- |
++| 1 | Kernel entry, after installing the diagnostic exception vector |
++| 2 | Initial identity map built |
++| 3 | `__cpu_setup` returned |
++| 4 | `__enable_mmu` returned; snapshot includes actual SCTLR.M |
++| 5 | High virtual kernel mapping built |
++| 6 | TTBR1 installed and kernel relocation returned |
++| 7 | High virtual `__primary_switched` entry, before task setup |
++| 8 | Initial task, kernel stack and per-CPU offset installed |
++| 9 | BSS clearing returned |
++| 10 | Early FDT mapping returned |
++| 11 | Feature override/finalise_el2 returned, before `start_kernel` |
++| 12 | Actual C `start_kernel` entry |
++| 13 | `setup_machine_fdt` entry |
++| 14 | FDT fixmap mapping returned |
++| 15 | Before FDT scan |
++| 16 | FDT scan succeeded |
++| 17 | Before read-only FDT remap |
++| 18 | Read-only FDT remap returned |
++| 19 | Machine name obtained |
++| 20 | End of `setup_machine_fdt` |
++| 21 | `setup_machine_fdt` returned to `setup_arch` |
++| 22 | `jump_label_init` returned |
++| 23 | Early parameter parsing returned |
++| 24 | Immediately **before** `local_daif_restore`; the legacy report label says "DAIF restored" |
++| 25 | Before `cpu_uninstall_idmap` |
++| 26 | `cpu_uninstall_idmap` returned |
++| 27 | `arm64_memblock_init` returned |
++| 28 | `paging_init` returned |
++| 29 | Device tree unflattened |
++| 30 | `bootmem_init` returned |
++| 31 | PSCI initialization returned, before boot CPU/SMP initialization |
++
++Other commands:
++
++- `status`: report current loader state and controller registers. It does
++  not reprint the waiting prompt.
++- `log`: replay the loader log from its beginning. The retained log is a
++  bounded **128 KiB** linear buffer; it is not the kernel printk ring.
++- `boot`: stop loader USB DMA and perform a normal kernel entry.
++- `reboot`, `reboot recovery`: select the boot mode in PMU INFORM registers,
++  request native PMU SWRESET, and arm a short watchdog fallback.
++- `watchdog arm`, `watchdog off`, `watchdog status`: inspect/control the
++  diagnostic watchdog. `watchdog test` and `watchdog test recovery` are
++  explicit expiry tests; their names alone do not establish test success.
++- `psci version`, `psci reset`: explicit firmware-call diagnostics, guarded
++  by an observed watchdog countdown. Native `reboot` uses PMU SWRESET.
++- `dt reserve el3`, `dt unreserve el3`: mutate only this loader session's
++  expanded FDT for controlled diagnostic A/B tests. The default board DTS
++  now reserves EL3 `0xfe800000 + 0x01800000` and framebuffer
++  `0xe2a00000 + 0x01000000`, both `no-map`. Removing EL3 protection is solely
++  for reproducing the old fault, not a normal boot configuration. A later
++  `boot` in the same session uses the currently mutated FDT too.
++
++## Diagnostic ABI and memory ownership
++
++The board-specific ABI uses the 24-word `dsh_regs` array:
++
++| Slots | Contents |
++| --- | --- |
++| 0..6 | CPU register snapshot: TCR, MAIR, SCTLR, TTBR1, TTBR0, SP, CurrentEL |
++| 8..11 | Exception ESR, FAR, ELR, and handler progress |
++| 12..15 | Physical loader callback, requested checkpoint, last checkpoint, magic `0x44534850524f4245` |
++| 16..18 | Last early page-table allocation PA, allocation count, phase |
++| 20..22 | FDT physical address, mapped virtual address, size |
++| 23 | Recursive exit guard |
++
++Allocation phase 1 means allocated, 2 fixmapped, 3 zeroed, and 4 fixmap
++cleared. These breadcrumbs are cleaned to the PoC at every phase, but
++firmware may still overwrite RAM during reboot. A retained word alone is
++not proof that it belongs to the current build or attempt.
++
++A normal, freshly copied Image has no armed magic, so probe checkpoints
++fall through. No Linux boot argument registers are repurposed. Armed probe
++runs reserve **32 MiB at `0x47000000..0x49000000`** with memblock before
++kernel allocations can reuse the loader image, context, and USB arena.
++This extra loader reservation applies only while the probe magic is armed.
++The diagnostic code does not add loader RAM or USB MMIO to the kernel's
++page tables for executing loader C.
++
++## Return path and supported lifetime
++
++The mode requires EL1 entry with the MMU off and SP_EL1, a 4 KiB/39-bit VA
++Image at physical `0x90000000`, and execution before `free_initmem()`.
++The supported command set currently stops at checkpoint 31; this is not
++a general runtime kernel-to-loader context switch.
++
++The exit routine `dsh_probe_exit`, including its physical trampoline, is
++linked in normal executable **`.text`**. It must not live in `.idmap.text`:
++the latter is placed in `.rodata.text`, which the permanent kernel TTBR1
++mapping deliberately marks non-executable. Physical execution of normal
++Linux idmap routines remains valid, but calling that high VA after
++`paging_init` would fault. The diagnostic exception handler would then
++retry the same unusable exit, hiding the original progress.
++
++On the high-VA exit path, the code first snapshots the **tested** CPU state.
++It then installs reserved TTBR0, invalidates the relevant TLB state,
++restores the initial identity-map T0SZ, and reinstalls
++`init_idmap_pg_dir` before branching to the physical exit address. The
++kernel's real `cpu_uninstall_idmap()` runs unchanged. The initial idmap
++tables are distinct from `init_pg_dir`, which `paging_init()` frees; the
++initial idmap survives until init memory is reclaimed. Low-VA checkpoints
++already executing through the initial idmap do not replace TTBR0 beneath
++their own instructions.
++
++The physical exit cleans the loaded kernel memory range, disables M/C,
++and branches to loader assembly. That assembly restores the loader's
++callee-saved registers, stack, translation/control registers, VBAR,
++SP_EL0 and thread/per-CPU pointer registers. Only then do loader C and
++USB polling resume.
++
++During armed runs, `__primary_switched` moves VBAR to the **high-VA**
++diagnostic vector table in executable `.text` before TTBR0 is removed.
++Keeping a physical VBAR after idmap uninstall would make the diagnostic
++fault handler itself unreachable. Normal boot installs Linux's standard
++vectors.
++
++Each probe recopies the original Image and clears its NOBITS tail before
++entry. The mutated payload is replaced again after reporting, before
++accepting another probe or normal boot. Probe entry exercises the common
++cache-preparation path, with uncached EL1 entry enforced and the USB DMA
++arena explicitly synchronized. USB ownership remains with the loader;
++its polling is suspended while the kernel runs. An enumerated USB device
++does not prove that the loader command loop is still executing.
++
++## Watchdog and evidence limits
++
++The Exynos7420 watchdog is at **`0x10020000`**, with PERIS PCLK gate bit 7.
++The ARM64 Samsung PMU sequence clears ATLAS/APOLLO bits 23/24 in
++`AUTOMATIC_DISABLE_WDT` (`0x105c0408`) and APOLLO bit 24 in
++`MASK_WDT_RESET_REQUEST` (`0x105c040c`). The old ARM32 bit-0 scheme does not
++unmask this reset route.
++
++After copying and cache preparation, probe entry arms count `0xffff`;
++the loader stops the watchdog immediately on return, before recopying.
++The expected maximum period is approximately 32.5 seconds with a 66 MHz
++parent or 89.5 seconds with 24 MHz. The local `usb_udelay` is a conservative
++spin loop, not a calibrated microsecond time source.
++
++Keep these evidence levels separate:
++
++1. Observing WTCNT decrease establishes that the watchdog clock/countdown
++   is running. Correct register readback establishes that the reset route
++   is unmasked. Neither alone proves that expiry resets this phone.
++2. A USB disconnect near the expected expiry is consistent with reset,
++   but cannot distinguish reset from another USB failure by itself.
++3. Confirm expiry only after observing the next boot or independent reset
++   evidence from a controlled expiry test. Confirm native `reboot` and
++   `reboot recovery` outcomes separately.
++
++As of the p34 EL3-reservation A/B attempt, countdown and ARM64 PMU unmask
++readback were verified (`fe7fffff/feffffff`). USB then disconnected about
++32 seconds after kernel entry, but the next boot had not yet been read.
++**Watchdog expiry was therefore not yet independently confirmed.** That
++attempt also used the old NX high-VA exit, so loss of its reply does not
++show that the EL3 reservation failed. A hung CPU cannot process the USB
++`reboot` command; automatic recovery depends on a separately established
++watchdog/reset path and successful USB re-enumeration. Manual recovery or
++cable replug can still be necessary.
++
++## Validation records
++
++QEMU Cortex-A53 software tests use the actual Image and loader return
++assembly. Earlier tests covered checkpoints 1..12, callee-saved
++register/SP/SCTLR restoration, SP_EL0/TPIDR_EL1, MMU-on checkpoints, and
++injected BRK faults before/after MMU and task setup. Later targeted tests
++covered return and BRK delivery with TTBR0 removed. Those tests do not
++establish correct behavior under the permanent TTBR1 permissions unless
++that transition is explicitly exercised.
++
++Real p32 hardware passed checkpoints 25, 26, and 27 after repairing the
++post-idmap return. The p34 baseline captured allocation PA `0xfffff000`,
++count 1, phase 4, followed by ESR `0x96000010` on an `ldr` from FIX_PMD
++VA `0xfffffffdfdc36000` during `paging_init`. This is a synchronous
++external abort on a **read**, not an observed memset write fault.
++Same-kernel A/B results after moving the exit to executable `.text` must
++be recorded before claiming the entire paging path passes.
++
++QEMU does not emulate this Exynos USB gadget or secure-memory protection.
++Hardware transcripts and per-attempt results are under
++`out/continue-20261016/` and `out/rootcause-20261016/`; read the named build
++and attempt rather than treating all historical logs as current firmware.
+diff --git a/drivers/usb-console/UPSTREAM.md b/drivers/usb-console/UPSTREAM.md
+new file mode 100644
+index 0000000..73e225b
+--- /dev/null
++++ b/drivers/usb-console/UPSTREAM.md
+@@ -0,0 +1,13 @@
++# USB DWC3 source provenance
++
++usb_dwc3.c/.h, usb_types.h and ringbuffer.c/.h are adapted from
++https://github.com/AsahiLinux/m1n1/tree/84b81988249a0f0ca42581650f92f8e000cb64ad/src (retrieved 2026-10-16; original file hashes verified).
++usb_dwc3_regs.h retains its Texas Instruments dual BSD/GPL notice.
++The m1n1 project is licensed under GPL-2.0-or-later except individually noted files.
++
++Port changes: direct physical DMA instead of Apple DART, fixed board serial and
++product strings, 64 KiB queues, Exynos FIFO numbering and UTMI configuration,
++DWC3 0x5533 controller IDs, disabled hibernation scratchpad commands, bounded
++console writes and event validation. The VID/PID 1209:316d is inherited from
++m1n1 for this private bring-up prototype; it is not an allocated uniLoader ID
++and must be replaced before distribution.
+diff --git a/drivers/usb-console/console.c b/drivers/usb-console/console.c
+new file mode 100644
+index 0000000..56c8b29
+--- /dev/null
++++ b/drivers/usb-console/console.c
+@@ -0,0 +1,716 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Polling USB CDC console for SM-G9209; no Linux, interrupts, or dynamic runtime. */
++#include <drivers/usb-console.h>
++#include <lib/debug.h>
++#include <main/boot.h>
++#include <string.h>
++#include "types.h"
++#include "utils.h"
++#include "usb_dwc3.h"
++
++#define USB_BASE 0x15400000UL
++#define PHY_BASE 0x15500000UL
++#define WDT_BASE 0x10020000UL
++#define WDT_WTCON (WDT_BASE + 0x00)
++#define WDT_WTDAT (WDT_BASE + 0x04)
++#define WDT_WTCNT (WDT_BASE + 0x08)
++#define WDT_WTCLRINT (WDT_BASE + 0x0c)
++#define WDT_ENABLE BIT(5)
++#define WDT_RESET_ENABLE BIT(0)
++#define WDT_CONTROL (0xff00 | (3 << 3) | WDT_ENABLE | WDT_RESET_ENABLE)
++#define PMU_WDT_AUTO_DISABLE 0x105c0408UL
++#define PMU_WDT_RESET_MASK 0x105c040cUL
++#define PMU_WDT_ATLAS BIT(23)
++#define PMU_WDT_APOLLO BIT(24)
++#define PMU_SWRESET 0x105c0400UL
++#define PMU_INFORM2 0x105c0808UL
++#define PMU_INFORM3 0x105c080cUL
++#define REBOOT_MODE_PREFIX 0x12345670U
++#define REBOOT_MODE_RECOVERY 4U
++#define HEAP_SIZE (2 * 1024 * 1024)
++static unsigned char heap[HEAP_SIZE] __attribute__((aligned(16384)));
++static size_t heap_used;
++static dwc3_dev_t *device;
++static int polling, ready_before, boot_requested;
++static unsigned int probe_requested;
++static unsigned long log_sent;
++static char command[1024];
++static unsigned int command_len;
++static int watchdog_owned;
++static unsigned int reconnect_attempts;
++static u32 last_setup_count;
++static unsigned long usb_progress_counter;
++static int muic_checked;
++/*
++ * DSH: PSCI CPU_ON 冒烟测试用的安全桩。
++ * 汇编已用 aarch64-linux-gnu-as + objdump 验证：
++ *   mov  x0, #0x46df0000   (d2a8dbe0)
++ *   movk x0, #0xf800       (f29f0000)   -> x0 = 0x46dff800
++ *   mov  w1, #0x5a5a       (528b4b41)
++ *   movk w1, #0x5a5a,lsl16 (72ab4b41)   -> w1 = 0x5a5a5a5a
++ *   str  w1, [x0]          (b9000001)
++ *   dsb  sy                (d5033f9f)
++ *   wfe                    (d503205f)
++ *   b    -4                (17ffffff)
++ * 从核执行到就写 marker 0x5a5a5a5a 到 0x46dff800，然后自旋。
++ * 0x46dff000 在 ramoops 区（0x46d80000+0x80000）内，DT 已 reserved。
++ */
++static const unsigned int psci_smoke_stub[8] = {
++    0xd2a8dbe0, 0xf29f0000, 0x528b4b41, 0x72ab4b41,
++    0xb9000001, 0xd5033f9f, 0xd503205f, 0x17ffffff,
++};
++#define PSCI_STUB_ENTRY   0x46dff000UL
++#define PSCI_MARKER_ADDR  0x46dff800UL
++#define PSCI_MARKER_VAL   0x5a5a5a5aU
++
++static void psci_install_stub(unsigned long entry)
++{
++    int i;
++    for (i = 0; i < 8; i++) write32(entry + (unsigned long)i * 4, psci_smoke_stub[i]);
++    write32(PSCI_MARKER_ADDR, 0);
++}
++
++static void set_reboot_mode(unsigned int mode);
++static int usb_console_reconnect(void);
++extern char dsh_log[];
++extern unsigned long dsh_log_len;
++
++void *usb_memalign(size_t align, size_t size)
++{
++    size_t offset = (heap_used + align - 1) & ~(align - 1);
++    if (!align || (align & (align - 1)) || offset > HEAP_SIZE || size > HEAP_SIZE - offset)
++        return NULL;
++    heap_used = offset + size;
++    return heap + offset;
++}
++
++void *usb_calloc(size_t n, size_t size)
++{
++    if (size && n > HEAP_SIZE / size) return NULL;
++    void *p = usb_memalign(64, n * size);
++    if (p) memset(p, 0, n * size);
++    return p;
++}
++
++/* Single USB instance with a boot-lifetime arena; free is intentionally a no-op. */
++void usb_free(void *p) { (void)p; }
++
++void usb_dma_sync(void)
++{
++    unsigned long begin = (unsigned long)heap;
++    unsigned long end = begin + heap_used;
++    for (unsigned long p = begin; p < end; p += 64)
++        asm volatile("dc civac, %0" :: "r"(p) : "memory");
++    asm volatile("dsb sy" ::: "memory");
++}
++
++void usb_console_flush_dma(void)
++{
++    usb_dma_sync();
++}
++
++static inline unsigned long usb_cntpct(void)
++{
++    unsigned long v;
++    asm volatile("isb; mrs %0, cntpct_el0" : "=r"(v) :: "memory");
++    return v;
++}
++
++/*
++ * DSH: 用 CNTPCT 做精确延时。
++ *
++ * 原实现是"每微秒 256 个 nop"的忙等，实际时长完全不可标定（MMU 关闭时
++ * 每次迭代都是慢速 Device 访问，实测偏差可能上百倍 —— 注释里自己都写
++ * 了 usb_udelay(3000) 可能是 0.27~0.73 秒）。
++ *
++ * 本机 CNTFRQ_EL0 为 0（S-Boot 从不编程），但实测 CNTPCT 确实在递增，
++ * 按 Exynos7420 的 24 MHz 系统计数器换算：1 us = 24 ticks。
++ * 万一计数器不递增（理论上不该发生），用最大迭代数兜底，绝不无限等。
++ */
++void usb_udelay(unsigned int us)
++{
++    unsigned long start = usb_cntpct();
++    unsigned long ticks = (unsigned long)us * 24UL;
++    unsigned long guard = 0;
++
++    if (!ticks)
++        ticks = 1;
++    while ((usb_cntpct() - start) < ticks) {
++        if (++guard > (unsigned long)us * 200000UL + 1000000UL)
++            break;          /* 计数器疑似冻结，别把机器等死 */
++    }
++}
++
++/* Exynos7420 WDT_APL: Samsung's working clock table uses PERIS PCLK bit 7.
++ * Its ARM64 pmu.c type1 clears ATLAS|APOLLO in AUTOMATIC_DISABLE_WDT and
++ * APOLLO in MASK_WDT_RESET_REQUEST. The legacy ARM32 bit0 scheme is wrong.
++ * Keep the inherited PERIS parent clock; no PLL or shared mux changes. */
++static int watchdog_arm_ticks(unsigned int ticks)
++{
++    set32(0x10040900UL, BIT(7));
++    write32(WDT_WTCON, 0);
++    write32(WDT_WTCLRINT, 1);
++    clear32(PMU_WDT_AUTO_DISABLE, PMU_WDT_ATLAS | PMU_WDT_APOLLO);
++    clear32(PMU_WDT_RESET_MASK, PMU_WDT_APOLLO);
++    write32(WDT_WTDAT, ticks);
++    write32(WDT_WTCNT, ticks);
++    write32(WDT_WTCON, WDT_CONTROL);
++    watchdog_owned = 1;
++
++    /* A readback alone cannot establish that its parent clock is running. */
++    unsigned int first = read32(WDT_WTCNT);
++    usb_udelay(1000);
++    unsigned int second = read32(WDT_WTCNT);
++    if (!(read32(WDT_WTCON) & WDT_ENABLE) || second >= first) {
++        write32(WDT_WTCON, 0);
++        watchdog_owned = 0;
++        printk(KERN_ERR, "[wdt] failed to observe countdown: %u -> %u\n",
++               first, second);
++        return 0;
++    }
++    unsigned int automatic = read32(PMU_WDT_AUTO_DISABLE);
++    unsigned int request_mask = read32(PMU_WDT_RESET_MASK);
++    printk(KERN_NOTICE, "[wdt] count=%u -> %u WTCON=%08x PMU=%08x/%08x\n",
++           first, second, read32(WDT_WTCON), automatic, request_mask);
++    if ((automatic & (PMU_WDT_ATLAS | PMU_WDT_APOLLO)) ||
++        (request_mask & PMU_WDT_APOLLO)) {
++        write32(WDT_WTCON, 0);
++        watchdog_owned = 0;
++        printk(KERN_ERR, "[wdt] countdown observed but PMU reset route remains masked; no reset guard\n");
++        return 0;
++    }
++    printk(KERN_NOTICE, "[wdt] countdown and PMU reset unmask verified; reset expiry still requires hardware test\n");
++    return 1;
++}
++
++/* Call only after copying/cleaning the payload, immediately before entry.
++ * Maximum count expires in ~32.5 s at 66 MHz or ~89.5 s at 24 MHz.
++ * Stop it immediately on probe return, before recopying the payload. */
++int usb_console_watchdog_arm(void)
++{
++    set_reboot_mode(0);
++    return watchdog_arm_ticks(0xffff);
++}
++
++int usb_console_watchdog_stop(void)
++{
++    /* Firmware may hand over a running watchdog independently of our BSS
++     * ownership flag. Enable its register clock and verify the actual stop. */
++    set32(0x10040900UL, BIT(7));
++    unsigned int before = read32(WDT_WTCON);
++    write32(WDT_WTCON, 0);
++    write32(WDT_WTCLRINT, 1);
++    asm volatile("dsb sy" ::: "memory");
++    unsigned int after = read32(WDT_WTCON);
++    if (!after) watchdog_owned = 0;
++    printk(after ? KERN_ERR : KERN_NOTICE,
++           "[wdt] stop WTCON=%08x -> %08x WTCNT=%08x gate=%08x; %s\n",
++           before, after, read32(WDT_WTCNT), read32(0x10040900UL),
++           after ? "FAILED" : "verified");
++    return after == 0;
++}
++
++static unsigned long psci_call4(unsigned long function, unsigned long a1,
++                                 unsigned long a2, unsigned long a3)
++{
++    register unsigned long x0 asm("x0") = function;
++    register unsigned long x1 asm("x1") = a1;
++    register unsigned long x2 asm("x2") = a2;
++    register unsigned long x3 asm("x3") = a3;
++    asm volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++                 : : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++                     "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++    return x0;
++}
++
++static unsigned long psci_call(unsigned long function)
++{
++    /* Initialize the fixed argument registers immediately before SMC.
++     * In particular, printk and DMA cleaning must not occur in between. */
++    register unsigned long x0 asm("x0") = function;
++    register unsigned long x1 asm("x1") = 0;
++    register unsigned long x2 asm("x2") = 0;
++    register unsigned long x3 asm("x3") = 0;
++    asm volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++                 : : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++                     "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++    return x0;
++}
++
++static void set_reboot_mode(unsigned int mode)
++{
++    /* Same bootloader contract as Samsung sec_reboot.c: keep out of charging
++     * mode and select normal BOOT or RECOVERY for either reset mechanism. */
++    write32(PMU_INFORM2, 0x12345678U);
++    write32(PMU_INFORM3, REBOOT_MODE_PREFIX | mode);
++}
++
++static void request_reboot(unsigned int mode)
++{
++    set_reboot_mode(mode);
++    printk(KERN_NOTICE, "[usb] reboot requested (%s); PMU SWRESET with watchdog fallback\n",
++           mode == REBOOT_MODE_RECOVERY ? "recovery" : "normal");
++    watchdog_arm_ticks(4096);
++    usb_console_flush_dma();
++    /* Working Exynos7420 ARM64 exynos_restart(): PMU_SWRESET = 1. */
++    write32(PMU_SWRESET, 1);
++    printk(KERN_ERR, "[usb] PMU SWRESET returned; waiting for watchdog fallback\n");
++}
++
++/*
++ * DSH: PHYCLKRST (0x15500010) 的位定义以 mainline phy-exynos5-usbdrd.c 为准：
++ *   BIT(0)  = COMMONONN   公共块（HS bias + MPLL）使能
++ *   BIT(1)  = PORTRESET   端口/PCS 复位
++ *   BIT(4)  = RETENABLEN  数字电源保持
++ *   BIT(19) = REF_SSP_EN  SS PLL 参考使能（启动 MPLL 的边沿位）
++ *   BIT(20) = SSC_EN      扩频使能
++ * 注意：这里没有 "PHYRESET" 或 "PHY_ENABLE" 位，早期注释是错的。
++ */
++#define DSH_PHYCLKRST_OFF      (BIT(4) | (2u << 2) | (5u << 5) | (0x68u << 11))
++
++static void exynos7420_usb_phy_init(void)
++{
++    /*
++     * DSH: 顺序非常重要 —— 时钟必须在任何 PHY 寄存器访问之前打开，
++     * 否则写入可能被静默丢弃（PHY 的 APB 时钟是 ACLK_USBDRD300）。
++     */
++    /* ① TOP1 父时钟 */
++    set32(0x105e080cUL, BIT(28));
++    set32(0x105e0a24UL, BIT(28));
++    set32(0x10e90200UL, BIT(24));
++    set32(0x10e90204UL, BIT(28));
++    /* ② FSYS0 门控（含 7420 额外的 LINKH AHB） */
++    set32(0x10e90800UL, BIT(19) | BIT(29));
++    set32(0x10e90804UL, BIT(29));            /* ACLK_USBDRD300 = PHY APB */
++    set32(0x10e90a04UL, BIT(4) | BIT(8));    /* SUSPENDCLK + REFCLK(24M) */
++    set32(0x10e90a08UL, BIT(24) | BIT(28));
++    set32(0x10e90a10UL, BIT(28));
++    /* ③ 解除 PMU 对 PHY 的隔离 */
++    set32(0x105c0704UL, BIT(0));
++    usb_udelay(2000);
++
++    /* Quiesce the link while PHY clocks are still running. Keep the pullup
++     * absent long enough for the host to finish the previous connection. */
++    u32 inherited_dctl = read32(USB_BASE + 0xc704);
++    u32 inherited_dsts = read32(USB_BASE + 0xc70c);
++    clear32(USB_BASE + 0xc704, BIT(31) | BIT(19));
++    int halt_timeout = poll32(USB_BASE + 0xc70c, BIT(22), BIT(22), 10000);
++    printk(halt_timeout ? KERN_WARNING : KERN_NOTICE,
++           "[usb] detach before PHY reset: old=%08x/%08x halt=%s dwell=200ms\n",
++           inherited_dctl, inherited_dsts, halt_timeout ? "timeout" : "acknowledged");
++    usb_udelay(200000);
++
++    {
++        u32 pre = read32(PHY_BASE + 0x10);
++        u32 pre_utmi = read32(PHY_BASE + 0x08);
++        u32 pre_test = read32(PHY_BASE + 0x28);
++        printk(KERN_NOTICE,
++               "[usb] PHY before power-cycle: PHYCLKRST=%08x PHYUTMI=%08x PHYTEST=%08x\n",
++               pre, pre_utmi, pre_test);
++
++        /*
++         * ④ 强制 PHY 掉电 —— 等价于 mainline 的 phy_exit()。
++         *
++         * 这是整个修复的核心：热启动时 COMMONONN/REF_SSP_EN/SSC_EN 本来就是 1，
++         * 单纯读-改-写回同值不会产生任何模拟动作，MPLL/SSC/HS-bias 不会重新
++         * 校准，于是 USB 表现为"能枚举但所有请求失败"。
++         * 必须先清零这三位（真正放电），再在后面重新置 1 形成上电边沿。
++         */
++        set32 (PHY_BASE + 0x28,
++               BIT(3) | BIT(2));                       /* PHYTEST: POWERDOWN_SSP|HSP */
++        write32(PHY_BASE + 0x08, 0x43);                /* PHYUTMI: OTGDISABLE|FORCESUSPEND|FORCESLEEP */
++        mask32(PHY_BASE + 0x10,
++               BIT(0) | BIT(19) | BIT(20),             /* COMMONONN | REF_SSP_EN | SSC_EN */
++               BIT(1));                                /* 同时保持 PORTRESET */
++        usb_udelay(5000);                               /* 让 bias/PLL 真正放电 */
++
++        /* ⑤ 参考时钟拉掉再恢复：确保 MPLL 看到时钟边沿 */
++        clear32(0x10e90a04UL, BIT(8));
++        usb_udelay(2000);
++        set32  (0x10e90a04UL, BIT(8));
++        usb_udelay(2000);
++    }
++
++
++    /* Exynos7420 USB3 CAL USB2/UTMI initialization, 24 MHz reference.
++     * See Samsung phy-samsung-usb3-cal.c in the working 3.10 source. */
++    clear32(PHY_BASE + 0x28, BIT(2) | BIT(3));
++    usb_udelay(500);
++    clear32(PHY_BASE + 0x08, 0x7f);
++    set32(PHY_BASE + 0x0c, BIT(4));
++    clear32(PHY_BASE + 0x1c, BIT(31));
++    set32(PHY_BASE + 0x04, BIT(27) | (0x20 << 1));
++    u32 clk = read32(PHY_BASE + 0x10);
++    clk &= ~((0x3f << 5) | (0x7f << 11) | (0xffu << 23) | (3u << 21) |
++             BIT(18) | BIT(31) | (3u << 2));
++    clk |= BIT(0) | BIT(1) | BIT(4) | BIT(19) | BIT(20) |
++           (2u << 2) | (5u << 5) | (0x68u << 11) | (0x88u << 23);
++    write32(PHY_BASE + 0x10, clk);
++    usb_udelay(100);
++    clear32(PHY_BASE + 0x10, BIT(1));
++    usb_udelay(1000);
++    /* Switch the user muxes to the now-running PHY clocks (60/125 MHz),
++     * rather than inheriting a possible 24 MHz oscillator selection. */
++    set32(0x10e90208UL, BIT(24) | BIT(28));
++    usb_udelay(100);
++}
++
++static void execute_command(void)
++{
++    command[command_len] = 0;
++    if (!strcmp(command, "boot") || !strcmp(command, "testboot")) {
++        printk(KERN_NOTICE, "[usb] %s requested; stopping USB DMA before kernel entry\n", command);
++        probe_requested = 0;
++        boot_requested = !strcmp(command, "testboot") ? 2 : 1;
++    } else if (!strncmp(command, "probe ", 6) &&
++               ((command_len == 7 && command[6] >= '1' && command[6] <= '9') ||
++                (command_len == 8 && command[6] >= '1' && command[6] <= '6' &&
++                 command[7] >= '0' && command[7] <= '9') ||
++                (command_len == 8 && command[6] == '3' && command[7] == '1'))) {
++        probe_requested = command_len == 7 ? command[6] - '0'
++                                           : 10 * (command[6] - '0') + (command[7] - '0');
++        if (probe_requested < 1 || probe_requested > 69)
++            probe_requested = 0;
++        boot_requested = 0;
++        printk(KERN_NOTICE, "[usb] probe %u requested; USB stays owned by loader\n",
++               probe_requested);
++    } else if (!strcmp(command, "reboot")) {
++        request_reboot(0);
++    } else if (!strcmp(command, "reboot recovery")) {
++        request_reboot(REBOOT_MODE_RECOVERY);
++    } else if (!strcmp(command, "usb reconnect")) {
++        printk(KERN_NOTICE, "[usb] explicit reconnect requested\n");
++        usb_console_reconnect();
++    } else if (!strcmp(command, "psci version") || !strcmp(command, "psci reset")) {
++        unsigned long function = !strcmp(command, "psci version") ?
++                                 0x84000000UL : 0x84000009UL;
++        set_reboot_mode(0);
++        printk(KERN_NOTICE, "[usb] explicit PSCI call %08lx; arming watchdog first\n",
++               function);
++        /* Never enter an unverified firmware call without an observed timer. */
++        if (watchdog_arm_ticks(4096)) {
++            usb_console_flush_dma();
++            unsigned long result = psci_call(function);
++            usb_console_watchdog_stop();
++            printk(KERN_NOTICE, "[usb] PSCI %08lx returned %016lx\n", function, result);
++        } else {
++            printk(KERN_ERR, "[usb] PSCI skipped: watchdog protection unavailable\n");
++        }
++
++    } else if (!strncmp(command, "psci cpuon ", 11)) {
++        /* DSH: PSCI CPU_ON 冒烟测试。
++         * 用法： psci cpuon <mpidr> [entry]
++         *   mpidr: 0x0=A57 core0, 0x101=A53 core0, 0x100=A57? 按需
++         *   entry: 缺省 0x46dff000（会自动装入安全桩并清 marker）
++         * 目的：直接验证 EL3 是否接受 CPU_ON，绕开整个内核路径。
++         * 挂死说明 EL3/secure monitor 层面拒绝，需从 secure 世界想办法；
++         * 正常返回说明 PSCI 协议可用，问题在内核路径。
++         */
++        unsigned long mpidr = 0x101, entry = PSCI_STUB_ENTRY;
++        char *p = command + 11;
++        mpidr = 0; while (*p == ' ') p++;
++        { int base = 0; if (p[0]=='0' && (p[1]=='x'||p[1]=='X')) { base = 16; p += 2; }
++          while (base == 16 ? ( (*p>='0'&&*p<='9')||(*p>='a'&&*p<='f')||(*p>='A'&&*p<='F') )
++                            : (*p>='0'&&*p<='9')) {
++              int d = (*p<='9') ? *p-'0' : ((*p|32)-'a'+10);
++              mpidr = mpidr*(base?16:10) + d; p++;
++          } }
++        while (*p == ' ') p++;
++        if (*p) { int base = 0; if (p[0]=='0' && (p[1]=='x'||p[1]=='X')) { base = 16; p += 2; }
++          entry = 0;
++          while (base == 16 ? ( (*p>='0'&&*p<='9')||(*p>='a'&&*p<='f')||(*p>='A'&&*p<='F') )
++                            : (*p>='0'&&*p<='9')) {
++              int d = (*p<='9') ? *p-'0' : ((*p|32)-'a'+10);
++              entry = entry*(base?16:10) + d; p++;
++          } }
++        printk(KERN_NOTICE, "[psci] CPU_ON(0xC4000003) mpidr=%016lx entry=%016lx; arming watchdog\n",
++               mpidr, entry);
++        if (watchdog_arm_ticks(0xffff)) {
++            /* 缺省 entry 时自动装入安全桩，省掉 8 条手工 mwr */
++            if (entry == PSCI_STUB_ENTRY) psci_install_stub(entry);
++            usb_console_flush_dma();
++            unsigned long r = psci_call4(0xC4000003UL, mpidr, entry, 0);
++            usb_console_watchdog_stop();
++            printk(KERN_NOTICE,
++                   "[psci] CPU_ON returned %016lx (%ld) marker@46dff800=%08x\n",
++                   r, (long)r, read32(PSCI_MARKER_ADDR));
++        } else {
++            printk(KERN_ERR, "[psci] skipped: no watchdog\n");
++        }
++    } else if (!strcmp(command, "watchdog arm")) {
++        usb_console_watchdog_arm();
++    } else if (!strcmp(command, "watchdog test") ||
++               !strcmp(command, "watchdog test recovery")) {
++        set_reboot_mode(!strcmp(command, "watchdog test recovery") ?
++                        REBOOT_MODE_RECOVERY : 0);
++        printk(KERN_NOTICE, "[wdt] reset test requested; short countdown\n");
++        watchdog_arm_ticks(4096);
++    } else if (!strcmp(command, "watchdog off")) {
++        usb_console_watchdog_stop();
++    } else if (!strcmp(command, "watchdog status")) {
++        set32(0x10040900UL, BIT(7));
++        printk(KERN_NOTICE, "[wdt] WTCON=%08x WTDAT=%08x WTCNT=%08x PMU=%08x/%08x\n",
++               read32(WDT_WTCON), read32(WDT_WTDAT), read32(WDT_WTCNT),
++               read32(0x105c0408UL), read32(0x105c040cUL));
++    } else if (!strcmp(command, "timer status")) {
++        unsigned long frq, c0, c1, ctl, cval;
++        asm volatile("mrs %0, cntfrq_el0" : "=r"(frq));
++        asm volatile("isb; mrs %0, cntpct_el0" : "=r"(c0) :: "memory");
++        usb_udelay(1000);
++        asm volatile("isb; mrs %0, cntpct_el0" : "=r"(c1) :: "memory");
++        asm volatile("mrs %0, cntp_ctl_el0" : "=r"(ctl));
++        asm volatile("mrs %0, cntp_cval_el0" : "=r"(cval));
++        printk(KERN_NOTICE, "[timer] CNTFRQ=%lu CNTPCT=%lu->%lu delta=%lu CTL=%lx CVAL=%lx (read-only)\n",
++               frq, c0, c1, c1-c0, ctl, cval);
++    } else if (!strcmp(command, "dt reserve el3")) {
++        dsh_reserve_el3();
++    } else if (!strcmp(command, "bat") || !strcmp(command, "battery")) {
++        /* DSH: 读 MAX77843 电量计（只读，安全），用于判断是否欠压。*/
++        extern int usb_read_battery(void);
++        usb_read_battery();
++    } else if (!strcmp(command, "prevlog")) {
++        /* DSH: 按需打印 ramoops 里的上一轮内核日志（默认不打印，
++         * 避免启动时 6KB 输出塞满 USB 缓冲导致控制台死掉）。*/
++        extern void dsh_dump_ramoops(void);
++        dsh_dump_ramoops();
++    } else if (!strcmp(command, "pmsgdump")) {
++        dsh_dump_pmsg();
++    } else if (!strncmp(command, "setcmd ", 7)) {
++        /* DSH: setcmd <text> —— 把命令带进内核的 /proc/cmdline，
++         * 由 initramfs 里的 /init 读取执行（本机没有任何输入设备，
++         * 这是唯一的"交互"通道）。结果经 /dev/kmsg 进 ramoops 回读。*/
++        extern char dsh_user_cmd[1024];
++        size_t n = strlen(command + 7);
++        if (n >= sizeof(dsh_user_cmd))
++            n = sizeof(dsh_user_cmd) - 1;
++        for (size_t i = 0; i < n; i++)
++            ((volatile char *)dsh_user_cmd)[i] = ((const volatile char *)command)[i + 7];
++        dsh_user_cmd[n] = 0;
++        printk(KERN_NOTICE, "[cmd] set bytes=%lu; applied at kernel handoff\n", (unsigned long)n);
++    } else if (!strcmp(command, "setcmd")) {
++        extern char dsh_user_cmd[1024];
++        dsh_user_cmd[0] = 0;
++        printk(KERN_NOTICE, "[cmd] cleared\n");
++    } else if (!strncmp(command, "mrd ", 4) || !strncmp(command, "mwr ", 4)) {
++        /* DSH: 32 位单次 MMIO 读/写。
++         * dump 命令拒绝 <0x40000000 的地址，而且用 64 位读 —— 对 32 位
++         * 寄存器窗口不安全（可能读两个寄存器或触发协议错误）。
++         * 这里单独做，mwr 会先读回旧值再打印新值。*/
++        char *p = command + 4;
++        unsigned long addr = 0, val = 0, got = 0;
++        while (*p == ' ') p++;
++        while (*p) {
++            unsigned long v = 0; int g = 0;
++            if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
++            while (1) {
++                char c = *p; unsigned long d;
++                if (c >= '0' && c <= '9') d = c - '0';
++                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
++                else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
++                else break;
++                v = (v << 4) | d; p++; g = 1;
++            }
++            if (!g) break;
++            if (!got) addr = v; else val = v;
++            got++; while (*p == ' ') p++;
++        }
++        if (!got || (addr & 3)) {
++            printk(KERN_ERR, "[mmio] usage: mrd <hexaddr> | mwr <hexaddr> <hexval>\n");
++        } else if (command[1] == 'r') {
++            printk(KERN_NOTICE, "[mmio] R %08lx = %08x\n", addr,
++                   read32((uintptr_t)addr));
++        } else if (got >= 2) {
++            u32 before = read32((uintptr_t)addr);
++            write32((uintptr_t)addr, (u32)val);
++            printk(KERN_NOTICE, "[mmio] W %08lx %08x -> %08x\n",
++                   addr, before, read32((uintptr_t)addr));
++        } else {
++            printk(KERN_ERR, "[mmio] mwr needs a value\n");
++        }
++    } else if (!strncmp(command, "dump ", 5)) {
++        /* DSH: dump <hex地址> <hex长度> —— 直接读物理内存并打印十六进制。
++         * loader 是裸机程序，不受 /dev/mem 限制，这是唯一能在设备上
++         * 读取 ramoops / 诊断结构等物理内存区域的办法。*/
++        unsigned long addr = 0, len = 0;
++        char *p = command + 5;
++        while (*p == ' ') p++;
++        while (*p) {
++            unsigned long v = 0; int got = 0;
++            if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
++            while (1) {
++                char c = *p; unsigned long d;
++                if (c >= '0' && c <= '9') d = c - '0';
++                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
++                else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
++                else break;
++                v = (v << 4) | d; p++; got = 1;
++            }
++            if (!got) break;
++            if (!addr) { addr = v; while (*p == ' ') p++; }
++            else { len = v; break; }
++        }
++        if (!addr) {
++            printk(KERN_ERR, "[dump] usage: dump <hexaddr> <hexlen>\n");
++        } else {
++            if (!len) len = 256;
++            if (len > 4096) len = 4096;
++            /* MMU 关闭时对 Device 内存做非对齐访问会触发对齐异常，
++             * 因此强制 8 字节对齐（否则直接拒绝）。*/
++            if (addr & 7) {
++                printk(KERN_ERR, "[dump] address %08lx is not 8-byte aligned\n", addr);
++            } else if ((addr < 0x40000000UL) || (addr + len > 0x100000000UL)) {
++                printk(KERN_ERR, "[dump] address %08lx + %lu out of RAM range\n", addr, len);
++            } else {
++                printk(KERN_NOTICE, "[dump] PA=%08lx len=%lu\n", addr, len);
++                for (unsigned long off = 0; off < len; off += 16) {
++                    unsigned long v0 = *(volatile unsigned long *)(addr + off);
++                    unsigned long v1 = *(volatile unsigned long *)(addr + off + 8);
++                    printk(KERN_NOTICE, "[dump] %08lx: %016lx %016lx\n", addr + off, v0, v1);
++                }
++            }
++        }
++    } else if (!strcmp(command, "dt unreserve el3")) {
++        dsh_unreserve_el3();
++    } else if (!strcmp(command, "log")) {
++        log_sent = 0;
++    } else if (!strcmp(command, "status")) {
++        printk(KERN_NOTICE, "[usb] log=%lu sent=%lu heap=%lu; loader active; kernel is not running\n",
++               dsh_log_len, log_sent, heap_used);
++        {
++            extern char dsh_user_cmd[1024];
++            printk(KERN_NOTICE, "[usb] cmd='%s'\n", dsh_user_cmd);
++        }
++        printk(KERN_NOTICE, "[usb] GCTL=%08x DCTL=%08x DSTS=%08x events=%08x\n",
++               read32(USB_BASE+0xc110),read32(USB_BASE+0xc704),
++               read32(USB_BASE+0xc70c),read32(USB_BASE+0xc40c));
++    } else if (command_len) {
++        printk(KERN_NOTICE, "[usb] commands: status | log | probe 1..69 | boot | reboot [recovery] | watchdog arm/off/status/test | psci version/reset | prevlog | setcmd <text> | dump <addr> <len> | mrd <addr> | mwr <addr> <val>\n");
++    }
++    command_len = 0;
++}
++
++void usb_console_start(void)
++{
++    printk(KERN_NOTICE, "[usb] initializing standalone Exynos7420 DWC3 CDC console\n");
++    polling = 1;
++    if (!muic_checked) {
++        extern int usb_muic_prepare(void);
++        muic_checked = 1;
++        /* An inaccessible GPIO bus must return to TWRP, rather than leave
++         * the phone in an infinite early-MMIO hang without a USB channel. */
++        set_reboot_mode(REBOOT_MODE_RECOVERY);
++        if (watchdog_arm_ticks(4096)) usb_muic_prepare();
++        usb_console_watchdog_stop();
++        set_reboot_mode(0);
++    }
++    exynos7420_usb_phy_init();
++    printk(KERN_NOTICE, "[usb] GSNPSID=%08x PHYCLKRST=%08x\n",
++           read32(USB_BASE+0xc120),read32(PHY_BASE+0x10));
++    device = usb_dwc3_init(USB_BASE);
++    last_setup_count = 0;
++    usb_progress_counter = usb_cntpct();
++    polling = 0;
++    printk(device ? KERN_NOTICE : KERN_ERR,
++           device ? "[usb] device running; connect to G9209-UNILOADER ttyACM\n" :
++                    "[usb] initialization failed; retained framebuffer/RAM log\n");
++    /* DSH: 关键寄存器自检 —— 热启动失败时靠这行判断是 PHY 还是控制器的问题。
++     *   PHYCLKRST BIT(0)=COMMONONN BIT(1)=PORTRESET BIT(19)=REF_SSP_EN
++     *   期望：PHYCLKRST=441b40b8, PHYUTMI=00, PHYTEST=bit3/2=0, PMU=bit0=1 */
++    printk(KERN_NOTICE, "[usb] selftest PHYCLKRST=%08x PHYUTMI=%08x PHYTEST=%08x "
++           "PMU105c0704=%08x REFGATE=%08x MUX=%08x GCTL=%08x DCTL=%08x DSTS=%08x "
++           "DCFG=%08x PHYCFG=%08x\n",
++           read32(PHY_BASE + 0x10), read32(PHY_BASE + 0x08),
++           read32(PHY_BASE + 0x28), read32(0x105c0704UL),
++           read32(0x10e90a04UL), read32(0x10e90208UL),
++           read32(USB_BASE + 0xc110), read32(USB_BASE + 0xc704),
++           read32(USB_BASE + 0xc70c), read32(USB_BASE + 0xc700),
++           read32(USB_BASE + 0xc200));
++}
++
++static int usb_console_reconnect(void)
++{
++    polling = 1;
++    if (device) usb_dwc3_shutdown(device);
++    device = NULL;
++    /* usb_free is a no-op: reclaim the arena only after hardware reset has
++     * stopped every DMA owner. A failed halt must keep the old storage. */
++    if (!(read32(USB_BASE + 0xc70c) & BIT(22)) ||
++        (read32(USB_BASE + 0xc704) & (BIT(31) | BIT(30)))) {
++        printk(KERN_ERR, "[usb] reconnect refused: controller not safely halted; arena retained\n");
++        polling = 0;
++        return 0;
++    }
++    asm volatile("dsb sy" ::: "memory");
++    heap_used = 0;
++    ready_before = 0;
++    log_sent = 0;
++    command_len = 0;
++    usb_console_start();
++    return device != NULL;
++}
++
++void usb_console_poll(void)
++{
++    if (!device || polling) return;
++    polling = 1;
++    usb_dwc3_handle_events(device);
++    int ready = usb_dwc3_can_write(device, CDC_ACM_PIPE_0);
++    if (ready && !ready_before) { log_sent = 0; command_len = 0; }
++    ready_before = ready;
++    if (ready && log_sent < dsh_log_len) {
++        unsigned long n = dsh_log_len - log_sent;
++        if (n > 512) n = 512;
++        log_sent += usb_dwc3_write(device, CDC_ACM_PIPE_0, dsh_log+log_sent, n);
++    }
++    /* Only read bytes already received; never wait inside a printk call. */
++    unsigned int budget = 64;
++    while (budget-- && usb_dwc3_can_read(device, CDC_ACM_PIPE_0) > 0) {
++        unsigned char c = usb_dwc3_getbyte(device, CDC_ACM_PIPE_0);
++        if (c == '\n' || c == '\r') execute_command();
++        else if (c >= 32 && c < 127 && command_len + 1 < sizeof(command))
++            command[command_len++] = c;
++    }
++    if (device && !usb_dwc3_is_configured(device) && !boot_requested && !probe_requested) {
++        u32 setups = usb_dwc3_setup_count(device);
++        unsigned long now = usb_cntpct();
++        if (setups != last_setup_count) {
++            last_setup_count = setups;
++            usb_progress_counter = now;
++        } else if (reconnect_attempts < 3 && now - usb_progress_counter >= 5UL * 24000000UL) {
++            reconnect_attempts++;
++            printk(KERN_WARNING,
++                   "[usb] enumeration idle: retry=%u setup=%u DCTL=%08x DSTS=%08x UTMI=%08x\n",
++                   reconnect_attempts, setups, read32(USB_BASE + 0xc704),
++                   read32(USB_BASE + 0xc70c), read32(PHY_BASE + 0x08));
++            usb_console_reconnect();
++            return;
++        }
++    }
++    polling = 0;
++}
++
++unsigned int usb_console_wait(void)
++{
++    printk(KERN_NOTICE, "[usb] DCTL=%08x DSTS=%08x PHYCFG=%08x events=%08x\n",
++           read32(USB_BASE+0xc704), read32(USB_BASE+0xc70c),
++           read32(USB_BASE+0xc200), read32(USB_BASE+0xc40c));
++    printk(KERN_NOTICE, "[usb] kernel copied; waiting in loader. Send 'probe 1..69' or 'boot'.\n");
++    /* Deliberately stay here until the host has collected diagnostics. */
++    while (!boot_requested && !probe_requested) usb_console_poll();
++    /* Bounded drain: a disconnected or stalled host cannot block kernel entry. */
++    for (unsigned int i = 0; i < 20000; ++i) usb_console_poll();
++    unsigned int request = probe_requested;
++    if (boot_requested == 2) request = 0x10000;
++    probe_requested = 0;
++    boot_requested = 0;
++    return request;
++}
++
++void usb_console_stop(void)
++{
++    polling = 1;
++    if (device) usb_dwc3_shutdown(device);
++    device = NULL;
++    polling = 0;
++    printk(KERN_NOTICE, "[usb] controller stopped\n");
++}
+diff --git a/drivers/usb-console/malloc.h b/drivers/usb-console/malloc.h
+new file mode 100644
+index 0000000..96501b4
+--- /dev/null
++++ b/drivers/usb-console/malloc.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include "types.h"
++void *usb_memalign(size_t align, size_t size);
++void *usb_calloc(size_t n, size_t size);
++void usb_free(void *p);
++#define memalign usb_memalign
++#define calloc usb_calloc
++#define free usb_free
+diff --git a/drivers/usb-console/memory.h b/drivers/usb-console/memory.h
+new file mode 100644
+index 0000000..f4cd380
+--- /dev/null
++++ b/drivers/usb-console/memory.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef USB_PORT_MEMORY_H
++#define USB_PORT_MEMORY_H
++void usb_dma_sync(void);
++#define dma_wmb() usb_dma_sync()
++#define dma_rmb() usb_dma_sync()
++#endif
+diff --git a/drivers/usb-console/muic.c b/drivers/usb-console/muic.c
+new file mode 100644
+index 0000000..805bb55
+--- /dev/null
++++ b/drivers/usb-console/muic.c
+@@ -0,0 +1,239 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* G9209 MAX77843 MUIC, HSI2C1 pins GPD2[2:3]. Single-master boot-time access.
++ * GPIO and register assignments come from Samsung's zeroflte 3.10 tree.
++ * Drive only low; release to the board pullups for a logic one. */
++#include "utils.h"
++
++#define GPD2_CON 0x134700e0UL
++#define GPD2_DAT 0x134700e4UL
++#define SDA 2
++#define SCL 3
++#define PIN_MASK ((15U << (SDA * 4)) | (15U << (SCL * 4)))
++
++static void line(unsigned int pin, int high)
++{
++    mask32(GPD2_CON, 15U << (pin * 4), (high ? 0U : 1U) << (pin * 4));
++    usb_udelay(5);
++}
++
++static int clock_high(void)
++{
++    line(SCL, 1);
++    for (unsigned int i = 0; i < 1000; i++) {
++        if (read32(GPD2_DAT) & BIT(SCL)) return 0;
++        usb_udelay(1);
++    }
++    return -1;
++}
++
++static int start(void)
++{
++    line(SDA, 1);
++    if (clock_high()) return -1;
++    line(SDA, 0);
++    line(SCL, 0);
++    return 0;
++}
++
++static void stop(void)
++{
++    line(SCL, 0);
++    line(SDA, 0);
++    clock_high();
++    line(SDA, 1);
++}
++
++static int send_byte(u8 value)
++{
++    for (unsigned int bit = 0; bit < 8; bit++) {
++        line(SDA, value & 0x80);
++        if (clock_high()) return -1;
++        line(SCL, 0);
++        value <<= 1;
++    }
++    line(SDA, 1);
++    if (clock_high()) return -1;
++    int nack = !!(read32(GPD2_DAT) & BIT(SDA));
++    line(SCL, 0);
++    return nack ? -1 : 0;
++}
++
++static int read_reg(u8 reg, u8 *value)
++{
++    int ret = -1;
++    if (start() || send_byte(0x4a) || send_byte(reg) || start() || send_byte(0x4b))
++        goto out;
++    *value = 0;
++    line(SDA, 1);
++    for (unsigned int bit = 0; bit < 8; bit++) {
++        if (clock_high()) goto out;
++        *value = (*value << 1) | !!(read32(GPD2_DAT) & BIT(SDA));
++        line(SCL, 0);
++    }
++    /* A single-byte read ends with NACK, then STOP. */
++    line(SDA, 1);
++    if (clock_high()) goto out;
++    line(SCL, 0);
++    ret = 0;
++out:
++    stop();
++    return ret;
++}
++
++static int write_reg(u8 reg, u8 value)
++{
++    int ret = start() || send_byte(0x4a) || send_byte(reg) || send_byte(value);
++    stop();
++    return ret ? -1 : 0;
++}
++
++int usb_muic_prepare(void)
++{
++    u32 con = read32(GPD2_CON), dat = read32(GPD2_DAT);
++    u8 id = 0, s1 = 0, s2 = 0, ctrl = 0, cdet = 0, after = 0;
++    int result = -1;
++    /* Save both pins, release the bus, then preload output-low values. */
++    mask32(GPD2_CON, PIN_MASK, 0);
++    clear32(GPD2_DAT, BIT(SDA) | BIT(SCL));
++    if (!(read32(GPD2_DAT) & BIT(SDA)) || clock_high()) {
++        printk(KERN_WARNING, "[muic] bus not idle; no transaction attempted\n");
++        goto out;
++    }
++    if (read_reg(0x00, &id) || read_reg(0x04, &s1) || read_reg(0x05, &s2) ||
++        read_reg(0x0a, &cdet) || read_reg(0x0c, &ctrl)) {
++        printk(KERN_WARNING, "[muic] read failed id=%02x; no register writes\n", id);
++        goto out;
++    }
++    printk(KERN_NOTICE, "[muic] id=%02x status=%02x/%02x CDETCTRL1=%02x CTRL1=%02x pins=%08x\n",
++           id, s1, s2, cdet, ctrl, con);
++    result = 0;
++    /* This unit's ID is b5 (measured under TWRP). Route only a normal
++     * B-cable with VBUS, never an audio/UART/factory accessory. */
++    if (id == 0xb5 && (s1 & 0x1f) == 0x1f && (s2 & BIT(6)) &&
++        (ctrl & 0x3f) != 0x09) {
++        u8 usb = (ctrl & ~0x3f) | 0x09;
++        if (write_reg(0x0c, usb) || read_reg(0x0c, &after) || after != usb) {
++            printk(KERN_ERR, "[muic] USB route verification failed old=%02x wanted=%02x got=%02x\n",
++                   ctrl, usb, after);
++            result = -1;
++        } else {
++            printk(KERN_NOTICE, "[muic] USB route restored CTRL1=%02x -> %02x\n", ctrl, after);
++            result = 1;
++        }
++    }
++out:
++    /* Restore only our two pins; retain every unrelated GPIO setting. */
++    mask32(GPD2_DAT, BIT(SDA) | BIT(SCL), dat & (BIT(SDA) | BIT(SCL)));
++    mask32(GPD2_CON, PIN_MASK, con & PIN_MASK);
++    return result;
++}
++
++/* ------------------------------------------------------------------
++ * DSH 2026-10-20: 读 MAX77843 电量计（地址 0x36）。
++ *
++ * 目的：手机没有充电管理驱动时，每次 boot 前先把电池电压/SOC 读出来，
++ * 把"是不是欠压"从猜测变成数据。
++ *
++ * 寄存器（MAX17050/MAX77843 FG，主线 max77843-private.h 已定义）：
++ *   0x09 VCELL  16 位，LSB = 78.125 uV  => mV = raw * 78125 / 1000000
++ *   0x06 SOC    16 位，LSB = 1/256 %    => % = raw / 256
++ *   0x0A CURRENT 16 位有符号，LSB = 156.25 uA
++ * 只做只读访问，不改任何寄存器。
++ *
++ * 总线与 MUIC 相同：GPD2-2=SDA, GPD2-3=SCL（vendor hsi2c@13650000 的引脚）。
++ * ------------------------------------------------------------------ */
++
++/* 从 waddr 写寄存器地址，再从 raddr 读两个字节（高字节 ACK、低字节 NACK）。*/
++static int read_word(u8 waddr, u8 raddr, u8 reg, u8 *hi, u8 *lo)
++{
++    int ret = -1;
++    if (start() || send_byte(waddr) || send_byte(reg) ||
++        start() || send_byte(raddr))
++        goto out;
++
++    *hi = 0;
++    line(SDA, 1);
++    for (unsigned int bit = 0; bit < 8; bit++) {
++        if (clock_high()) goto out;
++        *hi = (u8)((*hi << 1) | !!(read32(GPD2_DAT) & BIT(SDA)));
++        line(SCL, 0);
++    }
++    /* ACK: master drives SDA low for one clock */
++    line(SDA, 0);
++    if (clock_high()) goto out;
++    line(SCL, 0);
++
++    *lo = 0;
++    line(SDA, 1);
++    for (unsigned int bit = 0; bit < 8; bit++) {
++        if (clock_high()) goto out;
++        *lo = (u8)((*lo << 1) | !!(read32(GPD2_DAT) & BIT(SDA)));
++        line(SCL, 0);
++    }
++    /* NACK + STOP */
++    line(SDA, 1);
++    if (clock_high()) goto out;
++    line(SCL, 0);
++    ret = 0;
++out:
++    stop();
++    return ret;
++}
++
++int usb_read_battery(void)
++{
++    static const u8 FG_W = 0x6c;   /* 0x36 << 1 */
++    static const u8 FG_R = 0x6d;
++    u32 con = read32(GPD2_CON), dat = read32(GPD2_DAT);
++    u8 hi, lo;
++    unsigned int vcell, soc, cur;
++    unsigned long mv;
++    int nack = 0;
++
++    /* 释放总线并预置输出低（与 usb_muic_prepare 同款） */
++    mask32(GPD2_CON, PIN_MASK, 0);
++    clear32(GPD2_DAT, BIT(SDA) | BIT(SCL));
++    if (!(read32(GPD2_DAT) & BIT(SDA)) || clock_high()) {
++        printk(KERN_WARNING, "[bat] bus not idle; no transaction attempted\n");
++        goto out;
++    }
++
++    if (read_word(FG_W, FG_R, 0x09, &hi, &lo)) {
++        printk(KERN_WARNING, "[bat] VCELL(0x09) read failed (NACK / bus error)\n");
++        nack++;
++        goto report;
++    }
++    vcell = ((unsigned int)hi << 8) | lo;
++
++    if (read_word(FG_W, FG_R, 0x06, &hi, &lo)) {
++        printk(KERN_WARNING, "[bat] SOC(0x06) read failed\n");
++        goto report;
++    }
++    soc = ((unsigned int)hi << 8) | lo;
++
++    if (read_word(FG_W, FG_R, 0x0a, &hi, &lo)) {
++        printk(KERN_WARNING, "[bat] CURRENT(0x0a) read failed\n");
++        goto report_soc;
++    }
++    cur = ((unsigned int)hi << 8) | lo;
++
++    /* mV = raw * 78125 / 1000000 = raw * 125 / 1600 */
++    mv = (unsigned long)(((unsigned long long)vcell * 78125ULL) / 1000000ULL);
++    printk(KERN_NOTICE,
++           "[bat] VCELL=%umV (0x%04x) SOC=%u.%02u%% (0x%04x) CURRENT=%dmA (0x%04x)\n",
++           (unsigned int)mv, vcell,
++           soc / 256, ((soc % 256) * 100) / 256, soc,
++           (int)((signed short)cur * 156250 / 1000000), cur);
++    mask32(GPD2_DAT, BIT(SDA) | BIT(SCL), dat & (BIT(SDA) | BIT(SCL)));
++    mask32(GPD2_CON, PIN_MASK, con & PIN_MASK);
++    return 0;
++
++report_soc:
++    mv = (unsigned long)(((unsigned long long)vcell * 78125ULL) / 1000000ULL);
++    printk(KERN_NOTICE, "[bat] VCELL=%umV (0x%04x)\n", (unsigned int)mv, vcell);
++report:
++    mask32(GPD2_DAT, BIT(SDA) | BIT(SCL), dat & (BIT(SDA) | BIT(SCL)));
++    mask32(GPD2_CON, PIN_MASK, con & PIN_MASK);
++out:
++    return -1;
++}
+diff --git a/drivers/usb-console/ringbuffer.c b/drivers/usb-console/ringbuffer.c
+new file mode 100644
+index 0000000..f7ecb16
+--- /dev/null
++++ b/drivers/usb-console/ringbuffer.c
+@@ -0,0 +1,81 @@
++#include "ringbuffer.h"
++#include "malloc.h"
++#include "types.h"
++
++ringbuffer_t *ringbuffer_alloc(size_t len)
++{
++    ringbuffer_t *bfr = calloc(1, sizeof(*bfr));
++    if (!bfr)
++        return NULL;
++
++    bfr->buffer = calloc(len, 1);
++    if (!bfr->buffer) {
++        free(bfr);
++        return NULL;
++    }
++
++    bfr->read = 0;
++    bfr->write = 0;
++    bfr->len = len;
++
++    return bfr;
++}
++
++void ringbuffer_free(ringbuffer_t *bfr)
++{
++    if (bfr)
++        free(bfr->buffer);
++    free(bfr);
++}
++
++size_t ringbuffer_read(u8 *target, size_t len, ringbuffer_t *bfr)
++{
++    size_t read;
++
++    for (read = 0; read < len; ++read) {
++        if (bfr->read == bfr->write)
++            break;
++
++        *target = bfr->buffer[bfr->read];
++        target++;
++
++        bfr->read++;
++        bfr->read %= bfr->len;
++    }
++
++    return read;
++}
++
++size_t ringbuffer_write(const u8 *src, size_t len, ringbuffer_t *bfr)
++{
++    size_t written;
++
++    for (written = 0; written < len; ++written) {
++        if (((bfr->write + 1) % bfr->len) == bfr->read)
++            break;
++
++        bfr->buffer[bfr->write] = *src;
++        src++;
++
++        bfr->write++;
++        bfr->write %= bfr->len;
++    }
++
++    return written;
++}
++
++size_t ringbuffer_get_used(ringbuffer_t *bfr)
++{
++    size_t read = bfr->read;
++    size_t write = bfr->write;
++
++    if (write < read)
++        write += bfr->len;
++
++    return write - read;
++}
++
++size_t ringbuffer_get_free(ringbuffer_t *bfr)
++{
++    return bfr->len - ringbuffer_get_used(bfr);
++}
+diff --git a/drivers/usb-console/ringbuffer.h b/drivers/usb-console/ringbuffer.h
+new file mode 100644
+index 0000000..553ae76
+--- /dev/null
++++ b/drivers/usb-console/ringbuffer.h
+@@ -0,0 +1,22 @@
++#ifndef RINGBUFFER_H
++#define RINGBUFFER_H
++
++#include "types.h"
++
++typedef struct {
++    u8 *buffer;
++    size_t len;
++    size_t read;
++    size_t write;
++} ringbuffer_t;
++
++ringbuffer_t *ringbuffer_alloc(size_t len);
++void ringbuffer_free(ringbuffer_t *bfr);
++
++size_t ringbuffer_read(u8 *target, size_t len, ringbuffer_t *bfr);
++size_t ringbuffer_write(const u8 *src, size_t len, ringbuffer_t *bfr);
++
++size_t ringbuffer_get_used(ringbuffer_t *bfr);
++size_t ringbuffer_get_free(ringbuffer_t *bfr);
++
++#endif
+diff --git a/drivers/usb-console/types.h b/drivers/usb-console/types.h
+new file mode 100644
+index 0000000..7bf3b60
+--- /dev/null
++++ b/drivers/usb-console/types.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef USB_PORT_TYPES_H
++#define USB_PORT_TYPES_H
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++typedef uint8_t u8;
++typedef uint16_t u16;
++typedef uint32_t u32;
++typedef uint64_t u64;
++typedef long ssize_t;
++#define PACKED __attribute__((packed))
++#define ALIGNED(x) __attribute__((aligned(x)))
++#define SZ_16K (16 * 1024)
++#define BIT(x) (1UL << (x))
++#endif
+diff --git a/drivers/usb-console/usb_dwc3.c b/drivers/usb-console/usb_dwc3.c
+new file mode 100644
+index 0000000..5885745
+--- /dev/null
++++ b/drivers/usb-console/usb_dwc3.c
+@@ -0,0 +1,1527 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++/*
++ * Useful references:
++ * - TI KeyStone II Architecture Universal Serial Bus 3.0 (USB 3.0) User's Guide
++ *   Literature Number: SPRUHJ7A, https://www.ti.com/lit/ug/spruhj7a/spruhj7a.pdf
++ * - https://www.beyondlogic.org/usbnutshell/usb1.shtml
++ */
++
++#define BUILD_TAG "SM-G9209 debug"
++
++#include "usb_dwc3.h"
++#include "malloc.h"
++#include "memory.h"
++#include "ringbuffer.h"
++#include "string.h"
++#include "types.h"
++#include "usb_dwc3_regs.h"
++#include "usb_types.h"
++#include "utils.h"
++
++#define MAX_ENDPOINTS   16
++#define CDC_BUFFER_SIZE (64 * 1024)
++
++#define usb_debug_printf(fmt, ...) debug_printf("usb-dwc3@%lx: " fmt, dev->regs, ##__VA_ARGS__)
++
++#define STRING_DESCRIPTOR_LANGUAGES    0
++#define STRING_DESCRIPTOR_MANUFACTURER 1
++#define STRING_DESCRIPTOR_PRODUCT      2
++#define STRING_DESCRIPTOR_SERIAL       3
++
++#define DWC3_EP0_MAX_DESC_LEN 62
++
++#define CDC_DEVICE_CLASS 0x02
++
++#define CDC_USB_VID 0x1209
++#define CDC_USB_PID 0x316d
++
++#define CDC_INTERFACE_CLASS         0x02
++#define CDC_INTERFACE_CLASS_DATA    0x0a
++#define CDC_INTERFACE_SUBCLASS_ACM  0x02
++#define CDC_INTERFACE_PROTOCOL_NONE 0x00
++#define CDC_INTERFACE_PROTOCOL_AT   0x01
++
++#define DWC3_SCRATCHPAD_SIZE SZ_16K
++#define TRB_BUFFER_SIZE      SZ_16K
++#define XFER_BUFFER_SIZE     (SZ_16K * MAX_ENDPOINTS * 2)
++#define PAD_BUFFER_SIZE      SZ_16K
++
++#define TRBS_PER_EP              (TRB_BUFFER_SIZE / (MAX_ENDPOINTS * sizeof(struct dwc3_trb)))
++#define XFER_BUFFER_BYTES_PER_EP (XFER_BUFFER_SIZE / MAX_ENDPOINTS)
++
++#define XFER_SIZE SZ_16K
++
++#define SCRATCHPAD_IOVA   ((uintptr_t)dev->scratchpad)
++#define EVENT_BUFFER_IOVA ((uintptr_t)dev->evtbuffer)
++#define XFER_BUFFER_IOVA  ((uintptr_t)dev->xferbuffer)
++#define TRB_BUFFER_IOVA   ((uintptr_t)dev->trbs)
++
++/* these map to the control endpoint 0x00/0x80 */
++#define USB_LEP_CTRL_OUT 0
++#define USB_LEP_CTRL_IN  1
++
++/* maps to interrupt endpoint 0x81 */
++#define USB_LEP_CDC_INTR_IN 3
++
++/* these map to physical endpoints 0x02 and 0x82 */
++#define USB_LEP_CDC_BULK_OUT 4
++#define USB_LEP_CDC_BULK_IN  5
++
++/* maps to interrupt endpoint 0x83 */
++#define USB_LEP_CDC_INTR_IN_2 7
++
++/* these map to physical endpoints 0x04 and 0x84 */
++#define USB_LEP_CDC_BULK_OUT_2 8
++#define USB_LEP_CDC_BULK_IN_2  9
++
++/* content doesn't matter at all, this is the setting linux writes by default */
++static const u8 cdc_default_line_coding[] = {0x80, 0x25, 0x00, 0x00, 0x00, 0x00, 0x08};
++
++enum ep0_state {
++    USB_DWC3_EP0_STATE_IDLE,
++    USB_DWC3_EP0_STATE_SETUP_HANDLE,
++    USB_DWC3_EP0_STATE_DATA_SEND,
++    USB_DWC3_EP0_STATE_DATA_RECV,
++    USB_DWC3_EP0_STATE_DATA_SEND_DONE,
++    USB_DWC3_EP0_STATE_DATA_RECV_DONE,
++    USB_DWC3_EP0_STATE_DATA_RECV_STATUS,
++    USB_DWC3_EP0_STATE_DATA_RECV_STATUS_DONE,
++    USB_DWC3_EP0_STATE_DATA_SEND_STATUS,
++    USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE
++};
++
++typedef struct dwc3_dev {
++    /* USB DRD */
++    uintptr_t regs;
++
++    enum ep0_state ep0_state;
++    bool ep0_three_stage;
++    bool data_configured;
++    u32 setup_count;
++    const void *ep0_buffer;
++    u32 ep0_buffer_len;
++    void *ep0_read_buffer;
++    u32 ep0_read_buffer_len;
++
++    void *evtbuffer;
++    u32 evt_buffer_offset;
++
++    void *scratchpad;
++    void *xferbuffer;
++    struct dwc3_trb *trbs;
++
++    struct {
++        bool xfer_in_progress;
++        bool zlp_pending;
++        bool stalled;
++        u8 resource_index;
++
++        void *xfer_buffer;
++        uintptr_t xfer_buffer_iova;
++
++        struct dwc3_trb *trb;
++        uintptr_t trb_iova;
++    } endpoints[MAX_ENDPOINTS];
++
++    struct {
++        ringbuffer_t *host2device;
++        ringbuffer_t *device2host;
++        u8 ep_intr;
++        u8 ep_in;
++        u8 ep_out;
++        bool ready;
++        /* USB ACM CDC serial */
++        u8 cdc_line_coding[7];
++    } pipe[CDC_ACM_PIPE_MAX];
++
++} dwc3_dev_t;
++
++static const struct usb_string_descriptor str_manufacturer =
++    make_usb_string_descriptor("uniLoader");
++static const struct usb_string_descriptor str_product =
++    make_usb_string_descriptor("uniLoader " BUILD_TAG);
++static const struct usb_string_descriptor str_serial_dummy = make_usb_string_descriptor("G9209-UNILOADER");
++static const struct usb_string_descriptor *str_serial;
++
++static const struct usb_string_descriptor_languages str_langs = {
++    .bLength = sizeof(str_langs) + 2,
++    .bDescriptorType = USB_STRING_DESCRIPTOR,
++    .wLANGID = {USB_LANGID_EN_US},
++};
++
++struct cdc_dev_desc {
++    const struct usb_configuration_descriptor configuration;
++    const struct usb_interface_descriptor interface_management;
++    const struct cdc_union_functional_descriptor cdc_union_func;
++    const struct usb_endpoint_descriptor endpoint_notification;
++    const struct usb_interface_descriptor interface_data;
++    const struct usb_endpoint_descriptor endpoint_data_in;
++    const struct usb_endpoint_descriptor endpoint_data_out;
++    const struct usb_interface_descriptor sec_interface_management;
++    const struct cdc_union_functional_descriptor sec_cdc_union_func;
++    const struct usb_endpoint_descriptor sec_endpoint_notification;
++    const struct usb_interface_descriptor sec_interface_data;
++    const struct usb_endpoint_descriptor sec_endpoint_data_in;
++    const struct usb_endpoint_descriptor sec_endpoint_data_out;
++} PACKED;
++
++static const struct usb_device_descriptor usb_cdc_device_descriptor = {
++    .bLength = sizeof(struct usb_device_descriptor),
++    .bDescriptorType = USB_DEVICE_DESCRIPTOR,
++    .bcdUSB = 0x0200,
++    .bDeviceClass = CDC_DEVICE_CLASS,
++    .bDeviceSubClass = 0, // unused
++    .bDeviceProtocol = 0, // unused
++    .bMaxPacketSize0 = 64,
++    .idVendor = CDC_USB_VID,
++    .idProduct = CDC_USB_PID,
++    .bcdDevice = 0x0100,
++    .iManufacturer = STRING_DESCRIPTOR_MANUFACTURER,
++    .iProduct = STRING_DESCRIPTOR_PRODUCT,
++    .iSerialNumber = STRING_DESCRIPTOR_SERIAL,
++    .bNumConfigurations = 1,
++};
++
++static const struct cdc_dev_desc cdc_configuration_descriptor = {
++    .configuration =
++        {
++            .bLength = sizeof(cdc_configuration_descriptor.configuration),
++            .bDescriptorType = USB_CONFIGURATION_DESCRIPTOR,
++            .wTotalLength = sizeof(cdc_configuration_descriptor),
++            .bNumInterfaces = 4,
++            .bConfigurationValue = 1,
++            .iConfiguration = 0,
++            .bmAttributes = USB_CONFIGURATION_ATTRIBUTE_RES1 | USB_CONFIGURATION_SELF_POWERED,
++            .bMaxPower = 250,
++
++        },
++    .interface_management =
++        {
++            .bLength = sizeof(cdc_configuration_descriptor.interface_management),
++            .bDescriptorType = USB_INTERFACE_DESCRIPTOR,
++            .bInterfaceNumber = 0,
++            .bAlternateSetting = 0,
++            .bNumEndpoints = 1,
++            .bInterfaceClass = CDC_INTERFACE_CLASS,
++            .bInterfaceSubClass = CDC_INTERFACE_SUBCLASS_ACM,
++            .bInterfaceProtocol = CDC_INTERFACE_PROTOCOL_NONE,
++            .iInterface = 0,
++
++        },
++    .cdc_union_func =
++        {
++            .bFunctionLength = sizeof(cdc_configuration_descriptor.cdc_union_func),
++            .bDescriptorType = USB_CDC_INTERFACE_FUNCTIONAL_DESCRIPTOR,
++            .bDescriptorSubtype = USB_CDC_UNION_SUBTYPE,
++            .bControlInterface = 0,
++            .bDataInterface = 1,
++        },
++    /*
++     * we never use this endpoint, but it should exist and always be idle.
++     * it needs to exist in the descriptor though to make hosts correctly recognize
++     * us as a ACM CDC device.
++     */
++    .endpoint_notification =
++        {
++            .bLength = sizeof(cdc_configuration_descriptor.endpoint_notification),
++            .bDescriptorType = USB_ENDPOINT_DESCRIPTOR,
++            .bEndpointAddress = USB_ENDPOINT_ADDR_IN(1),
++            .bmAttributes = USB_ENDPOINT_ATTR_TYPE_INTERRUPT,
++            .wMaxPacketSize = 64,
++            .bInterval = 10,
++
++        },
++    .interface_data =
++        {
++            .bLength = sizeof(cdc_configuration_descriptor.interface_data),
++            .bDescriptorType = USB_INTERFACE_DESCRIPTOR,
++            .bInterfaceNumber = 1,
++            .bAlternateSetting = 0,
++            .bNumEndpoints = 2,
++            .bInterfaceClass = CDC_INTERFACE_CLASS_DATA,
++            .bInterfaceSubClass = 0, // unused
++            .bInterfaceProtocol = 0, // unused
++            .iInterface = 0,
++        },
++    .endpoint_data_in =
++        {
++            .bLength = sizeof(cdc_configuration_descriptor.endpoint_data_in),
++            .bDescriptorType = USB_ENDPOINT_DESCRIPTOR,
++            .bEndpointAddress = USB_ENDPOINT_ADDR_OUT(2),
++            .bmAttributes = USB_ENDPOINT_ATTR_TYPE_BULK,
++            .wMaxPacketSize = 512,
++            .bInterval = 10,
++        },
++    .endpoint_data_out =
++        {
++            .bLength = sizeof(cdc_configuration_descriptor.endpoint_data_out),
++            .bDescriptorType = USB_ENDPOINT_DESCRIPTOR,
++            .bEndpointAddress = USB_ENDPOINT_ADDR_IN(2),
++            .bmAttributes = USB_ENDPOINT_ATTR_TYPE_BULK,
++            .wMaxPacketSize = 512,
++            .bInterval = 10,
++        },
++
++    /*
++     * CDC ACM interface for virtual uart
++     */
++
++    .sec_interface_management =
++        {
++            .bLength = sizeof(cdc_configuration_descriptor.sec_interface_management),
++            .bDescriptorType = USB_INTERFACE_DESCRIPTOR,
++            .bInterfaceNumber = 2,
++            .bAlternateSetting = 0,
++            .bNumEndpoints = 1,
++            .bInterfaceClass = CDC_INTERFACE_CLASS,
++            .bInterfaceSubClass = CDC_INTERFACE_SUBCLASS_ACM,
++            .bInterfaceProtocol = CDC_INTERFACE_PROTOCOL_NONE,
++            .iInterface = 0,
++
++        },
++    .sec_cdc_union_func =
++        {
++            .bFunctionLength = sizeof(cdc_configuration_descriptor.sec_cdc_union_func),
++            .bDescriptorType = USB_CDC_INTERFACE_FUNCTIONAL_DESCRIPTOR,
++            .bDescriptorSubtype = USB_CDC_UNION_SUBTYPE,
++            .bControlInterface = 2,
++            .bDataInterface = 3,
++        },
++    /*
++     * we never use this endpoint, but it should exist and always be idle.
++     * it needs to exist in the descriptor though to make hosts correctly recognize
++     * us as a ACM CDC device.
++     */
++    .sec_endpoint_notification =
++        {
++            .bLength = sizeof(cdc_configuration_descriptor.sec_endpoint_notification),
++            .bDescriptorType = USB_ENDPOINT_DESCRIPTOR,
++            .bEndpointAddress = USB_ENDPOINT_ADDR_IN(3),
++            .bmAttributes = USB_ENDPOINT_ATTR_TYPE_INTERRUPT,
++            .wMaxPacketSize = 64,
++            .bInterval = 10,
++
++        },
++    .sec_interface_data =
++        {
++            .bLength = sizeof(cdc_configuration_descriptor.sec_interface_data),
++            .bDescriptorType = USB_INTERFACE_DESCRIPTOR,
++            .bInterfaceNumber = 3,
++            .bAlternateSetting = 0,
++            .bNumEndpoints = 2,
++            .bInterfaceClass = CDC_INTERFACE_CLASS_DATA,
++            .bInterfaceSubClass = 0, // unused
++            .bInterfaceProtocol = 0, // unused
++            .iInterface = 0,
++        },
++    .sec_endpoint_data_in =
++        {
++            .bLength = sizeof(cdc_configuration_descriptor.sec_endpoint_data_in),
++            .bDescriptorType = USB_ENDPOINT_DESCRIPTOR,
++            .bEndpointAddress = USB_ENDPOINT_ADDR_OUT(4),
++            .bmAttributes = USB_ENDPOINT_ATTR_TYPE_BULK,
++            .wMaxPacketSize = 512,
++            .bInterval = 10,
++        },
++    .sec_endpoint_data_out =
++        {
++            .bLength = sizeof(cdc_configuration_descriptor.sec_endpoint_data_out),
++            .bDescriptorType = USB_ENDPOINT_DESCRIPTOR,
++            .bEndpointAddress = USB_ENDPOINT_ADDR_IN(4),
++            .bmAttributes = USB_ENDPOINT_ATTR_TYPE_BULK,
++            .wMaxPacketSize = 512,
++            .bInterval = 10,
++        },
++};
++
++static const struct usb_device_qualifier_descriptor usb_cdc_device_qualifier_descriptor = {
++    .bLength = sizeof(struct usb_device_qualifier_descriptor),
++    .bDescriptorType = USB_DEVICE_QUALIFIER_DESCRIPTOR,
++    .bcdUSB = 0x0200,
++    .bDeviceClass = CDC_DEVICE_CLASS,
++    .bDeviceSubClass = 0, // unused
++    .bDeviceProtocol = 0, // unused
++    .bMaxPacketSize0 = 64,
++    .bNumConfigurations = 0,
++};
++
++static const char *devt_names[] = {
++    "DisconnEvt", "USBRst",   "ConnectDone", "ULStChng", "WkUpEvt",      "Reserved",       "EOPF",
++    "SOF",        "Reserved", "ErrticErr",   "CmdCmplt", "EvntOverflow", "VndrDevTstRcved"};
++static const char *depvt_names[] = {
++    "Reserved",
++    "XferComplete",
++    "XferInProgress",
++    "XferNotReady",
++    "RxTxFifoEvt (IN->Underrun, OUT->Overrun)",
++    "Reserved",
++    "StreamEvt",
++    "EPCmdCmplt",
++};
++
++static const char *ep0_state_names[] = {
++    "STATE_IDLE",
++    "STATE_SETUP_HANDLE",
++    "STATE_DATA_SEND",
++    "STATE_DATA_RECV",
++    "STATE_DATA_SEND_DONE",
++    "STATE_DATA_RECV_DONE",
++    "STATE_DATA_RECV_STATUS",
++    "STATE_DATA_RECV_STATUS_DONE",
++    "STATE_DATA_SEND_STATUS",
++    "STATE_DATA_SEND_STATUS_DONE",
++};
++
++static u8 ep_to_num(u8 epno)
++{
++    return (epno << 1) | (epno >> 7);
++}
++
++static int usb_dwc3_command(dwc3_dev_t *dev, u32 command, u32 par)
++{
++    write32(dev->regs + DWC3_DGCMDPAR, par);
++    write32(dev->regs + DWC3_DGCMD, command | DWC3_DGCMD_CMDACT);
++
++    if (poll32(dev->regs + DWC3_DGCMD, DWC3_DGCMD_CMDACT, 0, 1000)) {
++        usb_debug_printf("timeout while waiting for DWC3_DGCMD_CMDACT to clear.\n");
++        return -1;
++    }
++
++    return DWC3_DGCMD_STATUS(read32(dev->regs + DWC3_DGCMD));
++}
++
++static int usb_dwc3_ep_command(dwc3_dev_t *dev, u8 ep, u32 command, u32 par0, u32 par1, u32 par2)
++{
++    write32(dev->regs + DWC3_DEPCMDPAR0(ep), par0);
++    write32(dev->regs + DWC3_DEPCMDPAR1(ep), par1);
++    write32(dev->regs + DWC3_DEPCMDPAR2(ep), par2);
++    write32(dev->regs + DWC3_DEPCMD(ep), command | DWC3_DEPCMD_CMDACT);
++
++    if (poll32(dev->regs + DWC3_DEPCMD(ep), DWC3_DEPCMD_CMDACT, 0, 1000)) {
++        usb_debug_printf("timeout while waiting for DWC3_DEPCMD_CMDACT to clear.\n");
++        return -1;
++    }
++
++    u32 result = read32(dev->regs + DWC3_DEPCMD(ep));
++    if (DWC3_DEPCMD_STATUS(result))
++        usb_debug_printf("ep%u cmd=%02x result=%08x status=%u\n",
++                         ep, command, result, DWC3_DEPCMD_STATUS(result));
++    return DWC3_DEPCMD_STATUS(result);
++}
++
++static int usb_dwc3_ep_configure(dwc3_dev_t *dev, u8 ep, u8 type, u32 max_packet_len)
++{
++    u32 param0, param1;
++
++    param0 = DWC3_DEPCFG_EP_TYPE(type) | DWC3_DEPCFG_MAX_PACKET_SIZE(max_packet_len);
++    if (type != DWC3_DEPCMD_TYPE_CONTROL && (ep & 1))
++        param0 |= DWC3_DEPCFG_FIFO_NUMBER(ep >> 1);
++
++    param1 =
++        DWC3_DEPCFG_XFER_COMPLETE_EN | DWC3_DEPCFG_XFER_NOT_READY_EN | DWC3_DEPCFG_EP_NUMBER(ep);
++
++    if (usb_dwc3_ep_command(dev, ep, DWC3_DEPCMD_SETEPCONFIG, param0, param1, 0)) {
++        usb_debug_printf("cannot issue DWC3_DEPCMD_SETEPCONFIG for EP %d.\n", ep);
++        return -1;
++    }
++
++    if (usb_dwc3_ep_command(dev, ep, DWC3_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++        usb_debug_printf("cannot issue DWC3_DEPCMD_SETTRANSFRESOURCE EP %d.\n", ep);
++        return -1;
++    }
++
++    return 0;
++}
++
++static int usb_dwc3_ep_start_transfer(dwc3_dev_t *dev, u8 ep, uintptr_t trb_iova)
++{
++    if (dev->endpoints[ep].xfer_in_progress) {
++        usb_debug_printf(
++            "Tried to start a transfer for ep 0x%02x while another transfer is ongoing.\n", ep);
++        return -1;
++    }
++
++    dma_wmb();
++    int ret =
++        usb_dwc3_ep_command(dev, ep, DWC3_DEPCMD_STARTTRANSFER, trb_iova >> 32, (u32)trb_iova, 0);
++    if (ret) {
++        usb_debug_printf("cannot issue DWC3_DEPCMD_STARTTRANSFER for EP %d: %d.\n", ep, ret);
++        return ret;
++    }
++
++    dev->endpoints[ep].xfer_in_progress = true;
++    dev->endpoints[ep].resource_index =
++        DWC3_DEPCMD_GET_RSC_IDX(read32(dev->regs + DWC3_DEPCMD(ep)));
++    return 0;
++}
++
++static void usb_dwc3_ep_end_transfer(dwc3_dev_t *dev, u8 ep)
++{
++    if (!dev->endpoints[ep].xfer_in_progress)
++        return;
++    usb_dwc3_ep_command(dev, ep, DWC3_DEPCMD_ENDTRANSFER |
++        DWC3_DEPCMD_HIPRI_FORCERM |
++        DWC3_DEPCMD_PARAM(dev->endpoints[ep].resource_index), 0, 0, 0);
++    usb_udelay(100);
++    dev->endpoints[ep].xfer_in_progress = false;
++    dev->endpoints[ep].resource_index = 0;
++}
++
++static int usb_dwc3_configure_data_endpoints(dwc3_dev_t *dev)
++{
++    if (dev->data_configured)
++        return 0;
++    /* DWC3 2.x reserves resources 0/1 for EP0; begin the data configuration
++     * at resource 2, as the working Samsung gadget driver does. */
++    if (usb_dwc3_ep_command(dev, 0, DWC3_DEPCMD_DEPSTARTCFG |
++                           DWC3_DEPCMD_PARAM(2), 0, 0, 0))
++        return -1;
++    for (int i = 0; i < CDC_ACM_PIPE_MAX; ++i) {
++        if (usb_dwc3_ep_configure(dev, dev->pipe[i].ep_intr, DWC3_DEPCMD_TYPE_INTR, 64) ||
++            usb_dwc3_ep_configure(dev, dev->pipe[i].ep_in, DWC3_DEPCMD_TYPE_BULK, 512) ||
++            usb_dwc3_ep_configure(dev, dev->pipe[i].ep_out, DWC3_DEPCMD_TYPE_BULK, 512))
++            return -1;
++    }
++    dev->data_configured = true;
++    return 0;
++}
++
++static uintptr_t usb_dwc3_init_trb(dwc3_dev_t *dev, u8 ep, struct dwc3_trb **trb)
++{
++    struct dwc3_trb *next_trb = dev->endpoints[ep].trb;
++
++    if (trb)
++        *trb = next_trb;
++
++    next_trb->ctrl = DWC3_TRB_CTRL_HWO | DWC3_TRB_CTRL_ISP_IMI |
++                     DWC3_TRB_CTRL_LST | DWC3_TRB_CTRL_IOC;
++    next_trb->size = DWC3_TRB_SIZE_LENGTH(0);
++    next_trb->bph = 0;
++    next_trb->bpl = dev->endpoints[ep].xfer_buffer_iova;
++
++    return dev->endpoints[ep].trb_iova;
++}
++
++static int usb_dwc3_run_data_trb(dwc3_dev_t *dev, u8 ep, u32 data_len)
++{
++    struct dwc3_trb *trb;
++    uintptr_t trb_iova = usb_dwc3_init_trb(dev, ep, &trb);
++
++    trb->ctrl |= DWC3_TRBCTL_CONTROL_DATA;
++    trb->size = DWC3_TRB_SIZE_LENGTH(data_len);
++
++    return usb_dwc3_ep_start_transfer(dev, ep, trb_iova);
++}
++
++static int usb_dwc3_start_setup_phase(dwc3_dev_t *dev)
++{
++    struct dwc3_trb *trb;
++    uintptr_t trb_iova = usb_dwc3_init_trb(dev, USB_LEP_CTRL_OUT, &trb);
++
++    trb->ctrl |= DWC3_TRBCTL_CONTROL_SETUP;
++    trb->size = DWC3_TRB_SIZE_LENGTH(sizeof(union usb_setup_packet));
++    return usb_dwc3_ep_start_transfer(dev, USB_LEP_CTRL_OUT, trb_iova);
++}
++
++static int usb_dwc3_start_status_phase(dwc3_dev_t *dev, u8 ep)
++{
++    struct dwc3_trb *trb;
++    uintptr_t trb_iova = usb_dwc3_init_trb(dev, ep, &trb);
++
++    trb->ctrl |= dev->ep0_three_stage ? DWC3_TRBCTL_CONTROL_STATUS3 :
++                                      DWC3_TRBCTL_CONTROL_STATUS2;
++    trb->size = DWC3_TRB_SIZE_LENGTH(0);
++
++    return usb_dwc3_ep_start_transfer(dev, ep, trb_iova);
++}
++
++static int usb_dwc3_ep0_start_data_send_phase(dwc3_dev_t *dev)
++{
++    if (dev->ep0_buffer_len > XFER_BUFFER_BYTES_PER_EP) {
++        usb_debug_printf("Cannot xfer more than %d bytes but was requested to xfer %d on ep 1\n",
++                         XFER_BUFFER_BYTES_PER_EP, dev->ep0_buffer_len);
++        return -1;
++    }
++
++    memset(dev->endpoints[USB_LEP_CTRL_IN].xfer_buffer, 0, 64);
++    __optimized_memcpy(dev->endpoints[USB_LEP_CTRL_IN].xfer_buffer, dev->ep0_buffer, dev->ep0_buffer_len);
++
++    return usb_dwc3_run_data_trb(dev, USB_LEP_CTRL_IN, dev->ep0_buffer_len);
++}
++
++static int usb_dwc3_ep0_start_data_recv_phase(dwc3_dev_t *dev)
++{
++    if (dev->ep0_buffer_len > XFER_BUFFER_BYTES_PER_EP) {
++        usb_debug_printf("Cannot xfer more than %d bytes but was requested to xfer %d on ep 0\n",
++                         XFER_BUFFER_BYTES_PER_EP, dev->ep0_buffer_len);
++        return -1;
++    }
++
++    memset(dev->endpoints[USB_LEP_CTRL_OUT].xfer_buffer, 0, 64);
++
++    return usb_dwc3_run_data_trb(dev, USB_LEP_CTRL_OUT, 64);
++}
++
++static void usb_dwc3_ep_set_stall(dwc3_dev_t *dev, u8 ep, u8 stall)
++{
++    dev->endpoints[ep].stalled = !!stall;
++    if (stall)
++        usb_dwc3_ep_command(dev, ep, DWC3_DEPCMD_SETSTALL, 0, 0, 0);
++    else
++        usb_dwc3_ep_command(dev, ep, DWC3_DEPCMD_CLEARSTALL, 0, 0, 0);
++}
++
++static void usb_build_serial(void)
++{
++    str_serial = &str_serial_dummy;
++}
++
++static void usb_cdc_get_string_descriptor(u32 index, const void **descriptor, u16 *descriptor_len)
++{
++    switch (index) {
++        case STRING_DESCRIPTOR_LANGUAGES:
++            *descriptor = &str_langs;
++            *descriptor_len = str_langs.bLength;
++            break;
++        case STRING_DESCRIPTOR_MANUFACTURER:
++            *descriptor = &str_manufacturer;
++            *descriptor_len = str_manufacturer.bLength;
++            break;
++        case STRING_DESCRIPTOR_PRODUCT:
++            *descriptor = &str_product;
++            *descriptor_len = str_product.bLength;
++            break;
++        case STRING_DESCRIPTOR_SERIAL:
++            usb_build_serial();
++            *descriptor = str_serial;
++            *descriptor_len = str_serial->bLength;
++            break;
++        default:
++            *descriptor = NULL;
++            *descriptor_len = 0;
++    }
++
++    // FIXME: handle descriptors larger than maxPacketSize for EP 0
++    // limit the descriptor length to stay below EP 0's maxPacketSize of 64
++    *descriptor_len = min(*descriptor_len, DWC3_EP0_MAX_DESC_LEN);
++}
++
++static int
++usb_dwc3_handle_ep0_get_descriptor(dwc3_dev_t *dev,
++                                   const struct usb_setup_packet_get_descriptor *get_descriptor)
++{
++    const void *descriptor = NULL;
++    u16 descriptor_len = 0;
++
++    switch (get_descriptor->type) {
++        case USB_DEVICE_DESCRIPTOR:
++            descriptor = &usb_cdc_device_descriptor;
++            descriptor_len = usb_cdc_device_descriptor.bLength;
++            break;
++        case USB_CONFIGURATION_DESCRIPTOR:
++            descriptor = &cdc_configuration_descriptor;
++            descriptor_len = cdc_configuration_descriptor.configuration.wTotalLength;
++            break;
++        case USB_STRING_DESCRIPTOR:
++            usb_cdc_get_string_descriptor(get_descriptor->index, &descriptor, &descriptor_len);
++            break;
++        case USB_DEVICE_QUALIFIER_DESCRIPTOR:
++            descriptor = &usb_cdc_device_qualifier_descriptor;
++            descriptor_len = usb_cdc_device_qualifier_descriptor.bLength;
++            break;
++        default:
++            usb_debug_printf("Unknown descriptor type: %d\n", get_descriptor->type);
++            break;
++    }
++
++    if (descriptor) {
++        dev->ep0_buffer = descriptor;
++        dev->ep0_buffer_len = min(get_descriptor->wLength, descriptor_len);
++        return 0;
++    } else {
++        return -1;
++    }
++}
++
++static void usb_dwc3_ep0_handle_standard_device(dwc3_dev_t *dev,
++                                                const union usb_setup_packet *setup)
++{
++    switch (setup->raw.bRequest) {
++        case USB_REQUEST_SET_ADDRESS:
++            mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_DEVADDR_MASK,
++                   DWC3_DCFG_DEVADDR(setup->set_address.address));
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
++            break;
++
++        case USB_REQUEST_SET_CONFIGURATION:
++            switch (setup->set_configuration.configuration) {
++                case 0:
++                    clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_OUT));
++                    clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_IN));
++                    clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_INTR_IN));
++                    clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_OUT_2));
++                    clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_IN_2));
++                    clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_INTR_IN_2));
++                    dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
++                    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
++                        dev->pipe[i].ready = false;
++                    break;
++                case 1:
++                    if (usb_dwc3_configure_data_endpoints(dev)) {
++                        usb_dwc3_ep_set_stall(dev, 0, 1);
++                        dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
++                        break;
++                    }
++                    set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_OUT));
++                    set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_IN));
++                    set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_INTR_IN));
++                    set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_OUT_2));
++                    set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_IN_2));
++                    set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_INTR_IN_2));
++                    dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
++                    break;
++                default:
++                    usb_dwc3_ep_set_stall(dev, 0, 1);
++                    dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
++                    break;
++            }
++            break;
++
++        case USB_REQUEST_GET_DESCRIPTOR:
++            if (usb_dwc3_handle_ep0_get_descriptor(dev, &setup->get_descriptor) < 0) {
++                usb_dwc3_ep_set_stall(dev, 0, 1);
++                dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
++            } else {
++                dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
++            }
++            break;
++
++        case USB_REQUEST_GET_STATUS: {
++            static const u16 device_status = 0x0001; // self-powered
++            dev->ep0_buffer = &device_status;
++            dev->ep0_buffer_len = 2;
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
++            break;
++        }
++
++        default:
++            usb_dwc3_ep_set_stall(dev, 0, 1);
++            dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
++            usb_debug_printf("unsupported SETUP packet\n");
++    }
++}
++
++static void usb_dwc3_ep0_handle_standard_interface(dwc3_dev_t *dev,
++                                                   const union usb_setup_packet *setup)
++{
++    switch (setup->raw.bRequest) {
++        case USB_REQUEST_GET_STATUS: {
++            static const u16 device_status = 0x0000; // reserved
++            dev->ep0_buffer = &device_status;
++            dev->ep0_buffer_len = 2;
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
++            break;
++        }
++        default:
++            usb_dwc3_ep_set_stall(dev, 0, 1);
++            dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
++            usb_debug_printf("unsupported SETUP packet\n");
++    }
++}
++
++static void usb_dwc3_ep0_handle_standard_endpoint(dwc3_dev_t *dev,
++                                                  const union usb_setup_packet *setup)
++{
++    switch (setup->raw.bRequest) {
++        case USB_REQUEST_GET_STATUS: {
++            static const u16 device_status = 0x0000; // reserved
++            dev->ep0_buffer = &device_status;
++            dev->ep0_buffer_len = 2;
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
++            break;
++        }
++        case USB_REQUEST_CLEAR_FEATURE: {
++            switch (setup->feature.wFeatureSelector) {
++                case USB_FEATURE_ENDPOINT_HALT:
++                    usb_debug_printf("Host cleared EP 0x%x stall\n", setup->feature.wEndpoint);
++                    usb_dwc3_ep_set_stall(dev, ep_to_num(setup->feature.wEndpoint), 0);
++                    usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN);
++                    dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE;
++                    break;
++                default:
++                    usb_dwc3_ep_set_stall(dev, 0, 1);
++                    dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
++                    usb_debug_printf("unsupported CLEAR FEATURE: 0x%x\n",
++                                     setup->feature.wFeatureSelector);
++                    break;
++            }
++            break;
++        }
++        default:
++            usb_dwc3_ep_set_stall(dev, 0, 1);
++            dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
++            usb_debug_printf("unsupported SETUP packet\n");
++    }
++}
++
++static void usb_dwc3_ep0_handle_standard(dwc3_dev_t *dev, const union usb_setup_packet *setup)
++{
++    switch (setup->raw.bmRequestType & USB_REQUEST_TYPE_RECIPIENT_MASK) {
++        case USB_REQUEST_TYPE_RECIPIENT_DEVICE:
++            usb_dwc3_ep0_handle_standard_device(dev, setup);
++            break;
++
++        case USB_REQUEST_TYPE_RECIPIENT_INTERFACE:
++            usb_dwc3_ep0_handle_standard_interface(dev, setup);
++            break;
++
++        case USB_REQUEST_TYPE_RECIPIENT_ENDPOINT:
++            usb_dwc3_ep0_handle_standard_endpoint(dev, setup);
++            break;
++
++        default:
++            usb_dwc3_ep_set_stall(dev, 0, 1);
++            dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
++            usb_debug_printf("unimplemented request recipient\n");
++    }
++}
++
++static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_packet *setup)
++{
++    int pipe = setup->raw.wIndex / 2;
++
++    switch (setup->raw.bRequest) {
++        case USB_REQUEST_CDC_GET_LINE_CODING:
++            dev->ep0_buffer_len = min(setup->raw.wLength, sizeof(dev->pipe[pipe].cdc_line_coding));
++            dev->ep0_buffer = dev->pipe[pipe].cdc_line_coding;
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
++            break;
++
++        case USB_REQUEST_CDC_SET_CTRL_LINE_STATE:
++            if (setup->raw.wValue & 1) { // DTR
++                dev->pipe[pipe].ready = false;
++                usb_debug_printf("ACM device opened\n");
++                dev->pipe[pipe].ready = true;
++            } else {
++                dev->pipe[pipe].ready = false;
++                usb_debug_printf("ACM device closed\n");
++            }
++            usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN);
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE;
++            break;
++
++        case USB_REQUEST_CDC_SET_LINE_CODING:
++            dev->ep0_read_buffer = dev->pipe[pipe].cdc_line_coding;
++            dev->ep0_read_buffer_len =
++                min(setup->raw.wLength, sizeof(dev->pipe[pipe].cdc_line_coding));
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_RECV;
++            break;
++
++        default:
++            usb_dwc3_ep_set_stall(dev, 0, 1);
++            dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
++            usb_debug_printf("unsupported SETUP packet\n");
++    }
++}
++
++static void usb_dwc3_ep0_handle_setup(dwc3_dev_t *dev)
++{
++    const union usb_setup_packet *setup = dev->endpoints[0].xfer_buffer;
++
++    dev->setup_count++;
++    dev->ep0_three_stage = setup->raw.wLength != 0;
++    usb_debug_printf("SETUP type=%02x req=%02x value=%04x index=%04x len=%u\n",
++                     setup->raw.bmRequestType, setup->raw.bRequest,
++                     setup->raw.wValue, setup->raw.wIndex, setup->raw.wLength);
++
++    switch (setup->raw.bmRequestType & USB_REQUEST_TYPE_MASK) {
++        case USB_REQUEST_TYPE_STANDARD:
++            usb_dwc3_ep0_handle_standard(dev, setup);
++            break;
++        case USB_REQUEST_TYPE_CLASS:
++            usb_dwc3_ep0_handle_class(dev, setup);
++            break;
++        default:
++            usb_debug_printf("unsupported request type\n");
++            usb_dwc3_ep_set_stall(dev, 0, 1);
++            dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
++    }
++
++    /* DWC3 2.x must start the data phase immediately after SETUP.
++     * Waiting for XferNotReady(DATA) can leave the host waiting forever. */
++    if (dev->ep0_state == USB_DWC3_EP0_STATE_DATA_SEND) {
++        if (!usb_dwc3_ep0_start_data_send_phase(dev))
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_DONE;
++    } else if (dev->ep0_state == USB_DWC3_EP0_STATE_DATA_RECV) {
++        if (!usb_dwc3_ep0_start_data_recv_phase(dev))
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_RECV_DONE;
++    }
++}
++
++static void usb_dwc3_ep0_handle_xfer_done(dwc3_dev_t *dev, const struct dwc3_event_depevt event)
++{
++    switch (dev->ep0_state) {
++        case USB_DWC3_EP0_STATE_SETUP_HANDLE:
++            usb_dwc3_ep0_handle_setup(dev);
++            break;
++
++        case USB_DWC3_EP0_STATE_DATA_RECV_STATUS_DONE:
++        case USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE:
++            usb_dwc3_start_setup_phase(dev);
++            dev->ep0_state = USB_DWC3_EP0_STATE_SETUP_HANDLE;
++            break;
++
++        case USB_DWC3_EP0_STATE_DATA_SEND_DONE:
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_RECV_STATUS;
++            break;
++
++        case USB_DWC3_EP0_STATE_DATA_RECV_DONE:
++            __optimized_memcpy(dev->ep0_read_buffer, dev->endpoints[event.endpoint_number].xfer_buffer,
++                   dev->ep0_read_buffer_len);
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
++            break;
++
++        case USB_DWC3_EP0_STATE_IDLE:
++        default:
++            usb_debug_printf("invalid state in usb_dwc3_ep0_handle_xfer_done: %d, %s\n",
++                             dev->ep0_state, ep0_state_names[dev->ep0_state]);
++            usb_dwc3_ep_set_stall(dev, 0, 1);
++            dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
++    }
++}
++
++static void usb_dwc3_ep0_handle_xfer_not_ready(dwc3_dev_t *dev,
++                                               const struct dwc3_event_depevt event)
++{
++    switch (dev->ep0_state) {
++        case USB_DWC3_EP0_STATE_IDLE:
++            usb_dwc3_start_setup_phase(dev);
++            dev->ep0_state = USB_DWC3_EP0_STATE_SETUP_HANDLE;
++            break;
++
++        case USB_DWC3_EP0_STATE_DATA_SEND:
++            if (usb_dwc3_ep0_start_data_send_phase(dev))
++                usb_debug_printf("cannot start xtrl xfer data phase for EP 1.\n");
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_DONE;
++            break;
++
++        case USB_DWC3_EP0_STATE_DATA_RECV:
++            if (usb_dwc3_ep0_start_data_recv_phase(dev))
++                usb_debug_printf("cannot start xtrl xfer data phase for EP 0.\n");
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_RECV_DONE;
++            break;
++
++        case USB_DWC3_EP0_STATE_DATA_RECV_STATUS:
++            usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_OUT);
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_RECV_STATUS_DONE;
++            break;
++
++        case USB_DWC3_EP0_STATE_DATA_SEND_STATUS:
++            usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN);
++            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE;
++            break;
++
++        default:
++            usb_debug_printf(
++                "invalid state in usb_dwc3_ep0_handle_xfer_not_ready: %d, %s for ep %d (%x)\n",
++                dev->ep0_state, ep0_state_names[dev->ep0_state], event.endpoint_number,
++                event.endpoint_event);
++            usb_dwc3_ep_set_stall(dev, 0, 1);
++            dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
++    }
++}
++
++ringbuffer_t *usb_dwc3_cdc_get_ringbuffer(dwc3_dev_t *dev, u8 endpoint_number)
++{
++    switch (endpoint_number) {
++        case USB_LEP_CDC_BULK_IN:
++            return dev->pipe[CDC_ACM_PIPE_0].device2host;
++        case USB_LEP_CDC_BULK_OUT:
++            return dev->pipe[CDC_ACM_PIPE_0].host2device;
++        case USB_LEP_CDC_BULK_IN_2:
++            return dev->pipe[CDC_ACM_PIPE_1].device2host;
++        case USB_LEP_CDC_BULK_OUT_2:
++            return dev->pipe[CDC_ACM_PIPE_1].host2device;
++        default:
++            return NULL;
++    }
++}
++
++static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number)
++{
++    struct dwc3_trb *trb;
++    uintptr_t trb_iova;
++
++    if (dev->endpoints[endpoint_number].xfer_in_progress)
++        return;
++
++    ringbuffer_t *host2device = usb_dwc3_cdc_get_ringbuffer(dev, endpoint_number);
++    if (!host2device)
++        return;
++
++    if (ringbuffer_get_free(host2device) < XFER_SIZE)
++        return;
++
++    memset(dev->endpoints[endpoint_number].xfer_buffer, 0xaa, XFER_SIZE);
++    trb_iova = usb_dwc3_init_trb(dev, endpoint_number, &trb);
++    trb->ctrl |= DWC3_TRBCTL_NORMAL;
++    trb->size = DWC3_TRB_SIZE_LENGTH(XFER_SIZE);
++
++    usb_dwc3_ep_start_transfer(dev, endpoint_number, trb_iova);
++    dev->endpoints[endpoint_number].xfer_in_progress = true;
++}
++
++static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
++{
++    struct dwc3_trb *trb;
++    uintptr_t trb_iova;
++
++    if (dev->endpoints[endpoint_number].xfer_in_progress)
++        return;
++
++    ringbuffer_t *device2host = usb_dwc3_cdc_get_ringbuffer(dev, endpoint_number);
++    if (!device2host)
++        return;
++
++    size_t len =
++        ringbuffer_read(dev->endpoints[endpoint_number].xfer_buffer, XFER_SIZE, device2host);
++
++    if (!len && !dev->endpoints[endpoint_number].zlp_pending)
++        return;
++
++    trb_iova = usb_dwc3_init_trb(dev, endpoint_number, &trb);
++    trb->ctrl |= DWC3_TRBCTL_NORMAL;
++    trb->size = DWC3_TRB_SIZE_LENGTH(len);
++
++    usb_dwc3_ep_start_transfer(dev, endpoint_number, trb_iova);
++    dev->endpoints[endpoint_number].xfer_in_progress = true;
++    dev->endpoints[endpoint_number].zlp_pending = (len % 512) == 0;
++}
++
++static void usb_dwc3_cdc_handle_bulk_out_xfer_done(dwc3_dev_t *dev,
++                                                   const struct dwc3_event_depevt event)
++{
++    ringbuffer_t *host2device = usb_dwc3_cdc_get_ringbuffer(dev, event.endpoint_number);
++    if (!host2device)
++        return;
++    size_t len = min(XFER_SIZE, ringbuffer_get_free(host2device));
++    ringbuffer_write(dev->endpoints[event.endpoint_number].xfer_buffer,
++                     len - dev->endpoints[event.endpoint_number].trb->size, host2device);
++}
++
++static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_depevt event)
++{
++    if (event.endpoint_number >= MAX_ENDPOINTS) return;
++    if (event.endpoint_event == DWC3_DEPEVT_XFERCOMPLETE) {
++        dev->endpoints[event.endpoint_number].xfer_in_progress = false;
++
++        switch (event.endpoint_number) {
++            case USB_LEP_CTRL_IN:
++            case USB_LEP_CTRL_OUT:
++                return usb_dwc3_ep0_handle_xfer_done(dev, event);
++            case USB_LEP_CDC_INTR_IN: // [[fallthrough]]
++            case USB_LEP_CDC_INTR_IN_2:
++                return;
++            case USB_LEP_CDC_BULK_IN: // [[fallthrough]]
++            case USB_LEP_CDC_BULK_IN_2:
++                return;
++            case USB_LEP_CDC_BULK_OUT: // [[fallthrough]]
++            case USB_LEP_CDC_BULK_OUT_2:
++                return usb_dwc3_cdc_handle_bulk_out_xfer_done(dev, event);
++        }
++    } else if (event.endpoint_event == DWC3_DEPEVT_XFERNOTREADY) {
++        /*
++         * this might be a bug, we sometimes get spurious events like these here.
++         * ignoring them works just fine though
++         */
++        if (dev->endpoints[event.endpoint_number].xfer_in_progress)
++            return;
++
++        switch (event.endpoint_number) {
++            case USB_LEP_CTRL_IN:
++            case USB_LEP_CTRL_OUT:
++                return usb_dwc3_ep0_handle_xfer_not_ready(dev, event);
++            case USB_LEP_CDC_INTR_IN: // [[fallthrough]]
++            case USB_LEP_CDC_INTR_IN_2:
++                return;
++            case USB_LEP_CDC_BULK_IN: // [[fallthrough]]
++            case USB_LEP_CDC_BULK_IN_2:
++                return usb_dwc3_cdc_start_bulk_in_xfer(dev, event.endpoint_number);
++            case USB_LEP_CDC_BULK_OUT: // [[fallthrough]]
++            case USB_LEP_CDC_BULK_OUT_2:
++                return usb_dwc3_cdc_start_bulk_out_xfer(dev, event.endpoint_number);
++        }
++    }
++
++    usb_debug_printf("unhandled EP %02x event: %s (0x%02x) (%d)\n", event.endpoint_number,
++                     depvt_names[event.endpoint_event], event.endpoint_event,
++                     dev->endpoints[event.endpoint_number].xfer_in_progress);
++    usb_dwc3_ep_set_stall(dev, event.endpoint_number, 1);
++}
++
++static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev)
++{
++    /* A pending SETUP receiver survives USB reset. Do not discard its
++     * resource and start a second transfer on the same endpoint. */
++    for (int i = 0; i < MAX_ENDPOINTS; ++i) {
++        if (i || dev->ep0_state != USB_DWC3_EP0_STATE_SETUP_HANDLE)
++            usb_dwc3_ep_end_transfer(dev, i);
++        if (dev->endpoints[i].stalled)
++            usb_dwc3_ep_set_stall(dev, i, 0);
++    }
++    for (int i = 0; i < CDC_ACM_PIPE_MAX; ++i)
++        dev->pipe[i].ready = false;
++    dev->data_configured = false;
++
++    /* set device address back to zero */
++    mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_DEVADDR_MASK, DWC3_DCFG_DEVADDR(0));
++
++    /* only keep control endpoints enabled */
++    write32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(0) | DWC3_DALEPENA_EP(1));
++    if (!dev->endpoints[0].xfer_in_progress)
++        usb_dwc3_start_setup_phase(dev);
++    dev->ep0_state = USB_DWC3_EP0_STATE_SETUP_HANDLE;
++}
++
++static void usb_dwc3_handle_event_connect_done(dwc3_dev_t *dev)
++{
++    u32 speed = read32(dev->regs + DWC3_DSTS) & DWC3_DSTS_CONNECTSPD;
++
++    if (speed != DWC3_DSTS_HIGHSPEED) {
++        usb_debug_printf(
++            "WARNING: we only support high speed right now but %02x was requested in DSTS\n",
++            speed);
++    }
++
++    /* Modify EP0 maxpacket without resetting its sequence or allocating a
++     * second transfer resource. Bit 31 is IGN_SEQ_NUM/ACTION_MODIFY. */
++    for (u8 ep = 0; ep < 2; ++ep)
++        usb_dwc3_ep_command(dev, ep, DWC3_DEPCMD_SETEPCONFIG,
++            DWC3_DEPCFG_MAX_PACKET_SIZE(64) | (1u << 31),
++            DWC3_DEPCFG_XFER_COMPLETE_EN | DWC3_DEPCFG_XFER_NOT_READY_EN |
++            DWC3_DEPCFG_EP_NUMBER(ep), 0);
++    int ret = dev->endpoints[0].xfer_in_progress ? 0 : usb_dwc3_start_setup_phase(dev);
++    usb_debug_printf("EP0 setup arm=%d cmd=%08x trb=%08x/%08x buserr=%08x\n",
++                     ret, read32(dev->regs + DWC3_DEPCMD(0)),
++                     dev->endpoints[0].trb->ctrl, dev->endpoints[0].trb->size,
++                     read32(dev->regs + 0xc130));
++    dev->ep0_state = USB_DWC3_EP0_STATE_SETUP_HANDLE;
++}
++
++static void usb_dwc3_handle_event_dev(dwc3_dev_t *dev, const struct dwc3_event_devt event)
++{
++    usb_debug_printf("device event: %s (0x%02x)\n", (event.type < 13 ? devt_names[event.type] : "Unknown"), event.type);
++    switch (event.type) {
++        case DWC3_DEVT_USBRST:
++            usb_dwc3_handle_event_usbrst(dev);
++            break;
++        case DWC3_DEVT_CONNECTDONE:
++            usb_dwc3_handle_event_connect_done(dev);
++            break;
++        default:
++            usb_debug_printf("unhandled device event: %s (0x%02x)\n", (event.type < 13 ? devt_names[event.type] : "Unknown"),
++                             event.type);
++    }
++}
++
++static void usb_dwc3_handle_event(dwc3_dev_t *dev, const union dwc3_event event)
++{
++    if (!event.type.is_devspec)
++        usb_dwc3_handle_event_ep(dev, event.depevt);
++    else if (event.type.type == DWC3_EVENT_TYPE_DEV)
++        usb_dwc3_handle_event_dev(dev, event.devt);
++    else
++        usb_debug_printf("unknown event %08x\n", event.raw);
++}
++
++void usb_dwc3_handle_events(dwc3_dev_t *dev)
++{
++    if (!dev)
++        return;
++
++    u32 n_events = (read32(dev->regs + DWC3_GEVNTCOUNT(0)) & DWC3_GEVNTCOUNT_MASK) / sizeof(union dwc3_event);
++    if (n_events > DWC3_EVENT_BUFFERS_SIZE / sizeof(union dwc3_event))
++        n_events = DWC3_EVENT_BUFFERS_SIZE / sizeof(union dwc3_event);
++    if (n_events == 0)
++        return;
++
++    dma_rmb();
++
++    const union dwc3_event *evtbuffer = dev->evtbuffer;
++    for (u32 i = 0; i < n_events; ++i) {
++        usb_dwc3_handle_event(dev, evtbuffer[dev->evt_buffer_offset]);
++
++        dev->evt_buffer_offset =
++            (dev->evt_buffer_offset + 1) % (DWC3_EVENT_BUFFERS_SIZE / sizeof(union dwc3_event));
++    }
++
++    write32(dev->regs + DWC3_GEVNTCOUNT(0), sizeof(union dwc3_event) * n_events);
++}
++
++bool usb_dwc3_is_configured(dwc3_dev_t *dev)
++{
++    return dev && dev->data_configured;
++}
++
++u32 usb_dwc3_setup_count(dwc3_dev_t *dev)
++{
++    return dev ? dev->setup_count : 0;
++}
++
++dwc3_dev_t *usb_dwc3_init(uintptr_t regs)
++{
++    /* sanity check */
++    u32 snpsid = read32(regs + DWC3_GSNPSID);
++    if ((snpsid & DWC3_GSNPSID_MASK) != 0x33310000 &&
++        (snpsid & DWC3_GSNPSID_MASK) != 0x55330000) {
++        debug_printf("no DWC3 core found at 0x%lx: %08x\n", regs, snpsid);
++        return NULL;
++    }
++
++    dwc3_dev_t *dev = calloc(1, sizeof(*dev));
++    if (!dev)
++        return NULL;
++
++    memset(dev, 0, sizeof(*dev));
++    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
++        __optimized_memcpy(dev->pipe[i].cdc_line_coding, cdc_default_line_coding,
++               sizeof(cdc_default_line_coding));
++
++    dev->regs = regs;
++
++    /* allocate and map dma buffers */
++    dev->evtbuffer = memalign(SZ_16K, max(DWC3_EVENT_BUFFERS_SIZE, SZ_16K));
++    if (!dev->evtbuffer)
++        goto error;
++
++    dev->scratchpad = memalign(SZ_16K, max(DWC3_SCRATCHPAD_SIZE, SZ_16K));
++    if (!dev->scratchpad)
++        goto error;
++
++    dev->trbs = memalign(SZ_16K, TRB_BUFFER_SIZE);
++    if (!dev->trbs)
++        goto error;
++
++    dev->xferbuffer = memalign(SZ_16K, XFER_BUFFER_SIZE);
++    if (!dev->xferbuffer)
++        goto error;
++
++    memset(dev->evtbuffer, 0xaa, max(DWC3_EVENT_BUFFERS_SIZE, SZ_16K));
++    memset(dev->scratchpad, 0, max(DWC3_SCRATCHPAD_SIZE, SZ_16K));
++    memset(dev->xferbuffer, 0, XFER_BUFFER_SIZE);
++    memset(dev->trbs, 0, TRB_BUFFER_SIZE);
++
++    /* prepare endpoint buffers */
++    for (int i = 0; i < MAX_ENDPOINTS; ++i) {
++        u32 xferbuffer_offset = i * XFER_BUFFER_BYTES_PER_EP;
++        dev->endpoints[i].xfer_buffer = dev->xferbuffer + xferbuffer_offset;
++        dev->endpoints[i].xfer_buffer_iova = XFER_BUFFER_IOVA + xferbuffer_offset;
++
++        u32 trb_offset = i * TRBS_PER_EP;
++        dev->endpoints[i].trb = &dev->trbs[i * TRBS_PER_EP];
++        dev->endpoints[i].trb_iova = TRB_BUFFER_IOVA + trb_offset * sizeof(struct dwc3_trb);
++    }
++
++    /*
++     * DSH: 按 Linux core.c 的顺序做设备侧软复位。
++     *
++     * 原实现直接写 CSFTRST，但没先清 RUN_STOP、也没等 DSTS.DEVCTRLHLT，
++     * 复位可能不彻底（databook 要求 CSFTRST 与清 RUN_STOP 在同一次写里）。
++     * 另外 device 模式下 mainline 从不使用 GUSB2PHYCFG/GUSB3PIPECTL 的
++     * PHYSOFTRST（那是 host 模式用的），把它们删掉以免干扰 PHY 上电序列。
++     */
++    clear32(dev->regs + DWC3_DEVTEN, 0xffffffff);
++    clear32(dev->regs + DWC3_DALEPENA, 0xffffffff);
++
++    clear32(dev->regs + DWC3_DCTL, DWC3_DCTL_RUN_STOP);
++    if (poll32(dev->regs + DWC3_DSTS, DWC3_DSTS_DEVCTRLHLT,
++               DWC3_DSTS_DEVCTRLHLT, 1000))
++        usb_debug_printf("core did not halt before CSFTRST (DSTS=%08x)\n",
++                         read32(dev->regs + DWC3_DSTS));
++
++    {
++        u32 dctl = read32(dev->regs + DWC3_DCTL) & ~DWC3_DCTL_RUN_STOP;
++        write32(dev->regs + DWC3_DCTL, dctl | DWC3_DCTL_CSFTRST);
++    }
++    if (poll32(dev->regs + DWC3_DCTL, DWC3_DCTL_CSFTRST, 0, 1000)) {
++        usb_debug_printf("timeout while waiting for DWC3_DCTL_CSFTRST to clear.\n");
++        goto error;
++    }
++
++    /* core 软复位：100ms 静默窗口内不写任何 DWC3/PHY 寄存器 */
++    set32(dev->regs + DWC3_GCTL, DWC3_GCTL_CORESOFTRESET);
++    mdelay(100);
++    clear32(dev->regs + DWC3_GCTL, DWC3_GCTL_CORESOFTRESET);
++    mdelay(1);
++
++    /* 显式清残留的设备地址与测试模式 */
++    mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_DEVADDR_MASK, 0);
++    clear32(dev->regs + DWC3_DCTL, DWC3_DCTL_TSTCTRL_MASK | DWC3_DCTL_KEEP_CONNECT);
++
++    /* disable unused features */
++    clear32(dev->regs + DWC3_GCTL, DWC3_GCTL_SCALEDOWN_MASK | DWC3_GCTL_DISSCRAMBLE);
++
++    /* switch to device-only mode */
++    mask32(dev->regs + DWC3_GCTL, DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_OTG),
++           DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_DEVICE));
++
++    /* Match dwc3_core_config() in the working Exynos7420 3.10 tree. */
++    set32(dev->regs + 0xc100, (1u << 0) | (1u << 3)); /* INCR/INCR16 */
++    mask32(dev->regs + 0xc104, 15u << 8, 3u << 8); /* bus request limit */
++    set32(dev->regs + 0xc12c, 1u << 14); /* USBHSTINAUTORETRYEN */
++    mask32(dev->regs + 0xc12c, 0x3ffu << 22, 0x29u << 22); /* 24 MHz */
++
++    /* stick to USB 2.0 high speed for now */
++    mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_SPEED_MASK, DWC3_DCFG_HIGHSPEED);
++
++    clear32(dev->regs + DWC3_GUSB2PHYCFG(0),
++            DWC3_GUSB2PHYCFG_SUSPHY | (1u << 8) | (1u << 4));
++    /* Reset/connect detection does not validate the UTMI data-bus width.
++     * Follow Samsung's revision rule rather than forcing UTMI16 globally. */
++    if ((snpsid & 0xffff) <= 0x210a) {
++        set32(dev->regs + DWC3_GUSB2PHYCFG(0), 1u << 3);
++        mask32(dev->regs + DWC3_GUSB2PHYCFG(0), 15u << 10, 5u << 10);
++    } else {
++        clear32(dev->regs + DWC3_GUSB2PHYCFG(0), 1u << 3);
++        mask32(dev->regs + DWC3_GUSB2PHYCFG(0), 15u << 10, 9u << 10);
++    }
++    clear32(dev->regs + DWC3_GUSB3PIPECTL(0), DWC3_GUSB3PIPECTL_SUSPHY);
++    set32(dev->regs + DWC3_GCTL, DWC3_GCTL_DSBLCLKGTNG);
++    clear32(dev->regs + DWC3_DCFG, DWC3_DCFG_LPM_CAP);
++    clear32(dev->regs + DWC3_GCTL, DWC3_GCTL_GBLHIBERNATIONEN);
++
++    /* setup a single event buffer at EVENT_BUFFER_IOVA */
++    write32(dev->regs + DWC3_GEVNTADRLO(0), EVENT_BUFFER_IOVA);
++    write32(dev->regs + DWC3_GEVNTADRHI(0), 0);
++    write32(dev->regs + DWC3_GEVNTSIZ(0), DWC3_EVENT_BUFFERS_SIZE);
++    write32(dev->regs + DWC3_GEVNTCOUNT(0), 0);
++
++    /* enable connect, disconnect and reset events */
++    write32(dev->regs + DWC3_DEVTEN,
++            DWC3_DEVTEN_DISCONNEVTEN | DWC3_DEVTEN_USBRSTEN | DWC3_DEVTEN_CONNECTDONEEN);
++
++    if (usb_dwc3_ep_command(dev, 0, DWC3_DEPCMD_DEPSTARTCFG, 0, 0, 0)) {
++        usb_debug_printf("cannot issue initial DWC3_DEPCMD_DEPSTARTCFG.\n");
++        goto error;
++    }
++
++    /* prepare control endpoint 0 IN and OUT
++     *
++     * DSH: EP0 的 MPS 必须是 64（USB 2.0 HS 规定）。原实现写 512，
++     * 与描述符里的 bMaxPacketSize0=64 不一致 —— 主机发 SET_CONFIG 时
++     * 数据阶段长度会对不上，表现为 "can't set config #1, error -71"。
++     * connect_done 里后来会用 64 重配一次，但那已经太晚。*/
++    if (usb_dwc3_ep_configure(dev, USB_LEP_CTRL_OUT, DWC3_DEPCMD_TYPE_CONTROL, 64))
++        goto error;
++    if (usb_dwc3_ep_configure(dev, USB_LEP_CTRL_IN, DWC3_DEPCMD_TYPE_CONTROL, 64))
++        goto error;
++
++    /* prepare CDC ACM interfaces */
++
++    dev->pipe[CDC_ACM_PIPE_0].ep_intr = USB_LEP_CDC_INTR_IN;
++    dev->pipe[CDC_ACM_PIPE_0].ep_in = USB_LEP_CDC_BULK_IN;
++    dev->pipe[CDC_ACM_PIPE_0].ep_out = USB_LEP_CDC_BULK_OUT;
++
++    dev->pipe[CDC_ACM_PIPE_1].ep_intr = USB_LEP_CDC_INTR_IN_2;
++    dev->pipe[CDC_ACM_PIPE_1].ep_in = USB_LEP_CDC_BULK_IN_2;
++    dev->pipe[CDC_ACM_PIPE_1].ep_out = USB_LEP_CDC_BULK_OUT_2;
++
++    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
++        dev->pipe[i].host2device = ringbuffer_alloc(CDC_BUFFER_SIZE);
++        if (!dev->pipe[i].host2device)
++            goto error;
++        dev->pipe[i].device2host = ringbuffer_alloc(CDC_BUFFER_SIZE);
++        if (!dev->pipe[i].device2host)
++            goto error;
++
++    }
++
++    /* prepare first control transfer */
++    dev->ep0_state = USB_DWC3_EP0_STATE_SETUP_HANDLE;
++
++    /* only enable control endpoints for now */
++    write32(dev->regs + DWC3_DALEPENA,
++            DWC3_DALEPENA_EP(USB_LEP_CTRL_IN) | DWC3_DALEPENA_EP(USB_LEP_CTRL_OUT));
++    if (usb_dwc3_start_setup_phase(dev))
++        goto error;
++    usb_debug_printf("SETUP receiver ready before RUN_STOP: trb=%lx buffer=%lx\n",
++                     dev->endpoints[0].trb_iova, dev->endpoints[0].xfer_buffer_iova);
++
++    /* and finally kick the device controller to go live! */
++    /* Publish event/TRB storage before the controller can perform DMA. */
++    dma_wmb();
++    clear32(dev->regs + DWC3_DCTL, DWC3_DCTL_KEEP_CONNECT);
++    set32(dev->regs + DWC3_DCTL, DWC3_DCTL_RUN_STOP);
++    if (poll32(dev->regs + DWC3_DSTS, DWC3_DSTS_DEVCTRLHLT, 0, 5000))
++        usb_debug_printf("RUN_STOP set but controller remains halted\n");
++
++    return dev;
++
++error:
++    usb_dwc3_shutdown(dev);
++    return NULL;
++}
++
++void usb_dwc3_shutdown(dwc3_dev_t *dev)
++{
++    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
++        dev->pipe[i].ready = false;
++
++    /* stop all ongoing transfers */
++    for (int i = 0; i < MAX_ENDPOINTS; ++i)
++        usb_dwc3_ep_end_transfer(dev, i);
++
++    /* disable events and all endpoints and stop the device controller */
++    write32(dev->regs + DWC3_DEVTEN, 0);
++    write32(dev->regs + DWC3_DALEPENA, 0);
++    clear32(dev->regs + DWC3_DCTL, DWC3_DCTL_RUN_STOP);
++
++    /* wait until the controller is shut down */
++    if (poll32(dev->regs + DWC3_DSTS, DWC3_DSTS_DEVCTRLHLT, DWC3_DSTS_DEVCTRLHLT, 1000))
++        usb_debug_printf("timeout while waiting for DWC3_DSTS_DEVCTRLHLT during shutdown.\n");
++
++    /* reset the device side of the controller just to be safe */
++    set32(dev->regs + DWC3_DCTL, DWC3_DCTL_CSFTRST);
++    if (poll32(dev->regs + DWC3_DCTL, DWC3_DCTL_CSFTRST, 0, 1000))
++        usb_debug_printf("timeout while waiting for DWC3_DCTL_CSFTRST to clear during shutdown.\n");
++
++    /* unmap and free dma buffers */
++    free(dev->evtbuffer);
++    free(dev->scratchpad);
++    free(dev->xferbuffer);
++    free(dev->trbs);
++    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
++        ringbuffer_free(dev->pipe[i].device2host);
++        ringbuffer_free(dev->pipe[i].host2device);
++    }
++
++    free(dev);
++}
++
++u8 usb_dwc3_getbyte(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
++{
++    ringbuffer_t *host2device = dev->pipe[pipe].host2device;
++    if (!host2device)
++        return 0;
++
++    u8 ep = dev->pipe[pipe].ep_out;
++
++    u8 c;
++    while (ringbuffer_read(&c, 1, host2device) < 1) {
++        usb_dwc3_handle_events(dev);
++        usb_dwc3_cdc_start_bulk_out_xfer(dev, ep);
++    }
++    return c;
++}
++
++void usb_dwc3_putbyte(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, u8 byte)
++{
++    ringbuffer_t *device2host = dev->pipe[pipe].device2host;
++    if (!device2host)
++        return;
++
++    u8 ep = dev->pipe[pipe].ep_in;
++
++    while (ringbuffer_write(&byte, 1, device2host) < 1) {
++        usb_dwc3_handle_events(dev);
++        usb_dwc3_cdc_start_bulk_in_xfer(dev, ep);
++    }
++}
++
++size_t usb_dwc3_queue(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
++{
++    const u8 *p = buf;
++    size_t wrote, sent = 0;
++
++    if (!dev || !dev->pipe[pipe].ready)
++        return 0;
++
++    ringbuffer_t *device2host = dev->pipe[pipe].device2host;
++    if (!device2host)
++        return 0;
++
++    u8 ep = dev->pipe[pipe].ep_in;
++
++    wrote = ringbuffer_write(p, count, device2host);
++    sent += wrote;
++    usb_dwc3_cdc_start_bulk_in_xfer(dev, ep);
++
++    return sent;
++}
++
++size_t usb_dwc3_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
++{
++    if (!dev)
++        return -1;
++
++    u8 ep = dev->pipe[pipe].ep_in;
++    size_t ret = usb_dwc3_queue(dev, pipe, buf, count);
++
++    usb_dwc3_cdc_start_bulk_in_xfer(dev, ep);
++
++    return ret;
++}
++
++size_t usb_dwc3_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t count)
++{
++    u8 *p = buf;
++    size_t read, recvd = 0;
++
++    if (!dev || !dev->pipe[pipe].ready)
++        return 0;
++
++    ringbuffer_t *host2device = dev->pipe[pipe].host2device;
++    if (!host2device)
++        return 0;
++
++    u8 ep = dev->pipe[pipe].ep_out;
++
++    while (count) {
++        read = ringbuffer_read(p, count, host2device);
++        count -= read;
++        p += read;
++        recvd += read;
++        usb_dwc3_handle_events(dev);
++        usb_dwc3_cdc_start_bulk_out_xfer(dev, ep);
++    }
++
++    return recvd;
++}
++
++ssize_t usb_dwc3_can_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
++{
++    if (!dev || !dev->pipe[pipe].ready)
++        return 0;
++
++    ringbuffer_t *host2device = dev->pipe[pipe].host2device;
++    if (!host2device)
++        return 0;
++
++    return ringbuffer_get_used(host2device);
++}
++
++bool usb_dwc3_can_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
++{
++    (void)pipe;
++    if (!dev)
++        return false;
++
++    return dev->pipe[pipe].ready;
++}
++
++void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
++{
++    if (!dev || !dev->pipe[pipe].ready)
++        return;
++
++    ringbuffer_t *device2host = dev->pipe[pipe].device2host;
++    if (!device2host)
++        return;
++
++    u8 ep = dev->pipe[pipe].ep_in;
++
++    while (ringbuffer_get_used(device2host) != 0 || dev->endpoints[ep].xfer_in_progress) {
++        usb_dwc3_handle_events(dev);
++    }
++}
+diff --git a/drivers/usb-console/usb_dwc3.h b/drivers/usb-console/usb_dwc3.h
+new file mode 100644
+index 0000000..8617b86
+--- /dev/null
++++ b/drivers/usb-console/usb_dwc3.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#ifndef USB_DWC3_H
++#define USB_DWC3_H
++
++#include "types.h"
++
++typedef struct dwc3_dev dwc3_dev_t;
++
++typedef enum _cdc_acm_pipe_id_t {
++    CDC_ACM_PIPE_0,
++    CDC_ACM_PIPE_1,
++    CDC_ACM_PIPE_MAX
++} cdc_acm_pipe_id_t;
++
++dwc3_dev_t *usb_dwc3_init(uintptr_t regs);
++void usb_dwc3_shutdown(dwc3_dev_t *dev);
++
++void usb_dwc3_handle_events(dwc3_dev_t *dev);
++
++ssize_t usb_dwc3_can_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe);
++bool usb_dwc3_can_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe);
++bool usb_dwc3_is_configured(dwc3_dev_t *dev);
++u32 usb_dwc3_setup_count(dwc3_dev_t *dev);
++
++u8 usb_dwc3_getbyte(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe);
++void usb_dwc3_putbyte(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, u8 byte);
++
++size_t usb_dwc3_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t count);
++size_t usb_dwc3_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count);
++size_t usb_dwc3_queue(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count);
++void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe);
++
++#endif
+diff --git a/drivers/usb-console/usb_dwc3_regs.h b/drivers/usb-console/usb_dwc3_regs.h
+new file mode 100644
+index 0000000..d48db23
+--- /dev/null
++++ b/drivers/usb-console/usb_dwc3_regs.h
+@@ -0,0 +1,625 @@
++/**
++ * core.h - DesignWare USB3 DRD Core Header
++ * linux commit 7bc5a6ba369217e0137833f5955cf0b0f08b0712 before
++ * the switch to GPLv2 only
++ *
++ * Copyright (C) 2010-2011 Texas Instruments Incorporated - http://www.ti.com
++ *
++ * Authors: Felipe Balbi <balbi@ti.com>,
++ *	    Sebastian Andrzej Siewior <bigeasy@linutronix.de>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions, and the following disclaimer,
++ *    without modification.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. The names of the above-listed copyright holders may not be used
++ *    to endorse or promote products derived from this software without
++ *    specific prior written permission.
++ *
++ * ALTERNATIVELY, this software may be distributed under the terms of the
++ * GNU General Public License ("GPL") version 2, as published by the Free
++ * Software Foundation.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
++ * IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
++ * THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef __DRIVERS_USB_DWC3_CORE_H
++#define __DRIVERS_USB_DWC3_CORE_H
++
++#include "types.h"
++
++/* Global constants */
++#define DWC3_EP0_BOUNCE_SIZE    512
++#define DWC3_ENDPOINTS_NUM      32
++#define DWC3_XHCI_RESOURCES_NUM 2
++
++#define DWC3_EVENT_SIZE         4  /* bytes */
++#define DWC3_EVENT_MAX_NUM      64 /* 2 events/endpoint */
++#define DWC3_EVENT_BUFFERS_SIZE (DWC3_EVENT_SIZE * DWC3_EVENT_MAX_NUM)
++#define DWC3_EVENT_TYPE_MASK    0xfe
++
++#define DWC3_EVENT_TYPE_DEV    0
++#define DWC3_EVENT_TYPE_CARKIT 3
++#define DWC3_EVENT_TYPE_I2C    4
++
++#define DWC3_DEVICE_EVENT_DISCONNECT         0
++#define DWC3_DEVICE_EVENT_RESET              1
++#define DWC3_DEVICE_EVENT_CONNECT_DONE       2
++#define DWC3_DEVICE_EVENT_LINK_STATUS_CHANGE 3
++#define DWC3_DEVICE_EVENT_WAKEUP             4
++#define DWC3_DEVICE_EVENT_HIBER_REQ          5
++#define DWC3_DEVICE_EVENT_EOPF               6
++#define DWC3_DEVICE_EVENT_SOF                7
++#define DWC3_DEVICE_EVENT_ERRATIC_ERROR      9
++#define DWC3_DEVICE_EVENT_CMD_CMPL           10
++#define DWC3_DEVICE_EVENT_OVERFLOW           11
++
++#define DWC3_GEVNTCOUNT_MASK 0xfffc
++#define DWC3_GSNPSID_MASK    0xffff0000
++#define DWC3_GSNPSREV_MASK   0xffff
++
++/* DWC3 registers memory space boundaries */
++#define DWC3_XHCI_REGS_START    0x0
++#define DWC3_XHCI_REGS_END      0x7fff
++#define DWC3_GLOBALS_REGS_START 0xc100
++#define DWC3_GLOBALS_REGS_END   0xc6ff
++#define DWC3_DEVICE_REGS_START  0xc700
++#define DWC3_DEVICE_REGS_END    0xcbff
++#define DWC3_OTG_REGS_START     0xcc00
++#define DWC3_OTG_REGS_END       0xccff
++
++/* Global Registers */
++#define DWC3_GSBUSCFG0     0xc100
++#define DWC3_GSBUSCFG1     0xc104
++#define DWC3_GTXTHRCFG     0xc108
++#define DWC3_GRXTHRCFG     0xc10c
++#define DWC3_GCTL          0xc110
++#define DWC3_GEVTEN        0xc114
++#define DWC3_GSTS          0xc118
++#define DWC3_GSNPSID       0xc120
++#define DWC3_GGPIO         0xc124
++#define DWC3_GUID          0xc128
++#define DWC3_GUCTL         0xc12c
++#define DWC3_GBUSERRADDR0  0xc130
++#define DWC3_GBUSERRADDR1  0xc134
++#define DWC3_GPRTBIMAP0    0xc138
++#define DWC3_GPRTBIMAP1    0xc13c
++#define DWC3_GHWPARAMS0    0xc140
++#define DWC3_GHWPARAMS1    0xc144
++#define DWC3_GHWPARAMS2    0xc148
++#define DWC3_GHWPARAMS3    0xc14c
++#define DWC3_GHWPARAMS4    0xc150
++#define DWC3_GHWPARAMS5    0xc154
++#define DWC3_GHWPARAMS6    0xc158
++#define DWC3_GHWPARAMS7    0xc15c
++#define DWC3_GDBGFIFOSPACE 0xc160
++#define DWC3_GDBGLTSSM     0xc164
++#define DWC3_GPRTBIMAP_HS0 0xc180
++#define DWC3_GPRTBIMAP_HS1 0xc184
++#define DWC3_GPRTBIMAP_FS0 0xc188
++#define DWC3_GPRTBIMAP_FS1 0xc18c
++
++#define DWC3_GUSB2PHYCFG(n) (0xc200 + (n * 0x04))
++#define DWC3_GUSB2I2CCTL(n) (0xc240 + (n * 0x04))
++
++#define DWC3_GUSB2PHYACC(n) (0xc280 + (n * 0x04))
++
++#define DWC3_GUSB3PIPECTL(n) (0xc2c0 + (n * 0x04))
++
++#define DWC3_GTXFIFOSIZ(n) (0xc300 + (n * 0x04))
++#define DWC3_GRXFIFOSIZ(n) (0xc380 + (n * 0x04))
++
++#define DWC3_GEVNTADRLO(n) (0xc400 + (n * 0x10))
++#define DWC3_GEVNTADRHI(n) (0xc404 + (n * 0x10))
++#define DWC3_GEVNTSIZ(n)   (0xc408 + (n * 0x10))
++#define DWC3_GEVNTCOUNT(n) (0xc40c + (n * 0x10))
++
++#define DWC3_GHWPARAMS8 0xc600
++
++/* Device Registers */
++#define DWC3_DCFG          0xc700
++#define DWC3_DCTL          0xc704
++#define DWC3_DEVTEN        0xc708
++#define DWC3_DSTS          0xc70c
++#define DWC3_DGCMDPAR      0xc710
++#define DWC3_DGCMD         0xc714
++#define DWC3_DALEPENA      0xc720
++#define DWC3_DEPCMDPAR2(n) (0xc800 + (n * 0x10))
++#define DWC3_DEPCMDPAR1(n) (0xc804 + (n * 0x10))
++#define DWC3_DEPCMDPAR0(n) (0xc808 + (n * 0x10))
++#define DWC3_DEPCMD(n)     (0xc80c + (n * 0x10))
++
++/* OTG Registers */
++#define DWC3_OCFG   0xcc00
++#define DWC3_OCTL   0xcc04
++#define DWC3_OEVT   0xcc08
++#define DWC3_OEVTEN 0xcc0C
++#define DWC3_OSTS   0xcc10
++
++/* Bit fields */
++
++/* Global Configuration Register */
++#define DWC3_GCTL_PWRDNSCALE(n) ((n) << 19)
++#define DWC3_GCTL_U2RSTECN      (1 << 16)
++#define DWC3_GCTL_RAMCLKSEL(x)  (((x) & DWC3_GCTL_CLK_MASK) << 6)
++#define DWC3_GCTL_CLK_BUS       (0)
++#define DWC3_GCTL_CLK_PIPE      (1)
++#define DWC3_GCTL_CLK_PIPEHALF  (2)
++#define DWC3_GCTL_CLK_MASK      (3)
++
++#define DWC3_GCTL_PRTCAP(n)     (((n) & (3 << 12)) >> 12)
++#define DWC3_GCTL_PRTCAPDIR(n)  ((n) << 12)
++#define DWC3_GCTL_PRTCAP_HOST   1
++#define DWC3_GCTL_PRTCAP_DEVICE 2
++#define DWC3_GCTL_PRTCAP_OTG    3
++
++#define DWC3_GCTL_CORESOFTRESET    (1 << 11)
++#define DWC3_GCTL_SCALEDOWN(n)     ((n) << 4)
++#define DWC3_GCTL_SCALEDOWN_MASK   DWC3_GCTL_SCALEDOWN(3)
++#define DWC3_GCTL_DISSCRAMBLE      (1 << 3)
++#define DWC3_GCTL_GBLHIBERNATIONEN (1 << 1)
++#define DWC3_GCTL_DSBLCLKGTNG      (1 << 0)
++
++/* Global USB2 PHY Configuration Register */
++#define DWC3_GUSB2PHYCFG_PHYSOFTRST (1 << 31)
++#define DWC3_GUSB2PHYCFG_SUSPHY     (1 << 6)
++
++/* Global USB3 PIPE Control Register */
++#define DWC3_GUSB3PIPECTL_PHYSOFTRST (1 << 31)
++#define DWC3_GUSB3PIPECTL_SUSPHY     (1 << 17)
++
++/* Global TX Fifo Size Register */
++#define DWC3_GTXFIFOSIZ_TXFDEF(n)    ((n) & 0xffff)
++#define DWC3_GTXFIFOSIZ_TXFSTADDR(n) ((n) & 0xffff0000)
++
++/* Global HWPARAMS1 Register */
++#define DWC3_GHWPARAMS1_EN_PWROPT(n)  (((n) & (3 << 24)) >> 24)
++#define DWC3_GHWPARAMS1_EN_PWROPT_NO  0
++#define DWC3_GHWPARAMS1_EN_PWROPT_CLK 1
++#define DWC3_GHWPARAMS1_EN_PWROPT_HIB 2
++#define DWC3_GHWPARAMS1_PWROPT(n)     ((n) << 24)
++#define DWC3_GHWPARAMS1_PWROPT_MASK   DWC3_GHWPARAMS1_PWROPT(3)
++
++/* Global HWPARAMS4 Register */
++#define DWC3_GHWPARAMS4_HIBER_SCRATCHBUFS(n) (((n) & (0x0f << 13)) >> 13)
++#define DWC3_MAX_HIBER_SCRATCHBUFS           15
++
++/* Device Configuration Register */
++#define DWC3_DCFG_LPM_CAP       (1 << 22)
++#define DWC3_DCFG_DEVADDR(addr) ((addr) << 3)
++#define DWC3_DCFG_DEVADDR_MASK  DWC3_DCFG_DEVADDR(0x7f)
++
++#define DWC3_DCFG_SPEED_MASK (7 << 0)
++#define DWC3_DCFG_SUPERSPEED (4 << 0)
++#define DWC3_DCFG_HIGHSPEED  (0 << 0)
++#define DWC3_DCFG_FULLSPEED2 (1 << 0)
++#define DWC3_DCFG_LOWSPEED   (2 << 0)
++#define DWC3_DCFG_FULLSPEED1 (3 << 0)
++
++#define DWC3_DCFG_LPM_CAP (1 << 22)
++
++/* Device Control Register */
++#define DWC3_DCTL_RUN_STOP (1 << 31)
++#define DWC3_DCTL_CSFTRST  (1 << 30)
++#define DWC3_DCTL_LSFTRST  (1 << 29)
++
++#define DWC3_DCTL_HIRD_THRES_MASK (0x1f << 24)
++#define DWC3_DCTL_HIRD_THRES(n)   ((n) << 24)
++
++#define DWC3_DCTL_APPL1RES (1 << 23)
++
++/* These apply for core versions 1.87a and earlier */
++#define DWC3_DCTL_TRGTULST_MASK     (0x0f << 17)
++#define DWC3_DCTL_TRGTULST(n)       ((n) << 17)
++#define DWC3_DCTL_TRGTULST_U2       (DWC3_DCTL_TRGTULST(2))
++#define DWC3_DCTL_TRGTULST_U3       (DWC3_DCTL_TRGTULST(3))
++#define DWC3_DCTL_TRGTULST_SS_DIS   (DWC3_DCTL_TRGTULST(4))
++#define DWC3_DCTL_TRGTULST_RX_DET   (DWC3_DCTL_TRGTULST(5))
++#define DWC3_DCTL_TRGTULST_SS_INACT (DWC3_DCTL_TRGTULST(6))
++
++/* These apply for core versions 1.94a and later */
++#define DWC3_DCTL_KEEP_CONNECT (1 << 19)
++#define DWC3_DCTL_L1_HIBER_EN  (1 << 18)
++#define DWC3_DCTL_CRS          (1 << 17)
++#define DWC3_DCTL_CSS          (1 << 16)
++
++#define DWC3_DCTL_INITU2ENA    (1 << 12)
++#define DWC3_DCTL_ACCEPTU2ENA  (1 << 11)
++#define DWC3_DCTL_INITU1ENA    (1 << 10)
++#define DWC3_DCTL_ACCEPTU1ENA  (1 << 9)
++#define DWC3_DCTL_TSTCTRL_MASK (0xf << 1)
++
++#define DWC3_DCTL_ULSTCHNGREQ_MASK (0x0f << 5)
++#define DWC3_DCTL_ULSTCHNGREQ(n)   (((n) << 5) & DWC3_DCTL_ULSTCHNGREQ_MASK)
++
++#define DWC3_DCTL_ULSTCHNG_NO_ACTION   (DWC3_DCTL_ULSTCHNGREQ(0))
++#define DWC3_DCTL_ULSTCHNG_SS_DISABLED (DWC3_DCTL_ULSTCHNGREQ(4))
++#define DWC3_DCTL_ULSTCHNG_RX_DETECT   (DWC3_DCTL_ULSTCHNGREQ(5))
++#define DWC3_DCTL_ULSTCHNG_SS_INACTIVE (DWC3_DCTL_ULSTCHNGREQ(6))
++#define DWC3_DCTL_ULSTCHNG_RECOVERY    (DWC3_DCTL_ULSTCHNGREQ(8))
++#define DWC3_DCTL_ULSTCHNG_COMPLIANCE  (DWC3_DCTL_ULSTCHNGREQ(10))
++#define DWC3_DCTL_ULSTCHNG_LOOPBACK    (DWC3_DCTL_ULSTCHNGREQ(11))
++
++/* Device Event Enable Register */
++#define DWC3_DEVTEN_VNDRDEVTSTRCVEDEN   (1 << 12)
++#define DWC3_DEVTEN_EVNTOVERFLOWEN      (1 << 11)
++#define DWC3_DEVTEN_CMDCMPLTEN          (1 << 10)
++#define DWC3_DEVTEN_ERRTICERREN         (1 << 9)
++#define DWC3_DEVTEN_SOFEN               (1 << 7)
++#define DWC3_DEVTEN_EOPFEN              (1 << 6)
++#define DWC3_DEVTEN_HIBERNATIONREQEVTEN (1 << 5)
++#define DWC3_DEVTEN_WKUPEVTEN           (1 << 4)
++#define DWC3_DEVTEN_ULSTCNGEN           (1 << 3)
++#define DWC3_DEVTEN_CONNECTDONEEN       (1 << 2)
++#define DWC3_DEVTEN_USBRSTEN            (1 << 1)
++#define DWC3_DEVTEN_DISCONNEVTEN        (1 << 0)
++
++/* Device Status Register */
++#define DWC3_DSTS_DCNRD (1 << 29)
++
++/* This applies for core versions 1.87a and earlier */
++#define DWC3_DSTS_PWRUPREQ (1 << 24)
++
++/* These apply for core versions 1.94a and later */
++#define DWC3_DSTS_RSS (1 << 25)
++#define DWC3_DSTS_SSS (1 << 24)
++
++#define DWC3_DSTS_COREIDLE   (1 << 23)
++#define DWC3_DSTS_DEVCTRLHLT (1 << 22)
++
++#define DWC3_DSTS_USBLNKST_MASK (0x0f << 18)
++#define DWC3_DSTS_USBLNKST(n)   (((n) & DWC3_DSTS_USBLNKST_MASK) >> 18)
++
++#define DWC3_DSTS_RXFIFOEMPTY (1 << 17)
++
++#define DWC3_DSTS_SOFFN_MASK (0x3fff << 3)
++#define DWC3_DSTS_SOFFN(n)   (((n) & DWC3_DSTS_SOFFN_MASK) >> 3)
++
++#define DWC3_DSTS_CONNECTSPD (7 << 0)
++
++#define DWC3_DSTS_SUPERSPEED (4 << 0)
++#define DWC3_DSTS_HIGHSPEED  (0 << 0)
++#define DWC3_DSTS_FULLSPEED2 (1 << 0)
++#define DWC3_DSTS_LOWSPEED   (2 << 0)
++#define DWC3_DSTS_FULLSPEED1 (3 << 0)
++
++/* Device Generic Command Register */
++#define DWC3_DGCMD_SET_LMP          0x01
++#define DWC3_DGCMD_SET_PERIODIC_PAR 0x02
++#define DWC3_DGCMD_XMIT_FUNCTION    0x03
++
++/* These apply for core versions 1.94a and later */
++#define DWC3_DGCMD_SET_SCRATCHPAD_ADDR_LO 0x04
++#define DWC3_DGCMD_SET_SCRATCHPAD_ADDR_HI 0x05
++
++#define DWC3_DGCMD_SELECTED_FIFO_FLUSH  0x09
++#define DWC3_DGCMD_ALL_FIFO_FLUSH       0x0a
++#define DWC3_DGCMD_SET_ENDPOINT_NRDY    0x0c
++#define DWC3_DGCMD_RUN_SOC_BUS_LOOPBACK 0x10
++
++#define DWC3_DGCMD_STATUS(n) (((n) >> 12) & 0xf)
++#define DWC3_DGCMD_CMDACT    (1 << 10)
++#define DWC3_DGCMD_CMDIOC    (1 << 8)
++
++/* Device Generic Command Parameter Register */
++#define DWC3_DGCMDPAR_FORCE_LINKPM_ACCEPT (1 << 0)
++#define DWC3_DGCMDPAR_FIFO_NUM(n)         ((n) << 0)
++#define DWC3_DGCMDPAR_RX_FIFO             (0 << 5)
++#define DWC3_DGCMDPAR_TX_FIFO             (1 << 5)
++#define DWC3_DGCMDPAR_LOOPBACK_DIS        (0 << 0)
++#define DWC3_DGCMDPAR_LOOPBACK_ENA        (1 << 0)
++
++/* Device Endpoint Command Register */
++#define DWC3_DEPCMD_PARAM_SHIFT    16
++#define DWC3_DEPCMD_PARAM(x)       ((x) << DWC3_DEPCMD_PARAM_SHIFT)
++#define DWC3_DEPCMD_GET_RSC_IDX(x) (((x) >> DWC3_DEPCMD_PARAM_SHIFT) & 0x7f)
++#define DWC3_DEPCMD_STATUS(x)      (((x) >> 12) & 0xf)
++#define DWC3_DEPCMD_HIPRI_FORCERM  (1 << 11)
++#define DWC3_DEPCMD_CMDACT         (1 << 10)
++#define DWC3_DEPCMD_CMDIOC         (1 << 8)
++
++#define DWC3_DEPCMD_DEPSTARTCFG    (0x09 << 0)
++#define DWC3_DEPCMD_ENDTRANSFER    (0x08 << 0)
++#define DWC3_DEPCMD_UPDATETRANSFER (0x07 << 0)
++#define DWC3_DEPCMD_STARTTRANSFER  (0x06 << 0)
++#define DWC3_DEPCMD_CLEARSTALL     (0x05 << 0)
++#define DWC3_DEPCMD_SETSTALL       (0x04 << 0)
++/* This applies for core versions 1.90a and earlier */
++#define DWC3_DEPCMD_GETSEQNUMBER (0x03 << 0)
++/* This applies for core versions 1.94a and later */
++#define DWC3_DEPCMD_GETEPSTATE        (0x03 << 0)
++#define DWC3_DEPCMD_SETTRANSFRESOURCE (0x02 << 0)
++#define DWC3_DEPCMD_SETEPCONFIG       (0x01 << 0)
++
++/* The EP number goes 0..31 so ep0 is always out and ep1 is always in */
++#define DWC3_DALEPENA_EP(n) (1 << n)
++
++#define DWC3_DEPCMD_TYPE_CONTROL 0
++#define DWC3_DEPCMD_TYPE_ISOC    1
++#define DWC3_DEPCMD_TYPE_BULK    2
++#define DWC3_DEPCMD_TYPE_INTR    3
++
++#define DWC3_EVENT_PENDING BIT(0)
++
++#define DWC3_EP_FLAG_STALLED (1 << 0)
++#define DWC3_EP_FLAG_WEDGED  (1 << 1)
++
++#define DWC3_EP_DIRECTION_TX true
++#define DWC3_EP_DIRECTION_RX false
++
++#define DWC3_TRB_NUM  32
++#define DWC3_TRB_MASK (DWC3_TRB_NUM - 1)
++
++#define DWC3_EP_ENABLED         (1 << 0)
++#define DWC3_EP_STALL           (1 << 1)
++#define DWC3_EP_WEDGE           (1 << 2)
++#define DWC3_EP_BUSY            (1 << 4)
++#define DWC3_EP_PENDING_REQUEST (1 << 5)
++#define DWC3_EP_MISSED_ISOC     (1 << 6)
++
++/* This last one is specific to EP0 */
++#define DWC3_EP0_DIR_IN (1 << 31)
++
++enum dwc3_link_state {
++    /* In SuperSpeed */
++    DWC3_LINK_STATE_U0 = 0x00, /* in HS, means ON */
++    DWC3_LINK_STATE_U1 = 0x01,
++    DWC3_LINK_STATE_U2 = 0x02, /* in HS, means SLEEP */
++    DWC3_LINK_STATE_U3 = 0x03, /* in HS, means SUSPEND */
++    DWC3_LINK_STATE_SS_DIS = 0x04,
++    DWC3_LINK_STATE_RX_DET = 0x05, /* in HS, means Early Suspend */
++    DWC3_LINK_STATE_SS_INACT = 0x06,
++    DWC3_LINK_STATE_POLL = 0x07,
++    DWC3_LINK_STATE_RECOV = 0x08,
++    DWC3_LINK_STATE_HRESET = 0x09,
++    DWC3_LINK_STATE_CMPLY = 0x0a,
++    DWC3_LINK_STATE_LPBK = 0x0b,
++    DWC3_LINK_STATE_RESET = 0x0e,
++    DWC3_LINK_STATE_RESUME = 0x0f,
++    DWC3_LINK_STATE_MASK = 0x0f,
++};
++
++/* TRB Length, PCM and Status */
++#define DWC3_TRB_SIZE_MASK      (0x00ffffff)
++#define DWC3_TRB_SIZE_LENGTH(n) ((n) & DWC3_TRB_SIZE_MASK)
++#define DWC3_TRB_SIZE_PCM1(n)   (((n) & 0x03) << 24)
++#define DWC3_TRB_SIZE_TRBSTS(n) (((n) & (0x0f << 28)) >> 28)
++
++#define DWC3_TRBSTS_OK            0
++#define DWC3_TRBSTS_MISSED_ISOC   1
++#define DWC3_TRBSTS_SETUP_PENDING 2
++#define DWC3_TRB_STS_XFER_IN_PROG 4
++
++/* TRB Control */
++#define DWC3_TRB_CTRL_HWO         (1 << 0)
++#define DWC3_TRB_CTRL_LST         (1 << 1)
++#define DWC3_TRB_CTRL_CHN         (1 << 2)
++#define DWC3_TRB_CTRL_CSP         (1 << 3)
++#define DWC3_TRB_CTRL_TRBCTL(n)   (((n) & 0x3f) << 4)
++#define DWC3_TRB_CTRL_ISP_IMI     (1 << 10)
++#define DWC3_TRB_CTRL_IOC         (1 << 11)
++#define DWC3_TRB_CTRL_SID_SOFN(n) (((n) & 0xffff) << 14)
++
++#define DWC3_TRBCTL_NORMAL            DWC3_TRB_CTRL_TRBCTL(1)
++#define DWC3_TRBCTL_CONTROL_SETUP     DWC3_TRB_CTRL_TRBCTL(2)
++#define DWC3_TRBCTL_CONTROL_STATUS2   DWC3_TRB_CTRL_TRBCTL(3)
++#define DWC3_TRBCTL_CONTROL_STATUS3   DWC3_TRB_CTRL_TRBCTL(4)
++#define DWC3_TRBCTL_CONTROL_DATA      DWC3_TRB_CTRL_TRBCTL(5)
++#define DWC3_TRBCTL_ISOCHRONOUS_FIRST DWC3_TRB_CTRL_TRBCTL(6)
++#define DWC3_TRBCTL_ISOCHRONOUS       DWC3_TRB_CTRL_TRBCTL(7)
++#define DWC3_TRBCTL_LINK_TRB          DWC3_TRB_CTRL_TRBCTL(8)
++
++/**
++ * struct dwc3_trb - transfer request block (hw format)
++ * @bpl: DW0-3
++ * @bph: DW4-7
++ * @size: DW8-B
++ * @trl: DWC-F
++ */
++struct dwc3_trb {
++    u32 bpl;
++    u32 bph;
++    u32 size;
++    u32 ctrl;
++} PACKED;
++
++/* HWPARAMS0 */
++#define DWC3_MODE(n) ((n) & 0x7)
++
++#define DWC3_MODE_DEVICE 0
++#define DWC3_MODE_HOST   1
++#define DWC3_MODE_DRD    2
++#define DWC3_MODE_HUB    3
++
++#define DWC3_MDWIDTH(n) (((n) & 0xff00) >> 8)
++
++/* HWPARAMS1 */
++#define DWC3_NUM_INT(n) (((n) & (0x3f << 15)) >> 15)
++
++/* HWPARAMS3 */
++#define DWC3_NUM_IN_EPS_MASK (0x1f << 18)
++#define DWC3_NUM_EPS_MASK    (0x3f << 12)
++#define DWC3_NUM_EPS(p)      (((p)->hwparams3 & (DWC3_NUM_EPS_MASK)) >> 12)
++#define DWC3_NUM_IN_EPS(p)   (((p)->hwparams3 & (DWC3_NUM_IN_EPS_MASK)) >> 18)
++
++/* HWPARAMS7 */
++#define DWC3_RAM1_DEPTH(n) ((n) & 0xffff)
++
++#define DWC3_REVISION_173A 0x5533173a
++#define DWC3_REVISION_175A 0x5533175a
++#define DWC3_REVISION_180A 0x5533180a
++#define DWC3_REVISION_183A 0x5533183a
++#define DWC3_REVISION_185A 0x5533185a
++#define DWC3_REVISION_187A 0x5533187a
++#define DWC3_REVISION_188A 0x5533188a
++#define DWC3_REVISION_190A 0x5533190a
++#define DWC3_REVISION_194A 0x5533194a
++#define DWC3_REVISION_200A 0x5533200a
++#define DWC3_REVISION_202A 0x5533202a
++#define DWC3_REVISION_210A 0x5533210a
++#define DWC3_REVISION_220A 0x5533220a
++#define DWC3_REVISION_230A 0x5533230a
++#define DWC3_REVISION_240A 0x5533240a
++#define DWC3_REVISION_250A 0x5533250a
++
++/* -------------------------------------------------------------------------- */
++
++/* -------------------------------------------------------------------------- */
++
++struct dwc3_event_type {
++    u32 is_devspec : 1;
++    u32 type : 7;
++    u32 reserved8_31 : 24;
++} PACKED;
++
++#define DWC3_DEPEVT_XFERCOMPLETE   0x01
++#define DWC3_DEPEVT_XFERINPROGRESS 0x02
++#define DWC3_DEPEVT_XFERNOTREADY   0x03
++#define DWC3_DEPEVT_RXTXFIFOEVT    0x04
++#define DWC3_DEPEVT_STREAMEVT      0x06
++#define DWC3_DEPEVT_EPCMDCMPLT     0x07
++
++/**
++ * struct dwc3_event_depvt - Device Endpoint Events
++ * @one_bit: indicates this is an endpoint event (not used)
++ * @endpoint_number: number of the endpoint
++ * @endpoint_event: The event we have:
++ *	0x00	- Reserved
++ *	0x01	- XferComplete
++ *	0x02	- XferInProgress
++ *	0x03	- XferNotReady
++ *	0x04	- RxTxFifoEvt (IN->Underrun, OUT->Overrun)
++ *	0x05	- Reserved
++ *	0x06	- StreamEvt
++ *	0x07	- EPCmdCmplt
++ * @reserved11_10: Reserved, don't use.
++ * @status: Indicates the status of the event. Refer to databook for
++ *	more information.
++ * @parameters: Parameters of the current event. Refer to databook for
++ *	more information.
++ */
++struct dwc3_event_depevt {
++    u32 one_bit : 1;
++    u32 endpoint_number : 5;
++    u32 endpoint_event : 4;
++    u32 reserved11_10 : 2;
++    u32 status : 4;
++
++/* Within XferNotReady */
++#define DEPEVT_STATUS_TRANSFER_ACTIVE (1 << 3)
++
++/* Within XferComplete */
++#define DEPEVT_STATUS_BUSERR (1 << 0)
++#define DEPEVT_STATUS_SHORT  (1 << 1)
++#define DEPEVT_STATUS_IOC    (1 << 2)
++#define DEPEVT_STATUS_LST    (1 << 3)
++
++/* Stream event only */
++#define DEPEVT_STREAMEVT_FOUND    1
++#define DEPEVT_STREAMEVT_NOTFOUND 2
++
++/* Control-only Status */
++#define DEPEVT_STATUS_CONTROL_DATA   1
++#define DEPEVT_STATUS_CONTROL_STATUS 2
++
++    u32 parameters : 16;
++} PACKED;
++
++#define DWC3_DEVT_DISCONN         0x00
++#define DWC3_DEVT_USBRST          0x01
++#define DWC3_DEVT_CONNECTDONE     0x02
++#define DWC3_DEVT_ULSTCHNG        0x03
++#define DWC3_DEVT_WKUPEVT         0x04
++#define DWC3_DEVT_EOPF            0x06
++#define DWC3_DEVT_SOF             0x07
++#define DWC3_DEVT_ERRTICERR       0x09
++#define DWC3_DEVT_CMDCMPLT        0x0a
++#define DWC3_DEVT_EVNTOVERFLOW    0x0b
++#define DWC3_DEVT_VNDRDEVTSTRCVED 0x0c
++
++/**
++ * struct dwc3_event_devt - Device Events
++ * @one_bit: indicates this is a non-endpoint event (not used)
++ * @device_event: indicates it's a device event. Should read as 0x00
++ * @type: indicates the type of device event.
++ *	0	- DisconnEvt
++ *	1	- USBRst
++ *	2	- ConnectDone
++ *	3	- ULStChng
++ *	4	- WkUpEvt
++ *	5	- Reserved
++ *	6	- EOPF
++ *	7	- SOF
++ *	8	- Reserved
++ *	9	- ErrticErr
++ *	10	- CmdCmplt
++ *	11	- EvntOverflow
++ *	12	- VndrDevTstRcved
++ * @reserved15_12: Reserved, not used
++ * @event_info: Information about this event
++ * @reserved31_24: Reserved, not used
++ */
++struct dwc3_event_devt {
++    u32 one_bit : 1;
++    u32 device_event : 7;
++    u32 type : 4;
++    u32 reserved15_12 : 4;
++    u32 event_info : 8;
++    u32 reserved31_24 : 8;
++} PACKED;
++
++/**
++ * struct dwc3_event_gevt - Other Core Events
++ * @one_bit: indicates this is a non-endpoint event (not used)
++ * @device_event: indicates it's (0x03) Carkit or (0x04) I2C event.
++ * @phy_port_number: self-explanatory
++ * @reserved31_12: Reserved, not used.
++ */
++struct dwc3_event_gevt {
++    u32 one_bit : 1;
++    u32 device_event : 7;
++    u32 phy_port_number : 4;
++    u32 reserved31_12 : 20;
++} PACKED;
++
++union dwc3_event {
++    u32 raw;
++    struct dwc3_event_type type;
++    struct dwc3_event_depevt depevt;
++    struct dwc3_event_devt devt;
++    struct dwc3_event_gevt gevt;
++};
++
++#define DWC3_DEPCFG_EP_TYPE(n)         (((n) & 0x3) << 1)
++#define DWC3_DEPCFG_EP_NUMBER(n)       (((n) & 0x1f) << 25)
++#define DWC3_DEPCFG_FIFO_NUMBER(n)     (((n) & 0xf) << 17)
++#define DWC3_DEPCFG_MAX_PACKET_SIZE(n) (((n) & 0x7ff) << 3)
++
++#define DWC3_DEPCFG_INT_NUM(n)          (((n) & 0x1f) << 0)
++#define DWC3_DEPCFG_XFER_COMPLETE_EN    BIT(8)
++#define DWC3_DEPCFG_XFER_IN_PROGRESS_EN BIT(9)
++#define DWC3_DEPCFG_XFER_NOT_READY_EN   BIT(10)
++#define DWC3_DEPCFG_FIFO_ERROR_EN       BIT(11)
++#define DWC3_DEPCFG_STREAM_EVENT_EN     BIT(13)
++#define DWC3_DEPCFG_BINTERVAL_M1(n)     (((n) & 0xff) << 16)
++#define DWC3_DEPCFG_STREAM_CAPABLE      BIT(24)
++#define DWC3_DEPCFG_EP_NUMBER(n)        (((n) & 0x1f) << 25)
++#define DWC3_DEPCFG_BULK_BASED          BIT(30)
++#define DWC3_DEPCFG_FIFO_BASED          BIT(31)
++
++#endif /* __DRIVERS_USB_DWC3_CORE_H */
+diff --git a/drivers/usb-console/usb_types.h b/drivers/usb-console/usb_types.h
+new file mode 100644
+index 0000000..fca596f
+--- /dev/null
++++ b/drivers/usb-console/usb_types.h
+@@ -0,0 +1,211 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#ifndef USB_TYPES_H
++#define USB_TYPES_H
++
++#include "types.h"
++
++#define USB_REQUEST_TYPE_DIRECTION_SHIFT       7
++#define USB_REQUEST_TYPE_DIRECTION(d)          ((d) << USB_REQUEST_TYPE_DIRECTION_SHIFT)
++#define USB_REQUEST_TYPE_DIRECTION_HOST2DEVICE 0
++#define USB_REQUEST_TYPE_DIRECTION_DEVICE2HOST 1
++
++#define USB_REQUEST_TYPE_SHIFT    5
++#define USB_REQUEST_TYPE(t)       ((t) << USB_REQUEST_TYPE_SHIFT)
++#define USB_REQUEST_TYPE_STANDARD USB_REQUEST_TYPE(0b00)
++#define USB_REQUEST_TYPE_CLASS    USB_REQUEST_TYPE(0b01)
++#define USB_REQUEST_TYPE_VENDOR   USB_REQUEST_TYPE(0b10)
++#define USB_REQUEST_TYPE_MASK     USB_REQUEST_TYPE(0b11)
++
++#define USB_REQUEST_TYPE_RECIPIENT_DEVICE    0
++#define USB_REQUEST_TYPE_RECIPIENT_INTERFACE 1
++#define USB_REQUEST_TYPE_RECIPIENT_ENDPOINT  2
++#define USB_REQUEST_TYPE_RECIPIENT_OTHER     3
++#define USB_REQUEST_TYPE_RECIPIENT_MASK      0b11
++
++#define USB_REQUEST_GET_STATUS        0x00
++#define USB_REQUEST_CLEAR_FEATURE     0x01
++#define USB_REQUEST_SET_FEATURE       0x03
++#define USB_REQUEST_SET_ADDRESS       0x05
++#define USB_REQUEST_GET_DESCRIPTOR    0x06
++#define USB_REQUEST_SET_DESCRIPTOR    0x07
++#define USB_REQUEST_GET_CONFIGURATION 0x08
++#define USB_REQUEST_SET_CONFIGURATION 0x09
++
++#define USB_EP_REQUEST_CLEAR_FEATURE 0x01
++#define USB_EP_REQUEST_SET_FEATURE   0x03
++
++#define USB_FEATURE_ENDPOINT_HALT 0x00
++
++#define USB_REQUEST_CDC_SET_LINE_CODING     0x20
++#define USB_REQUEST_CDC_GET_LINE_CODING     0x21
++#define USB_REQUEST_CDC_SET_CTRL_LINE_STATE 0x22
++
++struct usb_setup_packet_raw {
++    u8 bmRequestType;
++    u8 bRequest;
++    u16 wValue;
++    u16 wIndex;
++    u16 wLength;
++} PACKED;
++
++struct usb_setup_packet_get_descriptor {
++    u8 bmRequestType;
++    u8 bRequest;
++    u8 index;
++    u8 type;
++    u16 language;
++    u16 wLength;
++} PACKED;
++
++struct usb_set_packet_set_address {
++    u8 bmRequestType;
++    u8 bRequest;
++    u16 address;
++    u16 zero0;
++    u16 zero1;
++} PACKED;
++
++struct usb_set_packet_set_configuration {
++    u8 bmRequestType;
++    u8 bRequest;
++    u16 configuration;
++    u16 zero0;
++    u16 zero1;
++} PACKED;
++
++struct usb_setup_packet_feature {
++    u8 bmRequestType;
++    u8 bRequest;
++    u16 wFeatureSelector;
++    u16 wEndpoint;
++    u16 wLength;
++} PACKED;
++
++union usb_setup_packet {
++    struct usb_setup_packet_raw raw;
++    struct usb_setup_packet_get_descriptor get_descriptor;
++    struct usb_set_packet_set_address set_address;
++    struct usb_set_packet_set_configuration set_configuration;
++    struct usb_setup_packet_feature feature;
++};
++
++#define USB_DEVICE_DESCRIPTOR                    0x01
++#define USB_CONFIGURATION_DESCRIPTOR             0x02
++#define USB_STRING_DESCRIPTOR                    0x03
++#define USB_INTERFACE_DESCRIPTOR                 0x04
++#define USB_ENDPOINT_DESCRIPTOR                  0x05
++#define USB_DEVICE_QUALIFIER_DESCRIPTOR          0x06
++#define USB_OTHER_SPEED_CONFIGURATION_DESCRIPTOR 0x07
++
++#define USB_CDC_INTERFACE_FUNCTIONAL_DESCRIPTOR 0x24
++#define USB_CDC_UNION_SUBTYPE                   0x06
++
++#define USB_CONFIGURATION_SELF_POWERED   0x40
++#define USB_CONFIGURATION_ATTRIBUTE_RES1 0x80
++
++#define USB_ENDPOINT_ADDR_IN(ep)  (0x80 | (ep))
++#define USB_ENDPOINT_ADDR_OUT(ep) (0x00 | (ep))
++
++#define USB_ENDPOINT_ATTR_TYPE_CONTROL     0b00
++#define USB_ENDPOINT_ATTR_TYPE_ISOCHRONOUS 0b01
++#define USB_ENDPOINT_ATTR_TYPE_BULK        0b10
++#define USB_ENDPOINT_ATTR_TYPE_INTERRUPT   0b11
++
++#define USB_LANGID_EN_US 0x0409
++
++struct usb_device_descriptor {
++    u8 bLength;
++    u8 bDescriptorType;
++    u16 bcdUSB;
++    u8 bDeviceClass;
++    u8 bDeviceSubClass;
++    u8 bDeviceProtocol;
++    u8 bMaxPacketSize0;
++    u16 idVendor;
++    u16 idProduct;
++    u16 bcdDevice;
++    u8 iManufacturer;
++    u8 iProduct;
++    u8 iSerialNumber;
++    u8 bNumConfigurations;
++} PACKED;
++
++struct usb_configuration_descriptor {
++    u8 bLength;
++    u8 bDescriptorType;
++    u16 wTotalLength;
++    u8 bNumInterfaces;
++    u8 bConfigurationValue;
++    u8 iConfiguration;
++    u8 bmAttributes;
++    u8 bMaxPower;
++} PACKED;
++
++struct usb_interface_descriptor {
++    u8 bLength;
++    u8 bDescriptorType;
++    u8 bInterfaceNumber;
++    u8 bAlternateSetting;
++    u8 bNumEndpoints;
++    u8 bInterfaceClass;
++    u8 bInterfaceSubClass;
++    u8 bInterfaceProtocol;
++    u8 iInterface;
++} PACKED;
++
++struct usb_endpoint_descriptor {
++    u8 bLength;
++    u8 bDescriptorType;
++    u8 bEndpointAddress;
++    u8 bmAttributes;
++    u16 wMaxPacketSize;
++    u8 bInterval;
++} PACKED;
++
++struct usb_string_descriptor {
++    u8 bLength;
++    u8 bDescriptorType;
++    u16 bString[];
++} PACKED;
++
++struct usb_string_descriptor_languages {
++    u8 bLength;
++    u8 bDescriptorType;
++    u16 wLANGID[];
++} PACKED;
++
++struct cdc_union_functional_descriptor {
++    u8 bFunctionLength;
++    u8 bDescriptorType;
++    u8 bDescriptorSubtype;
++    u8 bControlInterface;
++    u8 bDataInterface;
++} PACKED;
++
++struct usb_device_qualifier_descriptor {
++    u8 bLength;
++    u8 bDescriptorType;
++    u16 bcdUSB;
++    u8 bDeviceClass;
++    u8 bDeviceSubClass;
++    u8 bDeviceProtocol;
++    u8 bMaxPacketSize0;
++    u8 bNumConfigurations;
++    u8 bReserved;
++} PACKED;
++
++/*
++ * this macro is required because we need to convert any string literals
++ * to UTF16 and because we need to calculate the correct total size of the
++ * string descriptor.
++ */
++// 18.1.6 vs 18.1.1 diff
++// clang-format off
++#define make_usb_string_descriptor(str)                                                            \
++    {.bLength = sizeof(struct usb_string_descriptor) + sizeof(u##str) - 2,                         \
++     .bDescriptorType = USB_STRING_DESCRIPTOR,                                                     \
++     .bString = u##str}
++// clang-format on
++
++#endif
+diff --git a/drivers/usb-console/utils.h b/drivers/usb-console/utils.h
+new file mode 100644
+index 0000000..3efe399
+--- /dev/null
++++ b/drivers/usb-console/utils.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef USB_PORT_UTILS_H
++#define USB_PORT_UTILS_H
++#include "types.h"
++#include <lib/debug.h>
++#define min(a,b) ((a)<(b)?(a):(b))
++#define max(a,b) ((a)>(b)?(a):(b))
++#define debug_printf(...) printk(KERN_DEBUG, __VA_ARGS__)
++static inline u32 read32(uintptr_t a) { u32 v=*(volatile u32 *)a; asm volatile("dmb sy" ::: "memory"); return v; }
++static inline void write32(uintptr_t a, u32 v) { asm volatile("dmb sy" ::: "memory"); *(volatile u32 *)a=v; asm volatile("dsb sy" ::: "memory"); }
++static inline void mask32(uintptr_t a,u32 mask,u32 value) {write32(a,(read32(a)&~mask)|value);}
++static inline void set32(uintptr_t a,u32 value) {mask32(a,0,value);}
++static inline void clear32(uintptr_t a,u32 value) {mask32(a,value,0);}
++void usb_udelay(unsigned int us);
++static inline void mdelay(unsigned int ms) {while(ms--) usb_udelay(1000);}
++static inline int poll32(uintptr_t a,u32 mask,u32 value,unsigned int us) {
++    while(us--) {if ((read32(a)&mask)==value) return 0; usb_udelay(1);} return -1;
++}
++#endif
+diff --git a/include/drivers/usb-console.h b/include/drivers/usb-console.h
+new file mode 100644
+index 0000000..ff7a1ae
+--- /dev/null
++++ b/include/drivers/usb-console.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef UNILOADER_USB_CONSOLE_H
++#define UNILOADER_USB_CONSOLE_H
++#ifdef CONFIG_SAMSUNG_ZEROFLTE
++void usb_console_start(void);
++void usb_console_poll(void);
++unsigned int usb_console_wait(void);
++void usb_console_stop(void);
++void usb_console_flush_dma(void);
++int usb_console_watchdog_arm(void);
++int usb_console_watchdog_stop(void);
++#else
++static inline void usb_console_start(void) {}
++static inline void usb_console_poll(void) {}
++static inline unsigned int usb_console_wait(void) { return 0; }
++static inline void usb_console_stop(void) {}
++static inline void usb_console_flush_dma(void) {}
++static inline int usb_console_watchdog_arm(void) { return 0; }
++static inline int usb_console_watchdog_stop(void) { return 1; }
++#endif
++#endif
+diff --git a/include/main/boot.h b/include/main/boot.h
+index d988e39..a314ed2 100644
+--- a/include/main/boot.h
++++ b/include/main/boot.h
+@@ -23,4 +23,19 @@ void arch_load_kernel(void* kernel, void* dt, void* ramdisk);
+ 
+ void boot_kernel(void* dt, void* kernel, void* ramdisk);
+ 
++/* 诊断与自动修复（DSH 调试补丁）*/
++void arch_diag(void *dt);
++void arch_prepare_kernel(void *dt);
++void arch_prepare_probe(void *dt);
++int dsh_arm_probe(unsigned int stage);
++void dsh_report_probe(unsigned long result);
++unsigned long arch_probe_kernel(void *dt, void *kernel);
++void dsh_probe_return(void);
++void dsh_reserve_el3(void);
++void dsh_unreserve_el3(void);
++void dsh_pstore_init(const void *dt);
++void dsh_dump_ramoops(void);
++void dsh_dump_pmsg(void);
++int dsh_apply_user_command(void *dt);
++
+ #endif // BOOT_H_
+diff --git a/include/main/dsh-diag.h b/include/main/dsh-diag.h
+new file mode 100644
+index 0000000..dbdd33d
+--- /dev/null
++++ b/include/main/dsh-diag.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef DSH_DIAG_H
++#define DSH_DIAG_H
++#define DSH_DIAG_MAGIC 0x4453484449414731UL
++struct dsh_diag_record {
++	unsigned long magic, version, bytes, build_id, run_id, sequence;
++	unsigned long stage, initcall, caller, fmt, text_len, checksum;
++	char text[512];
++};
++_Static_assert(sizeof(struct dsh_diag_record) == 608, "Diagnostic ABI size");
++void dsh_arm_diag_record(unsigned long test_mode);
++#endif
+diff --git a/include/main/pstore-ring.h b/include/main/pstore-ring.h
+new file mode 100644
+index 0000000..7e9c7c1
+--- /dev/null
++++ b/include/main/pstore-ring.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef DSH_PSTORE_RING_H
++#define DSH_PSTORE_RING_H
++
++/* Linux 6.6 persistent_ram_buffer: little-endian sig/start/size, then data.
++ * Use byte accesses: the loader runs with translation disabled. */
++struct dsh_pram_view {
++	const volatile unsigned char *data;
++	unsigned long capacity, start, size;
++};
++
++static inline unsigned long dsh_pram_u32(const volatile unsigned char *p)
++{
++	return (unsigned long)p[0] | (unsigned long)p[1] << 8 |
++		(unsigned long)p[2] << 16 | (unsigned long)p[3] << 24;
++}
++
++static inline int dsh_pram_view(const volatile unsigned char *zone,
++			      unsigned long bytes, struct dsh_pram_view *v)
++{
++	if (bytes < 12 || dsh_pram_u32(zone) != 0x43474244UL)
++		return -1;
++	v->data = zone + 12;
++	v->capacity = bytes - 12;
++	v->start = dsh_pram_u32(zone + 4);
++	v->size = dsh_pram_u32(zone + 8);
++	if (v->size > v->capacity || v->start > v->size)
++		return -2;
++	/* Reject a partially published non-full ring rather than report it. */
++	if (v->size < v->capacity && v->start != v->size)
++		return -3;
++	return 0;
++}
++
++static inline unsigned char dsh_pram_byte(const struct dsh_pram_view *v,
++					unsigned long offset)
++{
++	return v->data[(v->start + v->capacity - v->size + offset) % v->capacity];
++}
++
++#endif
+diff --git a/lib/console/console.c b/lib/console/console.c
+index 652ac7a..c3b57fc 100644
+--- a/lib/console/console.c
++++ b/lib/console/console.c
+@@ -8,6 +8,7 @@
+ #include <stdarg.h>
+ #include <lib/console.h>
+ #include <lib/debug.h>
++#include <drivers/usb-console.h>
+ 
+ #define NANOPRINTF_IMPLEMENTATION
+ #define NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS	1
+@@ -22,6 +23,17 @@
+ 
+ #define PRINTK_BUFFER_SIZE 256
+ 
++/* Linear RAM transcript for emulator dumps and future transport backends. */
++char dsh_log[131072];
++unsigned long dsh_log_len;
++
++static void dsh_log_append(const char *s)
++{
++	while (*s && dsh_log_len + 1 < sizeof(dsh_log))
++		dsh_log[dsh_log_len++] = *s++;
++	dsh_log[dsh_log_len] = '\0';
++}
++
+ /* earlycon (usually uart) + fb; bump if a third sink appears. */
+ #define MAX_CONSOLES 2
+ 
+@@ -93,7 +105,10 @@ void printk(int log_level, const char *fmt, ...)
+ 	va_end(args);
+ 
+ 	const char *prefix = log_prefix(log_level);
++	dsh_log_append(prefix);
++	dsh_log_append(print_buffer);
+ 
+ 	for (unsigned int i = 0; i < n_consoles; i++)
+ 		consoles[i]->write(log_level, prefix, print_buffer);
++	usb_console_poll();
+ }
+diff --git a/lib/unic/string.c b/lib/unic/string.c
+index 237bb69..001bd7d 100644
+--- a/lib/unic/string.c
++++ b/lib/unic/string.c
+@@ -53,6 +53,9 @@ void *memset (void *m, int c, size_t n)
+ 		s = (char*)aligned_addr;
+ 	}
+ 
++	while (n--)
++		*s++ = (char)c;
++
+ 	return m;
+ }
+ 
+diff --git a/main/Makefile b/main/Makefile
+index cfc56cf..31c4f45 100644
+--- a/main/Makefile
++++ b/main/Makefile
+@@ -1,2 +1,2 @@
+-obj-y := boot.o main.o
++obj-y := boot.o main.o diag.o pstore.o
+ obj-$(CONFIG_LIBFDT) += boot-fdt.o
+diff --git a/main/boot.c b/main/boot.c
+index 9fa3010..7ac5635 100644
+--- a/main/boot.c
++++ b/main/boot.c
+@@ -1,20 +1,237 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/*
+- * Copyright (c) 2022, Ivaylo Ivanov <ivo.ivanov.ivanov1@gmail.com>
+- * Copyright (c) 2026, Igor Belwon <igor.belwon@mentallysanemainliners.org>
+- */
+-
++/* SM-G9209 bring-up: inspect raw breadcrumbs without following stale pointers. */
+ #include <lib/debug.h>
+ #include <main/boot.h>
+ #include <main/boot-fdt.h>
+ #include <string.h>
++#include <lib/libfdt/libfdt.h>
++#include <main/dsh-diag.h>
++
++static void *probe_fdt;
++
++/* Board-specific A/B switch: changes only this boot's expanded FDT. */
++void dsh_reserve_el3(void)
++{
++	const fdt32_t reg[] = { 0, cpu_to_fdt32(0xfe800000U),
++			       0, cpu_to_fdt32(0x01800000U) };
++	int parent, node, ret;
++	if (!probe_fdt || fdt_check_header(probe_fdt)) return;
++	parent = fdt_path_offset(probe_fdt, "/reserved-memory");
++	if (parent < 0) {
++		printk(KERN_ERR, "[dt] missing reserved-memory: %d\n", parent);
++		return;
++	}
++	node = fdt_subnode_offset(probe_fdt, parent, "trustzone@fe800000");
++	if (node == -FDT_ERR_NOTFOUND)
++		node = fdt_add_subnode(probe_fdt, parent, "trustzone@fe800000");
++	ret = node < 0 ? node : fdt_setprop(probe_fdt, node, "reg", reg, sizeof(reg));
++	if (!ret) ret = fdt_setprop(probe_fdt, node, "no-map", NULL, 0);
++	printk(ret ? KERN_ERR : KERN_NOTICE,
++	       "[dt] reserve EL3 fe800000+01800000 no-map result=%d\n", ret);
++}
++
++void dsh_unreserve_el3(void)
++{
++	int node, ret;
++	if (!probe_fdt || fdt_check_header(probe_fdt)) return;
++	node = fdt_path_offset(probe_fdt, "/reserved-memory/trustzone@fe800000");
++	ret = node < 0 ? node : fdt_del_node(probe_fdt, node);
++	printk(ret ? KERN_ERR : KERN_NOTICE,
++	       "[dt] unreserve EL3 result=%d; diagnostic A/B only\n", ret);
++}
++
++/* Updated from vmlinux by build_mainline.sh. */
++#define DSH_MARKER_PHYS 0x913d3960UL
++#define DSH_REGS_PHYS 0x913d3968UL
++#define DSH_DIAG_PHYS 0x913d3700UL
++#define DSH_DIAG_BUILD_ID 0x18dff874314c6416UL
++#define DSH_DIAG_TEST_PHYS 0x913d3a50UL
+ 
+-void boot_kernel(void* dt, void* kernel, void* ramdisk)
++static unsigned long diag_run_id;
++
++/* The loader runs with M=0, where unaligned Device accesses fault even
++ * with SCTLR.A clear.  In particular, memcpy's end-relative word loads
++ * are unsafe for a retained message whose length is not word aligned.
++ * Volatile byte accesses also prevent the compiler widening this loop. */
++static void diag_copy_bytes(void *dst, const void *src, unsigned long bytes)
+ {
++	volatile unsigned char *d = dst;
++	const volatile unsigned char *s = src;
++	while (bytes--)
++		*d++ = *s++;
++}
++
++static unsigned long diag_checksum(const struct dsh_diag_record *r)
++{
++	const unsigned char *p = (const unsigned char *)r;
++	unsigned long hash = 0xcbf29ce484222325UL;
++	for (unsigned int i = 0; i < sizeof(*r); ++i) {
++		hash ^= i >= 88 && i < 96 ? 0 : p[i];
++		hash *= 0x100000001b3UL;
++	}
++	return hash;
++}
++
++void dsh_arm_diag_record(unsigned long test_mode)
++{
++	struct dsh_diag_record r;
++	memset(&r, 0, sizeof(r));
++	r.magic = DSH_DIAG_MAGIC;
++	r.version = 1;
++	r.bytes = sizeof(r);
++	r.build_id = DSH_DIAG_BUILD_ID;
++	r.run_id = ++diag_run_id;
++	r.checksum = diag_checksum(&r);
++	diag_copy_bytes((void *)DSH_DIAG_PHYS, &r, sizeof(r));
++	*(volatile unsigned long *)DSH_DIAG_TEST_PHYS = test_mode;
++	printk(KERN_NOTICE, "[diagrec] armed build=%016lx run=%lu PA=%08lx test=%lu\n",
++	       r.build_id, r.run_id, (unsigned long)DSH_DIAG_PHYS, test_mode);
++}
++
++static void dsh_previous_record(void)
++{
++	struct dsh_diag_record r;
++	diag_copy_bytes(&r, (const void *)DSH_DIAG_PHYS, sizeof(r));
++	if (r.magic != DSH_DIAG_MAGIC || r.version != 1 || r.bytes != sizeof(r) ||
++	    r.text_len >= sizeof(r.text) || diag_checksum(&r) != r.checksum) {
++		printk(KERN_NOTICE, "[diagrec] no valid retained record\n");
++		return;
++	}
++	diag_run_id = r.run_id;
++	printk(KERN_NOTICE, "[diagrec] previous build=%016lx run=%lu seq=%lu matching=%lu\n",
++	       r.build_id, r.run_id, r.sequence,
++	       (unsigned long)(r.build_id == DSH_DIAG_BUILD_ID));
++	printk(KERN_NOTICE, "[diagrec] stage=%016lx initcall=%016lx caller=%016lx fmt=%016lx\n",
++	       r.stage, r.initcall, r.caller, r.fmt);
++	for (unsigned int off = 0; off < r.text_len; off += 128) {
++		char line[129];
++		unsigned int n = r.text_len - off;
++		if (n > 128) n = 128;
++		diag_copy_bytes(line, r.text + off, n);
++		line[n] = 0;
++		printk(KERN_NOTICE, "[diagrec] text: %s\n", line);
++	}
++}
++
++int dsh_arm_probe(unsigned int stage)
++{
++	unsigned long el, sctlr, spsel;
++	asm volatile("mrs %0, CurrentEL" : "=r"(el));
++	asm volatile("mrs %0, SCTLR_EL1" : "=r"(sctlr));
++	asm volatile("mrs %0, SPSel" : "=r"(spsel));
++	if (el != 4 || (sctlr & 1) || spsel != 1 || stage < 1 || stage > 69) {
++		printk(KERN_ERR, "[probe] requires EL1, MMU off, SP_EL1 and stage 1..69\n");
++		return -1;
++	}
++	volatile unsigned long *r = (volatile unsigned long *)DSH_REGS_PHYS;
++	for (unsigned int i = 0; i < 24; ++i) r[i] = 0;
++	r[12] = (unsigned long)dsh_probe_return;
++	r[13] = stage;
++	r[15] = 0x44534850524f4245UL;
++	printk(KERN_NOTICE, "[probe] armed stage=%u callback=%08lx regs=%08lx\n",
++	       stage, r[12], (unsigned long)DSH_REGS_PHYS);
++	return 0;
++}
++
++void dsh_report_probe(unsigned long result)
++{
++	static const char *const names[] = {
++		"invalid", "kernel entry", "identity map built", "CPU setup complete",
++		"MMU enable returned", "kernel mapping built", "relocation complete",
++		"high virtual entry", "initial task and stack installed",
++		"BSS cleared", "early FDT mapping returned", "before start_kernel",
++		"C start_kernel entry",
++		/* DSH: setup_machine_fdt 内部的 C 检查点 */
++		"setup_machine_fdt entry", "DT fixmap mapped",
++		"before DT scan", "DT scan OK",
++		"before RO remap", "RO remap returned",
++		"machine name read", "setup_machine_fdt done",
++		"setup_machine_fdt returned",
++		"jump_label done", "early params done", "DAIF restored",
++		"before idmap uninstall", "idmap uninstalled", "memblock done",
++		"paging_init done", "DT unflattened", "bootmem done",
++		"PSCI init done",
++		/* start_kernel 后半段 */
++		"after setup_arch", "trap_init done", "mm_core_init done",
++		"sched_init done", "time_init done", "before console_init",
++		"console_init done", "before rest_init",
++		/* time_init 内部 */
++		"time_init entry", "of_clk_init done", "timer_probe done",
++		"hrtimer broadcast", "arch timer rate", "time_init done",
++		"timekeeping_init done",
++		/* timekeeping_init 内部 */
++		"tk entry", "tk persistent clock", "tk before lock", "tk lock held",
++		"tk ntp done", "tk clk enable", "tk setup internals", "tk done",
++		/* start_kernel 中段（sched_init 之后）*/
++		"housekeeping done", "workqueue early done", "rcu_init done",
++		"trace_init done", "ctx tracking done", "before early_irq_init",
++		"early_irq_init done", "init_IRQ(GIC) done", "tick_init done",
++		"rcu_nohz done", "init_timers done", "srcu_init done"
++	};
++	volatile unsigned long *r = (volatile unsigned long *)DSH_REGS_PHYS;
++	if (result == 0x8000) {
++		printk(KERN_ERR, "[probe] EARLY EXCEPTION after checkpoint=%lu\n", r[14]);
++		printk(KERN_ERR, "[probe] ESR=%016lx FAR=%016lx ELR=%016lx\n",
++		       r[8], r[9], r[10]);
++	} else {
++		printk(KERN_NOTICE, "[probe] reached %lu: %s\n", result,
++		       result < sizeof(names)/sizeof(names[0]) ? names[result] : "invalid");
++	}
++	printk(KERN_NOTICE, "[probe] SCTLR=%016lx M=%lu C=%lu I=%lu EL=%lu\n",
++	       r[2], r[2]&1, (r[2]>>2)&1, (r[2]>>12)&1, r[6]>>2);
++	printk(KERN_NOTICE, "[probe] TCR=%016lx MAIR=%016lx\n", r[0], r[1]);
++	printk(KERN_NOTICE, "[probe] TTBR0=%016lx TTBR1=%016lx SP=%016lx\n",
++	       r[4], r[3], r[5]);
++	/* DSH: 设备树诊断（由内核 setup_machine_fdt 写入）
++	 * r[20]=引导程序给的 DT 物理地址 r[21]=映射后虚拟地址(0=失败) r[22]=size */
++	printk(KERN_NOTICE, "[probe] DT phys=%016lx virt=%016lx size=%08lx\n",
++	       r[20], r[21], r[22]);
++	printk(KERN_NOTICE, "[probe] pgalloc PA=%016lx count=%lu phase=%lu\n",
++	       r[16], r[17], r[18]);
++	/* A normal boot must never reuse the diagnostic callback. */
++	r[15] = 0;
++	r[12] = 0;
++	printk(KERN_NOTICE, "[probe] loader context restored; USB commands available\n");
++}
++
++static void dsh_previous_boot(void)
++{
++	volatile unsigned long *r = (volatile unsigned long *)DSH_REGS_PHYS;
++	unsigned long marker = *(volatile unsigned long *)DSH_MARKER_PHYS;
++
++	printk(KERN_WARNING, "[prev] marker@%08lx=%016lx (may be stale)\n",
++	       (unsigned long)DSH_MARKER_PHYS, marker);
++
++	/* DSH: 无条件打印全部 dsh_regs，便于在任何挂死情形下定位。
++	 * 内核早期的最小异常处理器会把现场写进 [8..11]：
++	 *   r[8]=ESR  r[9]=FAR  r[10]=ELR  r[11]=handler_step
++	 * 之前只在 marker==0x2800 时才打印，别的挂死形态就看不到现场。*/
++	printk(KERN_WARNING, "[prev] r[00..07]=%016lx %016lx %016lx %016lx %016lx %016lx %016lx %016lx\n",
++	       r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
++	printk(KERN_WARNING, "[prev] r[08..15]=%016lx %016lx %016lx %016lx %016lx %016lx %016lx %016lx\n",
++	       r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]);
++	printk(KERN_WARNING, "[prev] r[16..23]=%016lx %016lx %016lx %016lx %016lx %016lx %016lx %016lx\n",
++	       r[16], r[17], r[18], r[19], r[20], r[21], r[22], r[23]);
++
++	if (marker == 0x2800)
++		printk(KERN_WARNING, "[prev] >>> ?: step=%lu ESR=%016lx FAR=%016lx ELR=%016lx\n",
++		       r[11], r[8], r[9], r[10]);
++	if (r[11] >= 1 && r[11] <= 5 && r[8] != 0xdead)
++		printk(KERN_WARNING, "[prev] >>> ?: step=%lu ESR=%016lx FAR=%016lx ELR=%016lx\n",
++		       r[11], r[8], r[9], r[10]);
++}
++
++void boot_kernel(void *dt, void *kernel, void *ramdisk)
++{
++	/* DSH: 不再自动打印 ramoops —— 6KB 输出会塞满 USB 发送缓冲
++	 * 导致 loader 控制台死掉。改为按需：send "prevlog"。*/
++	dsh_previous_boot();
++	dsh_previous_record();
+ #ifdef CONFIG_LIBFDT
+ 	patch_dtb(&dt);
+ #endif
+-
++	probe_fdt = dt;
++	dsh_pstore_init(dt);
+ 	printk(KERN_INFO, "Booting kernel...\n");
+ 	arch_load_kernel(kernel, dt, ramdisk);
+ }
+diff --git a/main/diag.c b/main/diag.c
+new file mode 100644
+index 0000000..a353f3f
+--- /dev/null
++++ b/main/diag.c
+@@ -0,0 +1,332 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * 诊断与自动修复模块 —— 为 SM-G9209 (zeroflte) 主线移植调试加入
++ *
++ * 目的：在没有串口线的情况下，把内核拿到的关键硬件状态打到屏幕上，
++ *       并把已知会导致内核在极早期挂死的 DT 缺陷当场补上。
++ *
++ * 背景：该机型 S-Boot 不会为内核配置 ARM 通用定时器寄存器（CNTFRQ_EL0），
++ *       而 mainline 的 arch timer 驱动在缺少
++ *         - clock-frequency
++ *         - arm,cpu-registers-not-fw-configured
++ *       两个属性时，会去读 CNTFRQ；若该寄存器为 0，内核在 time_init 阶段
++ *       即挂死 —— 现象为：跳转后完全无输出。
++ */
++
++#include <lib/debug.h>
++#include <main/boot.h>
++#include <lib/libfdt/libfdt.h>
++#include <drivers/usb-console.h>
++
++#define TIMER_FREQ_HZ	24000000UL	/* 0x16e3600，与原厂 DT 一致 */
++
++struct arm64_image_header {
++	uint32_t code0;
++	uint32_t code1;
++	uint64_t text_offset;
++	uint64_t image_size;
++	uint64_t flags;
++	uint64_t res2, res3, res4;
++	uint32_t magic;
++	uint32_t res5;
++};
++
++/*
++ * 跳转前把可能残留在 D-cache 里的脏数据写回内存并失效。
++ * arm64 引导协议要求内核入口时 cache 处于干净/关闭状态；uniLoader
++ * 做过的 memcpy（内核镜像、initramfs）如果不写回，内核读到的可能是旧数据。
++ */
++static void dcache_clean_inval(unsigned long start, unsigned long end)
++{
++	unsigned long p;
++	for (p = start & ~63UL; p < end; p += 64)
++		asm volatile("dc civac, %0" :: "r"(p) : "memory");
++	asm volatile("dsb sy" ::: "memory");
++	asm volatile("isb" ::: "memory");
++}
++
++/* Run after all DT changes and after stopping USB DMA, immediately before
++ * kernel entry. The old diagnostic-time flush happened before fdt_setprop. */
++/* DSH: 由 setcmd 命令设置，会被拼进 bootargs 供内核侧 /init 读取。*/
++char dsh_user_cmd[1024] = {0};
++
++int dsh_apply_user_command(void *dt)
++{
++	/* DSH-SMP-BISECT (2026-10-18): maxcpus=1 -> 2 so that smp_init()
++	 * actually issues the first PSCI CPU_ON. Restore to maxcpus=1 when the
++	 * bisect is finished: this file is the only place that takes effect
++	 * (/chosen/bootargs from the board DTS is overwritten here). */
++	static const char args[] =
++		/* DSH 2026-10-20: 降噪提速。
++		 * 原来是 loglevel=8 + systemd.log_level=debug + show_status=1，
++		 * 每个 systemd 消息都要写 115200 baud 的 USB 串口 + journal，
++		 * 实测把启动拖慢到 90 秒还在 udev，GNOME 迟迟出不来。
++		 * 改成 loglevel=4 + systemd.log_level=warning，串口只留警告以上。 */
++		"console=tty0 console=ttyGS0 loglevel=4 nohz=off panic=10 clocksource=arch_sys_counter rcu_cpu_stall_suppress=1 rcupdate.rcu_cpu_stall_suppress=1 systemd.log_level=warning systemd.log_target=kmsg systemd.log_color=0 systemd.show_status=0 "
++		"clk_ignore_unused pd_ignore_unused deferred_probe_timeout=0 "
++		"rodata=off keep_bootcon mitigations=off nokaslr kpti=off";
++	int node = fdt_path_offset(dt, "/chosen");
++	int ret;
++	if (node < 0) return node;
++	ret = fdt_setprop(dt, node, "bootargs", args, sizeof(args));
++	if (ret) return ret;
++	/* A DT string preserves shell spaces/quotes without turning them into
++	 * kernel parameters or init argv. Apply after the USB command, at boot. */
++	if (dsh_user_cmd[0])
++		ret = fdt_setprop(dt, node, "g9209,command", dsh_user_cmd,
++				 strlen(dsh_user_cmd) + 1);
++	else {
++		ret = fdt_delprop(dt, node, "g9209,command");
++		if (ret == -FDT_ERR_NOTFOUND) ret = 0;
++	}
++	printk(ret ? KERN_ERR : KERN_NOTICE,
++	       "[cmd] applied bytes=%lu in /chosen/g9209,command result=%d\n",
++	       (unsigned long)strlen(dsh_user_cmd), ret);
++	return ret;
++}
++
++void arch_prepare_kernel(void *dt)
++{
++	extern char _reloc_start[], _reloc_end[];
++	/* Preserve inherited PERIS parents and enable register access for
++	 * MCT (bit 5) and WDT_APL (bit 7); do not reprogram a shared PLL. */
++	{
++		volatile unsigned int *gate = (volatile unsigned int *)0x10040900UL;
++		unsigned int before = *gate;
++		*gate = before | (1u << 5) | (1u << 7);
++		__asm__ __volatile__("dsb sy" ::: "memory");
++		printk(KERN_NOTICE, "[handoff] PERIS gate 0x10040900: %08x -> %08x (MCT|WDT)\n",
++		       before, *gate);
++	}
++	/* CNTFRQ is metadata, not a counter enable. It is writable only at the
++	 * highest implemented EL (EL3 here), so never write it from this EL1
++	 * loader. Linux gets the known 24 MHz rate from the FDT instead. */
++	{
++		unsigned long frq, c0, c1;
++		asm volatile("mrs %0, cntfrq_el0" : "=r"(frq));
++		asm volatile("isb; mrs %0, cntpct_el0" : "=r"(c0) :: "memory");
++		for (volatile unsigned int i = 0; i < 100000; i++)
++			asm volatile("nop" ::: "memory");
++		asm volatile("isb; mrs %0, cntpct_el0" : "=r"(c1) :: "memory");
++		printk(KERN_NOTICE, "[handoff] CNTFRQ=%lu (read-only); CNTPCT %lu -> %lu delta=%lu\n",
++		       frq, c0, c1, c1 - c0);
++	}
++	printk(KERN_NOTICE, "[handoff] clean kernel payload\n");
++	dcache_clean_inval(CONFIG_PAYLOAD_ENTRY,
++		CONFIG_PAYLOAD_ENTRY + (unsigned long)&kernel_size);
++#ifndef CONFIG_RAMDISK_NO_COPY
++	printk(KERN_NOTICE, "[handoff] clean ramdisk\n");
++	dcache_clean_inval(CONFIG_RAMDISK_ENTRY,
++		CONFIG_RAMDISK_ENTRY + (unsigned long)&ramdisk_size);
++#endif
++	printk(KERN_NOTICE, "[handoff] clean FDT\n");
++	dcache_clean_inval((unsigned long)dt,
++		(unsigned long)dt + fdt_totalsize(dt));
++	printk(KERN_NOTICE, "[handoff] clean loader region\n");
++	dcache_clean_inval((unsigned long)_reloc_start, (unsigned long)_reloc_end);
++	asm volatile("ic iallu; dsb sy; isb" ::: "memory");
++	printk(KERN_NOTICE, "[handoff] cache preparation complete\n");
++}
++
++/* Probe entry enforces EL1 M=0, so CPU data accesses are uncached. Publish
++ * and invalidate the USB arena first; no dirty cached CPU alias may race
++ * with DMA when the common preparation cleans the full loader range. */
++void arch_prepare_probe(void *dt)
++{
++	dcache_clean_inval(CONFIG_PAYLOAD_ENTRY,
++		CONFIG_PAYLOAD_ENTRY + ((volatile unsigned long *)CONFIG_PAYLOAD_ENTRY)[2]);
++	usb_console_flush_dma();
++	arch_prepare_kernel(dt);
++}
++
++extern unsigned long kernel_size;
++extern unsigned long ramdisk_size;
++
++void arch_diag(void *dt)
++{
++	printk(KERN_INFO, "[cache] clean+inval ? %lu ? / initramfs %lu ?\n",
++	       (unsigned long)&kernel_size, (unsigned long)&ramdisk_size);
++	dcache_clean_inval(CONFIG_PAYLOAD_ENTRY,
++			   CONFIG_PAYLOAD_ENTRY + (unsigned long)&kernel_size);
++#ifndef CONFIG_RAMDISK_NO_COPY
++	dcache_clean_inval(CONFIG_RAMDISK_ENTRY,
++			   CONFIG_RAMDISK_ENTRY + (unsigned long)&ramdisk_size);
++#endif
++	dcache_clean_inval(0x47000000UL, 0x48000000UL);	/* uniLoader 自身/栈 */
++#ifdef CONFIG_FRAMEBUFFER_BASE
++	dcache_clean_inval(CONFIG_FRAMEBUFFER_BASE, CONFIG_FRAMEBUFFER_BASE + 0x1000000);
++#endif
++	printk(KERN_INFO, "[cache] ?\n");
++
++
++	unsigned long el, cntfrq, midr, mpidr, sctlr;
++	struct arm64_image_header *h;
++	const void *p;
++	uint32_t v;
++	int off, ret;
++
++	/* ---------- CPU / 定时器状态 ---------- */
++	asm volatile("mrs %0, CurrentEL" : "=r"(el));
++	el = (el >> 2) & 3;
++	asm volatile("mrs %0, CNTFRQ_EL0" : "=r"(cntfrq));
++	asm volatile("mrs %0, MIDR_EL1" : "=r"(midr));
++	asm volatile("mrs %0, MPIDR_EL1" : "=r"(mpidr));
++
++	printk(KERN_INFO, "[diag] EL%lu CNTFRQ=%luHz MIDR=%08lx MPIDR=%08lx\n",
++	       el, cntfrq, midr, mpidr);
++
++	if (el >= 2) {
++		asm volatile("mrs %0, SCTLR_EL2" : "=r"(sctlr));
++		printk(KERN_INFO, "[diag] SCTLR_EL2=%08lx MMU=%lu\n", sctlr, sctlr & 1);
++		if (!cntfrq && el == 3) {
++			asm volatile("msr CNTFRQ_EL0, %0" :: "r"((unsigned long)TIMER_FREQ_HZ));
++			asm volatile("mrs %0, CNTFRQ_EL0" : "=r"(cntfrq));
++			printk(KERN_WARNING, "[fix] CNTFRQ=0 ? %lu -> ? %lu\n",
++			       (unsigned long)TIMER_FREQ_HZ, cntfrq);
++		}
++	} else {
++		asm volatile("mrs %0, SCTLR_EL1" : "=r"(sctlr));
++		printk(KERN_INFO, "[diag] SCTLR_EL1=%08lx MMU=%lu\n", sctlr, sctlr & 1);
++		if (!cntfrq)
++			printk(KERN_ERR, "[warn] CNTFRQ=0 ? EL1? DT ?\n");
++	}
++
++	/* ---------- 内核镜像头（确认 payload 正确）---------- */
++	h = (struct arm64_image_header *)CONFIG_PAYLOAD_ENTRY;
++	printk(KERN_INFO, "[diag] kimg code0=%08x code1=%08x magic=%08x\n",
++	       h->code0, h->code1, h->magic);
++	printk(KERN_INFO, "[diag] kimg text_off=%08x%08x img_size=%08x%08x flags=%08x%08x\n",
++	       (unsigned)(h->text_offset >> 32), (unsigned)h->text_offset,
++	       (unsigned)(h->image_size >> 32), (unsigned)h->image_size,
++	       (unsigned)(h->flags >> 32), (unsigned)h->flags);
++	{
++		unsigned op0 = h->code0 >> 26, op1 = h->code1 >> 26;
++		if (op0 == 0x05 || op1 == 0x05)
++			printk(KERN_INFO, "[diag] ? OK (B ? @%s)\n",
++			       op0 == 0x05 ? "code0" : "code1");
++		else
++			printk(KERN_ERR, "[diag] ? FAIL (? EFI/PE ?)\n");
++	}
++
++	/* ---------- DT: /timer 检查与修补 ---------- */
++	off = fdt_path_offset(dt, "/timer");
++	printk(KERN_INFO, "[diag] /timer off=%d\n", off);
++	if (off >= 0) {
++		p = fdt_getprop(dt, off, "clock-frequency", NULL);
++		if (p) {
++			printk(KERN_INFO, "[diag] clock-frequency=%u\n", fdt32_to_cpu(*(const uint32_t *)p));
++		} else {
++			v = cpu_to_fdt32((uint32_t)TIMER_FREQ_HZ);
++			ret = fdt_setprop(dt, off, "clock-frequency", &v, 4);
++			printk(KERN_WARNING, "[fix] ? clock-frequency=%lu ret=%d\n",
++			       (unsigned long)TIMER_FREQ_HZ, ret);
++		}
++		if (!fdt_getprop(dt, off, "arm,cpu-registers-not-fw-configured", NULL)) {
++			ret = fdt_setprop(dt, off, "arm,cpu-registers-not-fw-configured", NULL, 0);
++			printk(KERN_WARNING, "[fix] ? cpu-registers-not-fw-configured ret=%d\n", ret);
++		} else {
++			printk(KERN_INFO, "[diag] not-fw-configured ?\n");
++		}
++	}
++
++	/* ---------- DT: model / memory ---------- */
++	p = fdt_getprop(dt, fdt_path_offset(dt, "/"), "model", NULL);
++	if (p)
++		printk(KERN_INFO, "[diag] model=%s\n", (const char *)p);
++	off = fdt_path_offset(dt, "/memory@40000000");
++	if (off < 0)
++		off = fdt_path_offset(dt, "/memory");
++	if (off >= 0) {
++		p = fdt_getprop(dt, off, "reg", NULL);
++		if (p) {
++			const uint32_t *r = (const uint32_t *)p;
++			printk(KERN_INFO, "[diag] mem base=%08x%08x size=%08x%08x\n",
++			       fdt32_to_cpu(r[0]), fdt32_to_cpu(r[1]),
++			       fdt32_to_cpu(r[2]), fdt32_to_cpu(r[3]));
++		}
++	}
++
++	/* ---------- DSH: 拷贝后校验 —— 内核镜像是否真的进了 0x90000000 ---------- */
++	{
++		volatile unsigned long *pl = (volatile unsigned long *)0x90000000UL;
++		unsigned long c0 = pl[0] & 0xffffffffUL;
++
++		printk(KERN_WARNING, "[chk] ? payload[0]=%016lx payload[1]=%016lx\n", pl[0], pl[1]);
++		if (c0 == 0xd503201fUL)
++			printk(KERN_WARNING, "[chk] >>> OK ? 0x90000000?NOP+b ?\n");
++		else
++			printk(KERN_ERR, "[chk] >>> FAIL 0x90000000 ?\n");
++	}
++
++	/* ---------- 读 ID 寄存器：确认 TGran4 字段（内核据此判断能否开 MMU）---------- */
++	{
++		unsigned long mmfr0, pfr0;
++		printk(KERN_INFO, "[id] reading ID_AA64MMFR0_EL1 ...\n");
++		asm volatile("mrs %0, ID_AA64MMFR0_EL1" : "=r"(mmfr0));
++		printk(KERN_INFO, "[id] ID_AA64MMFR0 = %016lx\n", mmfr0);
++		printk(KERN_INFO, "[id]   PARange=%lu  TGran4=%lu  TGran16=%lu  TGran64=%lu\n",
++		       mmfr0 & 0xf, (mmfr0 >> 28) & 0xf, (mmfr0 >> 20) & 0xf, (mmfr0 >> 24) & 0xf);
++		if (((mmfr0 >> 28) & 0xf) > 1)
++			printk(KERN_ERR, "[id]   >>> TGran4 ? 0/1 -> ? __enable_mmu ?\n");
++		printk(KERN_INFO, "[id] reading ID_AA64PFR0_EL1 ...\n");
++		asm volatile("mrs %0, ID_AA64PFR0_EL1" : "=r"(pfr0));
++		printk(KERN_INFO, "[id] ID_AA64PFR0 = %016lx (EL0=%lu EL1=%lu EL2=%lu EL3=%lu)\n",
++		       pfr0, pfr0 & 0xf, (pfr0 >> 4) & 0xf, (pfr0 >> 8) & 0xf, (pfr0 >> 12) & 0xf);
++	}
++
++
++	/* ---------- DSH: 直接读硬件真实 MMU 寄存器（内核还没跑，这是 S-Boot 留下的真值）---------- */
++	{
++		unsigned long tcr, ttbr0, ttbr1, sctlr, mair, vbar;
++
++		printk(KERN_WARNING, "[real] ?...\n");
++		asm volatile("mrs %0, tcr_el1"   : "=r"(tcr));
++		asm volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
++		asm volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
++		asm volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
++		asm volatile("mrs %0, mair_el1"  : "=r"(mair));
++		asm volatile("mrs %0, vbar_el1"  : "=r"(vbar));
++		printk(KERN_WARNING, "[real] TCR_EL1  =%016lx\n", tcr);
++		printk(KERN_WARNING, "[real]   T0SZ=%lu T1SZ=%lu EPD0=%lu EPD1=%lu IPS=%lu\n",
++		       tcr & 0x3f, (tcr >> 16) & 0x3f, (tcr >> 22) & 1, (tcr >> 23) & 1, (tcr >> 32) & 7);
++		printk(KERN_INFO, "[real] inherited state with M=%lu; kernel will program its own TCR/TTBR\n",
++		       sctlr & 1);
++		printk(KERN_WARNING, "[real] TTBR0=%016lx TTBR1=%016lx\n", ttbr0, ttbr1);
++		printk(KERN_WARNING, "[real] SCTLR=%016lx MAIR=%016lx VBAR=%016lx\n", sctlr, mair, vbar);
++	}
++
++	/* ---------- /chosen: 打印并强制写入我们自己的 cmdline ---------- */
++	off = fdt_path_offset(dt, "/chosen");
++	printk(KERN_INFO, "[diag] /chosen off=%d\n", off);
++	if (off >= 0) {
++		p = fdt_getprop(dt, off, "bootargs", NULL);
++		if (p)
++			printk(KERN_WARNING, "[diag] ? bootargs: %s\n", (const char *)p);
++		else
++			printk(KERN_WARNING, "[diag] ? bootargs ?\n");
++
++		dsh_apply_user_command(dt);
++
++		/* 检查 simple-framebuffer 是否在 chosen 下（决定能否有屏幕输出）*/
++		p = fdt_getprop(dt, off, "linux,initrd-start", NULL);
++		if (p)
++			printk(KERN_INFO, "[diag] initrd-start=%08x%08x\n",
++			       fdt32_to_cpu(((const uint32_t *)p)[0]),
++			       fdt32_to_cpu(((const uint32_t *)p)[1]));
++		{
++			int c = fdt_first_subnode(dt, off);
++			while (c >= 0) {
++				printk(KERN_INFO, "[diag] chosen ?: %s\n", fdt_get_name(dt, c, NULL));
++				c = fdt_next_subnode(dt, c);
++			}
++			if (c == -FDT_ERR_NOTFOUND)
++				printk(KERN_INFO, "[diag] (chosen ?)\n");
++		}
++	}
++
++	/* CMU 探针已完成使命（定位到 cmu_top0 @0x105d0000），移除以免挂死 */
++
++	/* This board advertises the legacy PSCI 0.1 interface. Do not issue an
++	 * optional VERSION SMC before USB recovery and a reset guard exist. */
++	printk(KERN_INFO, "[diag] optional PSCI_VERSION deferred until USB console\n");
++}
+diff --git a/main/main.c b/main/main.c
+index 579def3..8a1e2c6 100644
+--- a/main/main.c
++++ b/main/main.c
+@@ -9,6 +9,7 @@
+ #include <main/boot.h>
+ #include <main/main.h>
+ #include <lib/debug.h>
++#include <drivers/usb-console.h>
+ 
+ extern struct board_data board_ops;
+ 
+diff --git a/main/pstore.c b/main/pstore.c
+new file mode 100644
+index 0000000..bdcfd70
+--- /dev/null
++++ b/main/pstore.c
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <main/boot.h>
++#include <main/pstore-ring.h>
++#include <lib/debug.h>
++#include <lib/libfdt/libfdt.h>
++
++static const void *pstore_fdt;
++
++void dsh_pstore_init(const void *dt)
++{
++	pstore_fdt = dt;
++}
++
++static unsigned long property(int node, const char *name)
++{
++	int len;
++	const fdt32_t *p = fdt_getprop(pstore_fdt, node, name, &len);
++	return p && len == 4 ? fdt32_to_cpu(*p) : 0;
++}
++
++static unsigned long power2(unsigned long n)
++{
++	unsigned long r = 0;
++	while (n) { r = r ? r << 1 : 1; n >>= 1; }
++	return r;
++}
++
++/* Match fs/pstore/ram.c allocation order: dmesg, console, pmsg, ftrace.
++ * ECC is deliberately rejected because it reduces each ring's data area. */
++static int zone(int pmsg, unsigned long *address, unsigned long *bytes)
++{
++	unsigned long base, total, record, console, message, trace, dump, used = 0;
++	const fdt32_t *reg;
++	int node, len;
++	if (!pstore_fdt || fdt_check_header(pstore_fdt)) return -1;
++	node = fdt_node_offset_by_compatible(pstore_fdt, -1, "ramoops");
++	if (node < 0 || property(node, "ecc-size")) return -1;
++	reg = fdt_getprop(pstore_fdt, node, "reg", &len);
++	if (!reg || len != 16 || fdt32_to_cpu(reg[0]) || fdt32_to_cpu(reg[2])) return -1;
++	base = fdt32_to_cpu(reg[1]); total = fdt32_to_cpu(reg[3]);
++	if (base < 0x40000000UL || !total || total > 0x100000UL ||
++	    base > 0x100000000UL - total) return -1;
++	record = power2(property(node, "record-size"));
++	console = power2(property(node, "console-size"));
++	message = power2(property(node, "pmsg-size"));
++	trace = power2(property(node, "ftrace-size"));
++	if (console + message + trace > total) return -1;
++	dump = total - console - message - trace;
++	if (record && dump) {
++		unsigned long count = dump / record;
++		if (!count) return -1;
++		used = (dump / count) * count;
++	}
++	*address = base + used + (pmsg ? console : 0);
++	*bytes = pmsg ? message : console;
++	return *bytes >= 12 ? 0 : -1;
++}
++
++static void dump_zone(int pmsg)
++{
++	unsigned long address, bytes, off, begin;
++	struct dsh_pram_view v;
++	char line[177];
++	unsigned int n = 0;
++	const char *tag = pmsg ? "pmsg" : "prevlog";
++	if (zone(pmsg, &address, &bytes)) {
++		printk(KERN_ERR, "[%s] unsupported or missing ramoops layout\n", tag);
++		return;
++	}
++	int result = dsh_pram_view((const volatile unsigned char *)address, bytes, &v);
++	printk(KERN_NOTICE, "[%s] zone=%08lx bytes=%lu validation=%d\n", tag, address, bytes, result);
++	if (result) {
++		printk(KERN_NOTICE, "[%s] no valid retained ring\n", tag);
++		return;
++	}
++	begin = v.size > 16384 ? v.size - 16384 : 0;
++	printk(KERN_NOTICE, "[%s] start=%lu size=%lu capacity=%lu offset=%lu\n",
++	       tag, v.start, v.size, v.capacity, begin);
++	/* Print chronological tail only, bounded below the loader transcript's
++	 * 128 KiB limit; old bytes and another zone are never scanned. */
++	for (off = begin; off < v.size; off++) {
++		unsigned char c = dsh_pram_byte(&v, off);
++		if (c != '\n') {
++			line[n++] = c >= 32 && c < 127 ? c : '.';
++			if (n < sizeof(line) - 1) continue;
++		}
++		line[n] = 0;
++		printk(KERN_NOTICE, "[%s] %s\n", tag, line);
++		n = 0;
++	}
++	if (n) { line[n] = 0; printk(KERN_NOTICE, "[%s] %s\n", tag, line); }
++	printk(KERN_NOTICE, "[%s] === end ===\n", tag);
++}
++
++void dsh_dump_ramoops(void) { dump_zone(0); }
++void dsh_dump_pmsg(void) { dump_zone(1); }

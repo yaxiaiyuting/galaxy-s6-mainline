@@ -1,0 +1,5 @@
+# 大文件（需要单独发布 Release）
+images/*.img
+*.bak-*
+*.o
+*.cmd

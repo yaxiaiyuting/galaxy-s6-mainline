@@ -1,0 +1,210 @@
+diff --git a/drivers/tty/tty_io.c b/drivers/tty/tty_io.c
+index 8a94e5a43..25e1114f2 100644
+--- a/drivers/tty/tty_io.c
++++ b/drivers/tty/tty_io.c
+@@ -75,6 +75,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/tty.h>
+ #include <linux/tty_driver.h>
++#include <linux/dsh_diag.h>
+ #include <linux/tty_flip.h>
+ #include <linux/devpts_fs.h>
+ #include <linux/file.h>
+@@ -3142,6 +3143,23 @@ int tty_put_char(struct tty_struct *tty, unsigned char ch)
+ }
+ EXPORT_SYMBOL_GPL(tty_put_char);
+ 
++static bool dsh_trace_vt_driver(const struct tty_driver *driver)
++{
++	return driver->type == TTY_DRIVER_TYPE_CONSOLE &&
++	       driver->major == TTY_MAJOR && driver->minor_start == 1;
++}
++
++/* Every completed step is also a progress heartbeat.  Preserve the tty
++ * index in the stage so a slow 63-device registration stays distinguishable
++ * from one device stuck in allocation, driver core, cdev, or uevent work.
++ */
++static void dsh_trace_vt_device(const struct tty_driver *driver,
++			      unsigned int index, unsigned long phase)
++{
++	if (dsh_trace_vt_driver(driver))
++		dsh_mark(0x460000UL | ((unsigned long)index << 8) | phase);
++}
++
+ static int tty_cdev_add(struct tty_driver *driver, dev_t dev,
+ 		unsigned int index, unsigned int count)
+ {
+@@ -3231,6 +3249,7 @@ struct device *tty_register_device_attr(struct tty_driver *driver,
+ 	else
+ 		tty_line_name(driver, index, name);
+ 
++	dsh_trace_vt_device(driver, index, 1);
+ 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+ 	if (!dev)
+ 		return ERR_PTR(-ENOMEM);
+@@ -3245,7 +3264,9 @@ struct device *tty_register_device_attr(struct tty_driver *driver,
+ 
+ 	dev_set_uevent_suppress(dev, 1);
+ 
++	dsh_trace_vt_device(driver, index, 2);
+ 	retval = device_register(dev);
++	dsh_trace_vt_device(driver, index, 3);
+ 	if (retval)
+ 		goto err_put;
+ 
+@@ -3260,13 +3281,17 @@ struct device *tty_register_device_attr(struct tty_driver *driver,
+ 			kfree(tp);
+ 		}
+ 
++		dsh_trace_vt_device(driver, index, 4);
+ 		retval = tty_cdev_add(driver, devt, index, 1);
++		dsh_trace_vt_device(driver, index, 5);
+ 		if (retval)
+ 			goto err_del;
+ 	}
+ 
+ 	dev_set_uevent_suppress(dev, 0);
++	dsh_trace_vt_device(driver, index, 6);
+ 	kobject_uevent(&dev->kobj, KOBJ_ADD);
++	dsh_trace_vt_device(driver, index, 7);
+ 
+ 	return dev;
+ 
+@@ -3416,6 +3441,10 @@ int tty_register_driver(struct tty_driver *driver)
+ 	int i;
+ 	dev_t dev;
+ 	struct device *d;
++	bool trace_vt = dsh_trace_vt_driver(driver);
++
++	if (trace_vt)
++		dsh_mark(0x4600);
+ 
+ 	if (!driver->major) {
+ 		error = alloc_chrdev_region(&dev, driver->minor_start,
+@@ -3430,6 +3459,8 @@ int tty_register_driver(struct tty_driver *driver)
+ 	}
+ 	if (error < 0)
+ 		goto err;
++	if (trace_vt)
++		dsh_mark(0x4601);
+ 
+ 	if (driver->flags & TTY_DRIVER_DYNAMIC_ALLOC) {
+ 		error = tty_cdev_add(driver, dev, 0, driver->num);
+@@ -3437,9 +3468,15 @@ int tty_register_driver(struct tty_driver *driver)
+ 			goto err_unreg_char;
+ 	}
+ 
++	if (trace_vt)
++		dsh_mark(0x4602);
+ 	mutex_lock(&tty_mutex);
++	if (trace_vt)
++		dsh_mark(0x4603);
+ 	list_add(&driver->tty_drivers, &tty_drivers);
+ 	mutex_unlock(&tty_mutex);
++	if (trace_vt)
++		dsh_mark(0x4604);
+ 
+ 	if (!(driver->flags & TTY_DRIVER_DYNAMIC_DEV)) {
+ 		for (i = 0; i < driver->num; i++) {
+@@ -3450,7 +3487,11 @@ int tty_register_driver(struct tty_driver *driver)
+ 			}
+ 		}
+ 	}
++	if (trace_vt)
++		dsh_mark(0x4605);
+ 	proc_tty_register_driver(driver);
++	if (trace_vt)
++		dsh_mark(0x4606);
+ 	driver->flags |= TTY_DRIVER_INSTALLED;
+ 	return 0;
+ 
+@@ -3617,25 +3658,33 @@ static struct ctl_table tty_table[] = {
+  */
+ int __init tty_init(void)
+ {
++	extern void dsh_mark(unsigned long);
++	dsh_mark(0x4410);
+ 	register_sysctl_init("dev/tty", tty_table);
++	dsh_mark(0x4411);
+ 	cdev_init(&tty_cdev, &tty_fops);
+ 	if (cdev_add(&tty_cdev, MKDEV(TTYAUX_MAJOR, 0), 1) ||
+ 	    register_chrdev_region(MKDEV(TTYAUX_MAJOR, 0), 1, "/dev/tty") < 0)
+ 		panic("Couldn't register /dev/tty driver\n");
++	dsh_mark(0x4412);
+ 	device_create(&tty_class, NULL, MKDEV(TTYAUX_MAJOR, 0), NULL, "tty");
++	dsh_mark(0x4413);
+ 
+ 	cdev_init(&console_cdev, &console_fops);
+ 	if (cdev_add(&console_cdev, MKDEV(TTYAUX_MAJOR, 1), 1) ||
+ 	    register_chrdev_region(MKDEV(TTYAUX_MAJOR, 1), 1, "/dev/console") < 0)
+ 		panic("Couldn't register /dev/console driver\n");
++	dsh_mark(0x4414);
+ 	consdev = device_create_with_groups(&tty_class, NULL,
+ 					    MKDEV(TTYAUX_MAJOR, 1), NULL,
+ 					    cons_dev_groups, "console");
+ 	if (IS_ERR(consdev))
+ 		consdev = NULL;
++	dsh_mark(0x4415);
+ 
+ #ifdef CONFIG_VT
+ 	vty_init(&console_fops);
+ #endif
++	dsh_mark(0x4417);
+ 	return 0;
+ }
+diff --git a/drivers/tty/vt/vt.c b/drivers/tty/vt/vt.c
+index 5c47f7780..b390eb918 100644
+--- a/drivers/tty/vt/vt.c
++++ b/drivers/tty/vt/vt.c
+@@ -75,6 +75,7 @@
+ #include <linux/types.h>
+ #include <linux/sched/signal.h>
+ #include <linux/tty.h>
++#include <linux/dsh_diag.h>
+ #include <linux/tty_flip.h>
+ #include <linux/kernel.h>
+ #include <linux/string.h>
+@@ -3529,6 +3530,7 @@ ATTRIBUTE_GROUPS(vt_dev);
+ 
+ int __init vty_init(const struct file_operations *console_fops)
+ {
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4301); }	/* vty_init 入口 */
+ 	cdev_init(&vc0_cdev, console_fops);
+ 	if (cdev_add(&vc0_cdev, MKDEV(TTY_MAJOR, 0), 1) ||
+ 	    register_chrdev_region(MKDEV(TTY_MAJOR, 0), 1, "/dev/vc/0") < 0)
+@@ -3539,26 +3541,35 @@ int __init vty_init(const struct file_operations *console_fops)
+ 	if (IS_ERR(tty0dev))
+ 		tty0dev = NULL;
+ 
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4302); }	/* /dev/tty0 注册完成 */
+ 	vcs_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4306); }
+ 
+ 	console_driver = tty_alloc_driver(MAX_NR_CONSOLES, TTY_DRIVER_REAL_RAW |
+ 			TTY_DRIVER_RESET_TERMIOS);
+ 	if (IS_ERR(console_driver))
+ 		panic("Couldn't allocate console driver\n");
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4303); }	/* tty_alloc_driver 成功 */
+ 
+ 	console_driver->name = "tty";
+ 	console_driver->name_base = 1;
+ 	console_driver->major = TTY_MAJOR;
+ 	console_driver->minor_start = 1;
+ 	console_driver->type = TTY_DRIVER_TYPE_CONSOLE;
++	dsh_mark(0x4310);
+ 	console_driver->init_termios = tty_std_termios;
++	dsh_mark(0x4311);
+ 	if (default_utf8)
+ 		console_driver->init_termios.c_iflag |= IUTF8;
+ 	tty_set_operations(console_driver, &con_ops);
++	dsh_mark(0x4307);
+ 	if (tty_register_driver(console_driver))
+ 		panic("Couldn't register console driver\n");
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4304); }	/* tty_register_driver 成功 */
+ 	kbd_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4308); }
+ 	console_map_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4305); }	/* ★ vty_init 全部完成 */
+ #ifdef CONFIG_MDA_CONSOLE
+ 	mda_console_init();
+ #endif

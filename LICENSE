@@ -1,0 +1,13 @@
+GNU GENERAL PUBLIC LICENSE
+Version 2, June 1991
+
+Copyright (C) 1989, 1991 Free Software Foundation, Inc.
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+
+Everyone is permitted to copy and distribute verbatim copies
+of this license document, but changing it is not allowed.
+
+[完整 GPL-2.0 文本见 https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt]
+
+本项目的 Linux 内核补丁遵循 GPL-2.0（Linux 内核要求）。
+文档部分遵循 CC BY-SA 4.0。

@@ -1,0 +1,709 @@
+diff --git a/init/Makefile b/init/Makefile
+index ec557ada3..2f6df073f 100644
+--- a/init/Makefile
++++ b/init/Makefile
+@@ -6,6 +6,7 @@
+ ccflags-y := -fno-function-sections -fno-data-sections
+ 
+ obj-y                          := main.o version.o mounts.o
++obj-y += dsh_debug.o dsh_watchdog.o
+ ifneq ($(CONFIG_BLK_DEV_INITRD),y)
+ obj-y                          += noinitramfs.o
+ else
+diff --git a/init/dsh_debug.c b/init/dsh_debug.c
+new file mode 100644
+index 000000000..797d3a2ca
+--- /dev/null
++++ b/init/dsh_debug.c
+@@ -0,0 +1,190 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/build_bug.h>
++#include <linux/dsh_diag.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <generated/dsh_build_id.h>
++
++/*
++ * DSH_MIN: 最小可靠观测变量。
++ *
++ * 由内核在启动早期写入进度值，由 uniLoader 在下次启动时读出，
++ * 并在下一次 uniLoader 启动时打印；跨重启内容可能被固件覆盖。
++ * S-Boot 的 pstore 区每次重写，不能用于可靠保留这些诊断数据。
++ *
++ * 这些变量必须位于常驻 .data（init/main.c 整体在 .init 段，会被释放）。
++ */
++volatile unsigned long dsh_marker = 0x1111UL;
++
++/*
++ * 注意：数组必须 >= 24 项！
++ * USB probe ABI: [0..6] CPU snapshot, [8..11] fault, [12] callback,
++ * [13] target, [14] last checkpoint, [15] magic, [23] exit guard.
++ * The callback is armed only by the board's EL1 diagnostic loader.
++ * 旧版 head.S 的页表上报代码会写 dsh_regs[16..19]。
++ * 数组太小时，额外写入会把紧随其后的 dsh_marker 覆盖掉，
++ * 导致读出的进度标记是垃圾值 —— 这个坑已经踩过一次。
++ */
++volatile unsigned long dsh_regs[24] = {
++	0xdead, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead,
++	0xdead, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead,
++	0xdead, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead
++};
++
++/* Nonzero initialization keeps the record in the loaded Image's .data.
++ * The loader supplies a fresh run_id before each entry; the build script
++ * synchronizes the physical address and DSH_BUILD_ID with that Image.
++ */
++struct dsh_diag_record dsh_diag __aligned(64) = {
++	.version = DSH_DIAG_VERSION,
++	.bytes = sizeof(struct dsh_diag_record),
++	.build_id = DSH_BUILD_ID,
++};
++
++static_assert(sizeof(struct dsh_diag_record) == DSH_DIAG_RECORD_BYTES);
++static_assert(offsetof(struct dsh_diag_record, checksum) == 88);
++static_assert(offsetof(struct dsh_diag_record, text) == 96);
++
++static DEFINE_RAW_SPINLOCK(dsh_diag_lock);
++static bool dsh_diag_fatal;
++
++/* Implemented by the board's normal-boot watchdog helper. Both are inert
++ * until its MMIO mappings are ready; no physical MMIO is accessed here.
++ */
++extern void dsh_diag_heartbeat(void);
++extern void dsh_diag_restart(void);
++
++static void dsh_diag_prepare(void)
++{
++	if (dsh_diag.magic == DSH_DIAG_MAGIC &&
++	    dsh_diag.version == DSH_DIAG_VERSION &&
++	    dsh_diag.bytes == sizeof(dsh_diag) &&
++	    dsh_diag.build_id == DSH_BUILD_ID)
++		return;
++
++	/* A normal boot without the diagnostic loader has run_id zero.
++	 * Never interpret a stale/foreign header as this run's identity.
++	 */
++	memset(&dsh_diag, 0, sizeof(dsh_diag));
++	dsh_diag.version = DSH_DIAG_VERSION;
++	dsh_diag.bytes = sizeof(dsh_diag);
++	dsh_diag.build_id = DSH_BUILD_ID;
++}
++
++static void dsh_diag_publish(void)
++{
++	const unsigned char *bytes = (const unsigned char *)&dsh_diag;
++	unsigned long hash = 14695981039346656037UL;
++	unsigned long address, end;
++	size_t i;
++
++	dsh_diag.magic = DSH_DIAG_MAGIC;
++	dsh_diag.checksum = 0;
++	for (i = 0; i < sizeof(dsh_diag); i++) {
++		hash ^= bytes[i];
++		hash *= 1099511628211UL;
++	}
++	dsh_diag.checksum = hash;
++
++	/* A reset may still interrupt this publication, so the reader must
++	 * validate build/run IDs and the full checksum before trusting it.
++	 */
++	address = (unsigned long)&dsh_diag;
++	end = address + sizeof(dsh_diag);
++	for (; address < end; address += 64)
++		asm volatile("dc cvac, %0" :: "r"(address) : "memory");
++	asm volatile("dsb sy" ::: "memory");
++}
++
++static void dsh_mark_legacy(unsigned long value)
++{
++	asm volatile("str %0, [%1]\n"
++		     "dc civac, %1\n"
++		     "dsb sy\n"
++		     :: "r"(value), "r"((unsigned long)&dsh_marker) : "memory");
++}
++
++/*
++ * DSH: 可靠的进度标记写入。
++ *
++ * 普通写入只会落在 D-cache 里；一旦复位，缓存被清空，DRAM 中可能仍是旧值 ——
++ * 读到的 marker 就失真了（已经踩过一次：读到 0x4133 但探针证明内核早已走过）。
++ * 这里写完立刻把该缓存行清理并写回 DRAM，再用 dsb sy 同步。
++ */
++void dsh_mark(unsigned long value)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&dsh_diag_lock, flags);
++	if (dsh_diag_fatal) {
++		raw_spin_unlock_irqrestore(&dsh_diag_lock, flags);
++		return;
++	}
++	dsh_diag_prepare();
++	dsh_diag.stage = value;
++	dsh_diag.sequence++;
++	if ((long)value < 0)
++		dsh_diag.initcall = value;
++	dsh_diag_publish();
++	dsh_mark_legacy(value);
++	raw_spin_unlock_irqrestore(&dsh_diag_lock, flags);
++	dsh_diag_heartbeat();
++}
++
++/* Publish a nonfatal observation without changing the recorded initcall,
++ * caller, or format pointer. The text remains available across subsequent
++ * numeric progress markers until another note or a panic replaces it.
++ */
++void dsh_diag_note(unsigned long stage, const char *message)
++{
++	unsigned long flags;
++	size_t length;
++
++	raw_spin_lock_irqsave(&dsh_diag_lock, flags);
++	if (dsh_diag_fatal) {
++		raw_spin_unlock_irqrestore(&dsh_diag_lock, flags);
++		return;
++	}
++	dsh_diag_prepare();
++	dsh_diag.stage = stage;
++	dsh_diag.sequence++;
++	length = message ? strnlen(message, sizeof(dsh_diag.text) - 1) : 0;
++	if (length)
++		memmove(dsh_diag.text, message, length);
++	memset(dsh_diag.text + length, 0, sizeof(dsh_diag.text) - length);
++	dsh_diag.text_len = length;
++	dsh_diag_publish();
++	dsh_mark_legacy(stage);
++	raw_spin_unlock_irqrestore(&dsh_diag_lock, flags);
++	dsh_diag_heartbeat();
++}
++
++void dsh_diag_panic(const char *message, unsigned long fmt,
++		    unsigned long caller)
++{
++	unsigned long flags;
++	size_t length;
++
++	/* panic() has selected its owning CPU before calling here. The
++	 * short IRQ-masked critical section serializes any last progress
++	 * update; no allocation, printk, or MMIO occurs while it is held.
++	 */
++	raw_spin_lock_irqsave(&dsh_diag_lock, flags);
++	if (!dsh_diag_fatal) {
++		dsh_diag_prepare();
++		dsh_diag_fatal = true;
++		dsh_diag.stage = 0x9999;
++		dsh_diag.sequence++;
++		dsh_diag.caller = caller;
++		dsh_diag.fmt = fmt;
++		memset(dsh_diag.text, 0, sizeof(dsh_diag.text));
++		length = message ? strnlen(message, sizeof(dsh_diag.text) - 1) : 0;
++		if (length)
++			memcpy(dsh_diag.text, message, length);
++		dsh_diag.text_len = length;
++		dsh_diag_publish();
++		dsh_mark_legacy(0x9999);
++	}
++	raw_spin_unlock_irqrestore(&dsh_diag_lock, flags);
++	dsh_diag_restart();
++}
+diff --git a/init/dsh_watchdog.c b/init/dsh_watchdog.c
+new file mode 100644
+index 000000000..1a453247f
+--- /dev/null
++++ b/init/dsh_watchdog.c
+@@ -0,0 +1,280 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SM-G9209 bootstrap diagnostic reset guard.
++ *
++ * This deliberately covers only normal boots on the bring-up board. USB
++ * probes own their watchdog in uniLoader and must not acquire a second owner.
++ * There is no background feeder: only an explicit progress heartbeat extends
++ * the countdown, so a stalled bootstrap eventually returns to the loader.
++ */
++#include <linux/bitops.h>
++#include <linux/compiler.h>
++#include <linux/delay.h>
++#include <linux/dsh_diag.h>
++#include <linux/errno.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/irqflags.h>
++#include <linux/kernel_stat.h>
++#include <linux/jiffies.h>
++#include <linux/sched.h>
++#include <linux/of.h>
++#include <linux/printk.h>
++#include <linux/sizes.h>
++#include <linux/string.h>
++
++#include <asm/barrier.h>
++#include <asm/processor.h>
++
++#define DSH_PROBE_MAGIC		0x44534850524f4245UL
++#define DSH_WDT_PHYS		0x10020000UL
++#define DSH_PMU_PHYS		0x105c0000UL
++
++#define DSH_WTCON		0x00
++#define DSH_WTDAT		0x04
++#define DSH_WTCNT		0x08
++#define DSH_WTCLRINT		0x0c
++#define DSH_WDT_CONTROL		0xff39U
++#define DSH_WDT_COUNT		0xffffU
++#define DSH_RESTART_COUNT	4096U
++
++#define DSH_PMU_SWRESET		0x0400
++#define DSH_PMU_AUTO_DISABLE	0x0408
++#define DSH_PMU_RESET_MASK	0x040c
++#define DSH_PMU_INFORM2		0x0808
++#define DSH_PMU_INFORM3		0x080c
++#define DSH_WDT_ATLAS		BIT(23)
++#define DSH_WDT_APOLLO		BIT(24)
++
++extern volatile unsigned long dsh_regs[24];
++unsigned long dsh_diag_test_mode __section(".data") = 0;
++
++/* Public hooks; declarations also live with the diagnostic record interface. */
++void dsh_diag_heartbeat(void);
++void dsh_diag_restart(void);
++void dsh_diag_boot_complete(void);
++void dsh_diag_tick_test(void);
++extern void dsh_diag_note(unsigned long stage, const char *message);
++
++static void __iomem *dsh_wdt;
++static void __iomem *dsh_pmu;
++static bool dsh_wdt_ready;
++static struct {
++	u32 first, last, control, automatic, mask;
++	u64 counter_delta;
++	unsigned int polls;
++	int result;
++} dsh_guard = { .result = -EAGAIN };
++
++void dsh_diag_tick_test(void)
++{
++	unsigned long j0, j1, irq0, irq1, ctl, count;
++	u64 c0, c1, c2, cval;
++	long remaining;
++	char text[384];
++	if (READ_ONCE(dsh_diag_test_mode) != 1 ||
++	    !smp_load_acquire(&dsh_wdt_ready))
++		return;
++	j0 = jiffies;
++	irq0 = kstat_cpu_irqs_sum(raw_smp_processor_id());
++	c0 = read_sysreg(cntpct_el0);
++
++	/* DSH: 先做两次最小间隔读，把读数直接写进记录。
++	 * 这样即使循环里再次卡死，读回记录也能立刻判断
++	 * CNTPCT_EL0 到底有没有在递增、CNTFRQ_EL0 是否为 0。*/
++	c2 = read_sysreg(cntpct_el0);
++	scnprintf(text, sizeof(text),
++		  "clockevent test begin: cntpct=%llu re-read=%llu delta=%llu cntfrq=%llu cntp_ctl=%lx",
++		  c0, c2, c2 - c0, read_sysreg(cntfrq_el0),
++		  (unsigned long)read_sysreg(cntp_ctl_el0));
++	dsh_diag_note(0x44a0, text);
++	dsh_diag_heartbeat();
++
++	/* DSH: 上限从 2500 万降到 200 万，并且每 10 万次显式喂一次狗。
++	 * 之前循环内完全不喂狗，一旦计数冻结就会静默超过看门狗时限。*/
++	c1 = c0;
++	for (count = 0; count < 2000000; count++) {
++		c1 = read_sysreg(cntpct_el0);
++		if (c1 - c0 >= 24000000)
++			break;
++		if ((count & 0xFFFFF) == 0)
++			dsh_diag_heartbeat();
++		cpu_relax();
++	}
++	dsh_diag_heartbeat();
++	j1 = jiffies;
++	irq1 = kstat_cpu_irqs_sum(raw_smp_processor_id());
++	ctl = read_sysreg(cntp_ctl_el0);
++	cval = read_sysreg(cntp_cval_el0);
++	scnprintf(text, sizeof(text),
++		  "tick: jiffies=%lu->%lu delta=%lu IRQ=%lu->%lu counter_delta=%llu CNTP_CTL=%lx CVAL=%llx counter=%llx IRQ_disabled=%d loops=%lu",
++		  j0, j1, j1-j0, irq0, irq1, c1-c0, ctl, cval, c1,
++		  irqs_disabled(), count);
++	dsh_diag_note(0x44a1, text);
++	/* The independent hardware guard bounds this sleep if the clockevent
++	 * is broken. A zero result proves a timer-driven wakeup occurred. */
++	dsh_mark(0x44a2);
++	remaining = schedule_timeout_uninterruptible(5);
++	scnprintf(text, sizeof(text), "tick wakeup: remaining=%ld jiffies=%lu", remaining, jiffies);
++	dsh_diag_note(remaining ? 0x44a4 : 0x44a3, text);
++}
++
++void dsh_diag_boot_complete(void)
++{
++	char text[DSH_DIAG_TEXT_BYTES], previous[192];
++
++	if (READ_ONCE(dsh_diag_test_mode) != 1) {
++		dsh_mark(0x4500);
++		return;
++	}
++	strscpy(previous, dsh_diag.text, sizeof(previous));
++	scnprintf(text, sizeof(text),
++		  "exec loaded: test=%lu guard=%u result=%d count=%u->%u control=%x PMU=%x/%x polls=%u counter_delta=%llu; %s",
++		  READ_ONCE(dsh_diag_test_mode),
++		  smp_load_acquire(&dsh_wdt_ready), dsh_guard.result,
++		  dsh_guard.first, dsh_guard.last, dsh_guard.control,
++		  dsh_guard.automatic, dsh_guard.mask, dsh_guard.polls,
++		  dsh_guard.counter_delta, previous);
++	dsh_diag_note(0x4500, text);
++	dsh_diag_restart();
++}
++
++void dsh_diag_heartbeat(void)
++{
++	if (!smp_load_acquire(&dsh_wdt_ready))
++		return;
++
++	writel(DSH_WDT_COUNT, dsh_wdt + DSH_WTCNT);
++}
++
++void dsh_diag_restart(void)
++{
++	/* Explicit test recovery can use the verified board PMU reset path
++	 * even if the WDT countdown check failed. No mappings are made here. */
++	if (!dsh_pmu || !dsh_wdt)
++		return;
++
++	/* Never allocate/map here: this hook may run after a fatal exception.
++	 * Stop further progress feeds before installing the short fallback. */
++	local_irq_disable();
++	WRITE_ONCE(dsh_wdt_ready, false);
++	writel(0x12345678U, dsh_pmu + DSH_PMU_INFORM2);
++	writel(0x12345670U, dsh_pmu + DSH_PMU_INFORM3);
++	dsb(sy);
++
++	writel(0, dsh_wdt + DSH_WTCON);
++	writel(1, dsh_wdt + DSH_WTCLRINT);
++	writel(DSH_RESTART_COUNT, dsh_wdt + DSH_WTDAT);
++	writel(DSH_RESTART_COUNT, dsh_wdt + DSH_WTCNT);
++	writel(DSH_WDT_CONTROL, dsh_wdt + DSH_WTCON);
++	dsb(sy);
++	writel(1, dsh_pmu + DSH_PMU_SWRESET);
++	dsb(sy);
++
++	pr_emerg("[dsh-wdt] PMU SWRESET returned; waiting for watchdog fallback\n");
++	for (;;)
++		cpu_relax();
++}
++
++static int __init dsh_diag_watchdog_init(void)
++{
++	u32 automatic, mask, first, second, control;
++	u64 begin, now;
++	unsigned int polls;
++	char text[256];
++
++	if (smp_load_acquire(&dsh_wdt_ready))
++		return 0;
++
++	if (!of_machine_is_compatible("samsung,zeroflte") ||
++	    READ_ONCE(dsh_regs[15]) == DSH_PROBE_MAGIC ||
++	    READ_ONCE(dsh_diag_test_mode) != 1)
++		return 0;
++
++	if (!dsh_wdt)
++		dsh_wdt = ioremap(DSH_WDT_PHYS, SZ_4K);
++	if (!dsh_wdt) {
++		dsh_guard.result = -ENOMEM;
++		return -ENOMEM;
++	}
++	if (!dsh_pmu)
++		dsh_pmu = ioremap(DSH_PMU_PHYS, SZ_4K);
++	if (!dsh_pmu) {
++		dsh_guard.result = -ENOMEM;
++		iounmap(dsh_wdt);
++		dsh_wdt = NULL;
++		return -ENOMEM;
++	}
++
++	/* The loader already enabled the PERIS register gate. Use the ARM64
++	 * Exynos7420 reset routing, not the unrelated legacy bit-zero mask. */
++	writel(0, dsh_wdt + DSH_WTCON);
++	writel(1, dsh_wdt + DSH_WTCLRINT);
++	automatic = readl(dsh_pmu + DSH_PMU_AUTO_DISABLE);
++	automatic &= ~(DSH_WDT_ATLAS | DSH_WDT_APOLLO);
++	writel(automatic, dsh_pmu + DSH_PMU_AUTO_DISABLE);
++	mask = readl(dsh_pmu + DSH_PMU_RESET_MASK);
++	mask &= ~DSH_WDT_APOLLO;
++	writel(mask, dsh_pmu + DSH_PMU_RESET_MASK);
++	writel(DSH_WDT_COUNT, dsh_wdt + DSH_WTDAT);
++	writel(DSH_WDT_COUNT, dsh_wdt + DSH_WTCNT);
++	writel(DSH_WDT_CONTROL, dsh_wdt + DSH_WTCON);
++	dsb(sy);
++	first = readl(dsh_wdt + DSH_WTCNT);
++	/* One WDT tick takes 32768 parent cycles. A fixed CPU spin can end
++	 * before that even with a live WDT. Poll the actual count, bounded by
++	 * 10 ms at the board's 24 MHz counter and an independent iteration cap.
++	 * No calibrated delay or working clockevent is required. */
++	begin = read_sysreg(cntpct_el0);
++	now = begin;
++	second = first;
++	for (polls = 0; polls < 1000000; polls++) {
++		second = readl(dsh_wdt + DSH_WTCNT);
++		now = read_sysreg(cntpct_el0);
++		if (second < first || now - begin >= 240000)
++			break;
++		cpu_relax();
++	}
++	control = readl(dsh_wdt + DSH_WTCON);
++	automatic = readl(dsh_pmu + DSH_PMU_AUTO_DISABLE);
++	mask = readl(dsh_pmu + DSH_PMU_RESET_MASK);
++	dsh_guard.first = first;
++	dsh_guard.last = second;
++	dsh_guard.control = control;
++	dsh_guard.automatic = automatic;
++	dsh_guard.mask = mask;
++	dsh_guard.polls = polls < 1000000 ? polls + 1 : polls;
++	dsh_guard.counter_delta = now - begin;
++	pr_notice("[dsh-wdt] bootstrap WTCON=%08x count=%u -> %u PMU=%08x/%08x\n",
++		  control, first, second, automatic, mask);
++	if (control != DSH_WDT_CONTROL || second >= first ||
++	    (automatic & (DSH_WDT_ATLAS | DSH_WDT_APOLLO)) ||
++	    (mask & DSH_WDT_APOLLO)) {
++		writel(0, dsh_wdt + DSH_WTCON);
++		dsb(sy);
++		pr_err("[dsh-wdt] bootstrap reset guard verification failed\n");
++		dsh_guard.result = -EIO;
++		scnprintf(text, sizeof(text),
++			  "guard failed: count=%u->%u control=%x PMU=%x/%x polls=%u counter_delta=%llu",
++			  first, second, control, automatic, mask, dsh_guard.polls, now - begin);
++		dsh_diag_note(0x44d0, text);
++		/* Keep mappings for the explicit PMU recovery path. The failed
++		 * WDT stays stopped and cannot be fed by progress updates. */
++		return -EIO;
++	}
++
++	/* Fully initialize both permanent mappings before exposing the hooks. */
++	smp_store_release(&dsh_wdt_ready, true);
++	dsh_guard.result = 0;
++	scnprintf(text, sizeof(text), "guard verified: count=%u->%u polls=%u counter_delta=%llu",
++		  first, second, dsh_guard.polls, now - begin);
++	dsh_diag_note(0x44d1, text);
++	pr_notice("[dsh-wdt] progress-fed bootstrap reset guard ready\n");
++	return 0;
++}
++early_initcall(dsh_diag_watchdog_init);
++
++void __init dsh_diag_early_guard(void)
++{
++	dsh_diag_watchdog_init();
++}
+diff --git a/init/main.c b/init/main.c
+index 436d73261..c06367898 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -58,6 +58,9 @@
+ #include <linux/taskstats_kern.h>
+ #include <linux/delayacct.h>
+ #include <linux/unistd.h>
++
++/* DSH: 由 arch/arm64/kernel/setup.c 提供，用于 C 代码探针检查点 */
++extern void dsh_probe_c(unsigned int stage);
+ #include <linux/utsname.h>
+ #include <linux/rmap.h>
+ #include <linux/mempolicy.h>
+@@ -820,6 +823,8 @@ early_param("randomize_kstack_offset", early_randomize_kstack_offset);
+ 
+ void __init __weak __noreturn arch_call_rest_init(void)
+ {
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4139); }
++	dsh_probe_c(39);		/* ★★★ 探针：即将 rest_init */
+ 	rest_init();
+ }
+ 
+@@ -866,9 +871,19 @@ static void __init print_unknown_bootoptions(void)
+ 	memblock_free(unknown_options, len);
+ }
+ 
++extern volatile unsigned long dsh_marker;
++extern volatile unsigned long dsh_regs[24];
++#ifdef CONFIG_ARM64
++extern void dsh_probe_c_entry(void);
++#endif
++
+ asmlinkage __visible __init __no_sanitize_address __noreturn __no_stack_protector
+ void start_kernel(void)
+ {
++#ifdef CONFIG_ARM64
++	dsh_probe_c_entry();
++#endif
++	dsh_marker = 0x3333;	/* 进入 C 代码 */
+ 	char *command_line;
+ 	char *after_dashes;
+ 
+@@ -891,6 +906,7 @@ void start_kernel(void)
+ 	pr_notice("%s", linux_banner);
+ 	early_security_init();
+ 	setup_arch(&command_line);
++	dsh_marker = 0x5555;	/* setup_arch 完成 */
+ 	setup_boot_config();
+ 	setup_command_line(command_line);
+ 	setup_nr_cpu_ids();
+@@ -924,8 +940,14 @@ void start_kernel(void)
+ 	setup_log_buf(0);
+ 	vfs_caches_init_early();
+ 	sort_main_extable();
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4132); }
++	dsh_probe_c(32);		/* ★ 探针：setup_arch 之后 */
+ 	trap_init();
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4133); }
++	dsh_probe_c(33);		/* 探针：trap_init 完成 */
+ 	mm_core_init();
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4134); }
++	dsh_probe_c(34);		/* ★★ 探针：mm_core_init 完成 */
+ 	poking_init();
+ 	ftrace_init();
+ 
+@@ -938,6 +960,8 @@ void start_kernel(void)
+ 	 * time - but meanwhile we still have a functioning scheduler.
+ 	 */
+ 	sched_init();
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4135); }
++	dsh_probe_c(35);		/* 探针：sched_init 完成 */
+ 
+ 	if (WARN(!irqs_disabled(),
+ 		 "Interrupts were enabled *very* early, fixing it\n"))
+@@ -950,6 +974,8 @@ void start_kernel(void)
+ 	 * workqueue to take non-housekeeping into account.
+ 	 */
+ 	housekeeping_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4158); }	/* housekeeping 完成 */
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(58); }
+ 
+ 	/*
+ 	 * Allow workqueue creation and work item queueing/cancelling
+@@ -957,27 +983,55 @@ void start_kernel(void)
+ 	 * workqueue_init().
+ 	 */
+ 	workqueue_init_early();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4159); }	/* workqueue 早期初始化完成 */
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(59); }
+ 
+ 	rcu_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4160); }	/* RCU 初始化完成 */
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(60); }
+ 
+ 	/* Trace events are available after this */
+ 	trace_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4161); }	/* trace 初始化完成 */
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(61); }
+ 
+ 	if (initcall_debug)
+ 		initcall_debug_enable();
+ 
+ 	context_tracking_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4162); }	/* 上下文追踪初始化完成 */
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(62); }
+ 	/* init some links before init_ISA_irqs() */
+ 	early_irq_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4163); }	/* ★ early_irq_init 之前 */
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(63); }
+ 	init_IRQ();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4164); }	/* ★★ early_irq_init 完成 */
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(64); }
+ 	tick_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4165); }	/* ★★★ init_IRQ(GIC) 完成 */
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(65); }
+ 	rcu_init_nohz();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4166); }	/* tick_init 完成 */
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(66); }
+ 	init_timers();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4167); }	/* rcu_init_nohz 完成 */
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(67); }
+ 	srcu_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4168); }	/* init_timers 完成 */
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(68); }
+ 	hrtimers_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4169); }	/* srcu 初始化完成 */
++	{ extern void dsh_probe_c(unsigned int); dsh_probe_c(69); }
+ 	softirq_init();
++	/* Test boots must recover even if clock discovery or timer_probe hangs. */
++	{ extern void dsh_diag_early_guard(void); dsh_diag_early_guard(); }
+ 	timekeeping_init();
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4146); }
++	dsh_probe_c(46);		/* ★ 探针：timekeeping_init 完成 */
+ 	time_init();
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4136); }
++	dsh_probe_c(36);		/* ★★ 探针：time_init 完成 */
+ 
+ 	/* This must be after timekeeping is initialized */
+ 	random_init();
+@@ -1001,7 +1055,11 @@ void start_kernel(void)
+ 	 * we've done PCI setups etc, and console_init() must be aware of
+ 	 * this. But we do want output early, in case something goes wrong.
+ 	 */
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4137); }
++	dsh_probe_c(37);		/* ★★★ 探针：即将 console_init */
+ 	console_init();
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4138); }
++	dsh_probe_c(38);		/* ★★★ 探针：console_init 完成（此后应有输出）*/
+ 	if (panic_later)
+ 		panic("Too many boot %s vars at `%s'", panic_later,
+ 		      panic_param);
+@@ -1225,11 +1283,17 @@ int __init_or_module do_one_initcall(initcall_t fn)
+ 	char msgbuf[64];
+ 	int ret;
+ 
++	/* DSH: 把即将执行的 initcall 函数地址写进标记（带缓存写回，保证复位后可读）。
++	 * 内核若在此挂死，下次 loader 读到的 marker 就是这个函数地址，
++	 * 用 addr2line 一查就知道是哪个驱动初始化卡的。*/
++	{ extern void dsh_mark(unsigned long); dsh_mark((unsigned long)fn); }
++
+ 	if (initcall_blacklisted(fn))
+ 		return -EPERM;
+ 
+ 	do_trace_initcall_start(fn);
+ 	ret = fn();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4204); }
+ 	do_trace_initcall_finish(fn, ret);
+ 
+ 	msgbuf[0] = 0;
+@@ -1322,6 +1386,7 @@ static void __init do_initcalls(void)
+  */
+ static void __init do_basic_setup(void)
+ {
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4201); }	/* 进入 do_basic_setup */
+ 	cpuset_init_smp();
+ 	driver_init();
+ 	init_irq_proc();
+@@ -1341,6 +1406,8 @@ static void __init do_pre_smp_initcalls(void)
+ static int run_init_process(const char *init_filename)
+ {
+ 	const char *const *p;
++	int ret;
++	extern void dsh_diag_boot_complete(void);
+ 
+ 	argv_init[0] = init_filename;
+ 	pr_info("Run %s as init process\n", init_filename);
+@@ -1350,7 +1417,10 @@ static int run_init_process(const char *init_filename)
+ 	pr_debug("  with environment:\n");
+ 	for (p = envp_init; *p; p++)
+ 		pr_debug("    %s\n", *p);
+-	return kernel_execve(init_filename, argv_init, envp_init);
++	ret = kernel_execve(init_filename, argv_init, envp_init);
++	if (!ret)
++		dsh_diag_boot_complete();
++	return ret;
+ }
+ 
+ static int try_to_run_init_process(const char *init_filename)
+@@ -1427,6 +1497,7 @@ void __weak free_initmem(void)
+ 
+ static int __ref kernel_init(void *unused)
+ {
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4203); }	/* ★ PID1 kernel_init 开始 */
+ 	int ret;
+ 
+ 	/*
+@@ -1517,6 +1588,7 @@ void __init console_on_rootfs(void)
+ 
+ static noinline void __init kernel_init_freeable(void)
+ {
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4202); }	/* 进入 kernel_init_freeable */
+ 	/* Now the scheduler is fully set up and can do blocking allocations */
+ 	gfp_allowed_mask = __GFP_BITS_MASK;
+ 

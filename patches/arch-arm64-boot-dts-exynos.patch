@@ -1,0 +1,1526 @@
+diff --git a/arch/arm64/boot/dts/exynos/Makefile b/arch/arm64/boot/dts/exynos/Makefile
+index 6e4ba6926..e8c4f0e2c 100644
+--- a/arch/arm64/boot/dts/exynos/Makefile
++++ b/arch/arm64/boot/dts/exynos/Makefile
+@@ -3,6 +3,10 @@ dtb-$(CONFIG_ARCH_EXYNOS) += \
+ 	exynos5433-tm2.dtb		\
+ 	exynos5433-tm2e.dtb		\
+ 	exynos7-espresso.dtb		\
++	exynos7420-zeroflte.dtb		\
++	exynos7420-zeroflte-touch-gpio-test.dtb \
++	exynos7420-zeroflte-touch-power-test.dtb \
++	exynos7420-zeroflte-touch-test.dtb \
+ 	exynos7885-jackpotlte.dtb	\
+ 	exynos850-e850-96.dtb		\
+ 	exynosautov9-sadk.dtb
+diff --git a/arch/arm64/boot/dts/exynos/exynos7.dtsi b/arch/arm64/boot/dts/exynos/exynos7.dtsi
+index 54ed5167d..4ace20567 100644
+--- a/arch/arm64/boot/dts/exynos/exynos7.dtsi
++++ b/arch/arm64/boot/dts/exynos/exynos7.dtsi
+@@ -25,18 +25,15 @@ aliases {
+ 		pinctrl6 = &pinctrl_fsys0;
+ 		pinctrl7 = &pinctrl_fsys1;
+ 		pinctrl8 = &pinctrl_bus1;
++		pinctrl9 = &pinctrl_aud;
++		spi0 = &spi_0;
+ 		tmuctrl0 = &tmuctrl_0;
+ 	};
+ 
+-	arm-pmu {
+-		compatible = "arm,cortex-a57-pmu";
+-		interrupts = <GIC_SPI 56 IRQ_TYPE_LEVEL_HIGH>,
+-			     <GIC_SPI 57 IRQ_TYPE_LEVEL_HIGH>,
+-			     <GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>,
+-			     <GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>;
+-		interrupt-affinity = <&cpu_atlas0>, <&cpu_atlas1>,
+-				     <&cpu_atlas2>, <&cpu_atlas3>;
+-	};
++	/*
++	 * Only the Cortex-A53 cluster is described for now; the A57 PMU
++	 * interrupts do not apply, so leave the PMU out.
++	 */
+ 
+ 	fin_pll: clock {
+ 		/* XXTI */
+@@ -49,17 +46,15 @@ cpus {
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+ 
++		/*
++		 * Cortex-A57 (atlas) cluster.  Power-up is handled by
++		 * exynos7420_pmu_cpu_power_up() in psci.c.
++		 */
+ 		cpu_atlas0: cpu@0 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x0>;
+ 			enable-method = "psci";
+-			i-cache-size = <0xc000>;
+-			i-cache-line-size = <64>;
+-			i-cache-sets = <256>;
+-			d-cache-size = <0x8000>;
+-			d-cache-line-size = <64>;
+-			d-cache-sets = <256>;
+ 			next-level-cache = <&atlas_l2>;
+ 		};
+ 
+@@ -68,12 +63,6 @@ cpu_atlas1: cpu@1 {
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x1>;
+ 			enable-method = "psci";
+-			i-cache-size = <0xc000>;
+-			i-cache-line-size = <64>;
+-			i-cache-sets = <256>;
+-			d-cache-size = <0x8000>;
+-			d-cache-line-size = <64>;
+-			d-cache-sets = <256>;
+ 			next-level-cache = <&atlas_l2>;
+ 		};
+ 
+@@ -82,12 +71,6 @@ cpu_atlas2: cpu@2 {
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x2>;
+ 			enable-method = "psci";
+-			i-cache-size = <0xc000>;
+-			i-cache-line-size = <64>;
+-			i-cache-sets = <256>;
+-			d-cache-size = <0x8000>;
+-			d-cache-line-size = <64>;
+-			d-cache-sets = <256>;
+ 			next-level-cache = <&atlas_l2>;
+ 		};
+ 
+@@ -96,12 +79,6 @@ cpu_atlas3: cpu@3 {
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x3>;
+ 			enable-method = "psci";
+-			i-cache-size = <0xc000>;
+-			i-cache-line-size = <64>;
+-			i-cache-sets = <256>;
+-			d-cache-size = <0x8000>;
+-			d-cache-line-size = <64>;
+-			d-cache-sets = <256>;
+ 			next-level-cache = <&atlas_l2>;
+ 		};
+ 
+@@ -113,6 +90,34 @@ atlas_l2: l2-cache0 {
+ 			cache-line-size = <64>;
+ 			cache-sets = <2048>;
+ 		};
++
++		cpu_apollo0: cpu@100 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a53";
++			reg = <0x100>;
++			enable-method = "psci";
++		};
++
++		cpu_apollo1: cpu@101 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a53";
++			reg = <0x101>;
++			enable-method = "psci";
++		};
++
++		cpu_apollo2: cpu@102 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a53";
++			reg = <0x102>;
++			enable-method = "psci";
++		};
++
++		cpu_apollo3: cpu@103 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a53";
++			reg = <0x103>;
++			enable-method = "psci";
++		};
+ 	};
+ 
+ 	psci {
+@@ -133,6 +138,29 @@ chipid@10000000 {
+ 			reg = <0x10000000 0x100>;
+ 		};
+ 
++		timer@101c0000 {
++			compatible = "samsung,exynos4210-mct";
++			reg = <0x101c0000 0x800>;
++			interrupts = <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 113 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 114 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 115 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 116 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 117 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 118 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 119 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 120 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 121 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 122 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 123 IRQ_TYPE_LEVEL_HIGH>;
++			samsung,local-timers = <0 1 2 3 4 5 6 7>;
++			clocks = <&fin_pll>, <&clock_peris PCLK_MCT>;
++			clock-names = "fin_pll", "mct";
++			/* Boards must supply fin_pll and a live PERIS parent before
++			 * enabling this timer. CNTFRQ does not enable the counter. */
++			status = "disabled";
++		};
++
+ 		gic: interrupt-controller@11001000 {
+ 			compatible = "arm,gic-400";
+ 			#interrupt-cells = <3>;
+@@ -319,6 +347,16 @@ serial_3: serial@14c40000 {
+ 			status = "disabled";
+ 		};
+ 
++		serial_4: serial@11460000 {
++			compatible = "samsung,exynos4210-uart";
++			reg = <0x11460000 0x100>;
++			interrupts = <GIC_SPI 91 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_aud PCLK_UART>,
++				 <&cmu_aud SCLK_UART>;
++			clock-names = "uart", "clk_uart_baud0";
++			status = "disabled";
++		};
++
+ 		pinctrl_alive: pinctrl@10580000 {
+ 			compatible = "samsung,exynos7-pinctrl";
+ 			reg = <0x10580000 0x1000>;
+@@ -378,6 +416,12 @@ pinctrl_bus1: pinctrl@14870000 {
+ 			interrupts = <GIC_SPI 384 IRQ_TYPE_LEVEL_HIGH>;
+ 		};
+ 
++		pinctrl_aud: pinctrl@114b0000 {
++			compatible = "samsung,exynos7-pinctrl";
++			reg = <0x114b0000 0x1000>;
++			interrupts = <GIC_SPI 92 IRQ_TYPE_LEVEL_HIGH>;
++		};
++
+ 		hsi2c_0: i2c@13640000 {
+ 			compatible = "samsung,exynos7-hsi2c";
+ 			reg = <0x13640000 0x1000>;
+@@ -430,6 +474,22 @@ hsi2c_3: i2c@14e70000 {
+ 			status = "disabled";
+ 		};
+ 
++		spi_0: spi@14d20000 {
++			compatible = "samsung,exynos7-spi";
++			reg = <0x14d20000 0x100>;
++			interrupts = <GIC_SPI 464 IRQ_TYPE_LEVEL_HIGH>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			samsung,spi-src-clk = <0>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&spi0_bus>;
++			clocks = <&clock_peric1 PCLK_SPI0>,
++				 <&clock_peric1 SCLK_SPI0>;
++			clock-names = "spi", "spi_busclk0";
++			num-cs = <1>;
++			status = "disabled";
++		};
++
+ 		hsi2c_4: i2c@13660000 {
+ 			compatible = "samsung,exynos7-hsi2c";
+ 			reg = <0x13660000 0x1000>;
+@@ -539,6 +599,35 @@ pmu_system_controller: system-controller@105c0000 {
+ 			reg = <0x105c0000 0x5000>;
+ 		};
+ 
++		pd_g3d: power-domain@105c4100 {
++			/* DSH: 地址修正。
++			 * 主线原来写 0x105c4060，但按原厂 ctc_stock.dts:5771 那是 pd-cam1；
++			 * vendor 的 G3D 域是 pd-g3d@105c4100（pd-option=0x1101）。
++			 * 见 文档/05-专项/IOMMU修复-20261018.md 的 GPU 纠正一节。 */
++			/*
++			 * DSH GPU: 专用 compatible 让 exynos-pm-domains 给这个域加
++			 * GENPD_FLAG_ALWAYS_ON —— 厂商 G3D 上电序列需要 RMW
++			 * CMU_TOP0/TOPC1（本板读即挂），无法安全实现；保持 bootloader
++			 * 的上电状态、永不断电是当前唯一低风险解。见
++			 * 文档/05-专项/GPU加速-20261020.md。
++			 * 第一个 compatible 必须在前：OF 匹配按 compatible 位置打分，
++			 * 这样不会被 exynos5433-pd fallback 抢走。
++			 */
++			compatible = "samsung,exynos7420-g3d-pd",
++				     "samsung,exynos5433-pd";
++			reg = <0x105c4100 0x20>;
++			#power-domain-cells = <0>;
++			label = "G3D";
++		};
++
++		pd_disp: power-domain@105c4080 {
++			compatible = "samsung,exynos7420-pd";
++			reg = <0x105c4080 0x20>;
++			#power-domain-cells = <0>;
++			label = "DISP";
++			status = "okay";
++		};
++
+ 		rtc: rtc@10590000 {
+ 			compatible = "samsung,s3c6410-rtc";
+ 			reg = <0x10590000 0x100>;
+@@ -559,6 +648,110 @@ watchdog: watchdog@101d0000 {
+ 			status = "disabled";
+ 		};
+ 
++		cmu_g3d: clock-controller@14aa0000 {
++			compatible = "samsung,exynos7-clock-g3d";
++			reg = <0x14aa0000 0x1000>;
++			#clock-cells = <1>;
++		};
++
++		cmu_aud: clock-controller@114c0000 {
++			compatible = "samsung,exynos7-clock-aud";
++			reg = <0x114c0000 0x1000>;
++			#clock-cells = <1>;
++		};
++
++		adma: dma-controller@11420000 {
++			compatible = "arm,pl330", "arm,primecell";
++			reg = <0x11420000 0x1000>;
++			interrupts = <GIC_SPI 97 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_aud ACLK_ADMA>;
++			clock-names = "apb_pclk";
++			#dma-cells = <1>;
++		};
++
++		i2s0: i2s@11440000 {
++			compatible = "samsung,exynos7-i2s";
++			reg = <0x11440000 0x100>;
++			dmas = <&adma 0>, <&adma 2>;
++			dma-names = "tx", "rx";
++			interrupts = <GIC_SPI 70 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_aud PCLK_I2S>,
++				 <&cmu_aud SCLK_I2S>,
++				 <&cmu_aud SCLK_I2S>;
++			clock-names = "iis", "i2s_opclk0", "i2s_opclk1";
++			#clock-cells = <1>;
++			#sound-dai-cells = <1>;
++			status = "disabled";
++		};
++
++		cmu_disp: clock-controller@13ad0000 {
++			compatible = "samsung,exynos7-clock-disp";
++			reg = <0x13ad0000 0x1000>;
++			#clock-cells = <1>;
++		};
++
++		/*
++		 * Exynos7420 System MMU (SysMMU v6, 0x13A00000 / SPI 176).
++		 *
++		 * The "samsung,exynos7420-sysmmu" compatible is required: it
++		 * tells the mainline exynos-iommu driver to assume v6.0/v5
++		 * register layout from a static table instead of reading
++		 * REG_MMU_VERSION (0x34) from ->probe().
++		 *
++		 * Why that read must be avoided: the SYSMMU block lives in the
++		 * DISP power/clock domain and probe runs long before DECON is
++		 * powered.  On the 7420 an MMIO access to a powered-down block
++		 * never completes on the AXI bus, so mainline's probe-time
++		 * version read silently hangs the CPU.  The vendor v6 driver
++		 * only clk_prepare()s at probe and defers register access until
++		 * the master is up; the mainline driver follows the same model
++		 * (see IOMMU修复-20261018.md).
++		 *
++		 * "master" = DECON's aclk.  Vendor v6 wraps every SYSMMU
++		 * register access in the master clock (__master_clk_enable());
++		 * without it enabling the pclk gate wedges CCF.
++		 */
++		sysmmu_disp_ro: sysmmu@13a00000 {
++			compatible = "samsung,exynos7420-sysmmu",
++				     "samsung,exynos-sysmmu";
++			reg = <0x13a00000 0x1000>;
++			interrupts = <GIC_SPI 176 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_disp CLK_ACLK_DISP_RO_SYSMMU>,
++				 <&cmu_disp CLK_PCLK_DISP_RO_SYSMMU>,
++				 <&cmu_disp CLK_ACLK_DECON0>;
++			clock-names = "aclk", "pclk", "master";
++			#iommu-cells = <0>;
++		};
++
++		/* Exynos7420 System MMU (SysMMU v6, 0x13A10000 / SPI 179) */
++		sysmmu_disp_rw: sysmmu@13a10000 {
++			compatible = "samsung,exynos7420-sysmmu",
++				     "samsung,exynos-sysmmu";
++			reg = <0x13a10000 0x1000>;
++			interrupts = <GIC_SPI 179 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_disp CLK_ACLK_DISP_RW_SYSMMU>,
++				 <&cmu_disp CLK_PCLK_DISP_RW_SYSMMU>,
++				 <&cmu_disp CLK_ACLK_DECON0>;
++			clock-names = "aclk", "pclk", "master";
++			#iommu-cells = <0>;
++		};
++
++		decon: decon@13930000 {
++			compatible = "samsung,exynos7-decon";
++			reg = <0x13930000 0x10000>;
++			clocks = <&cmu_disp CLK_PCLK_DECON0>,
++				 <&cmu_disp CLK_ACLK_DECON0>,
++				 <&cmu_disp CLK_SCLK_DECON0_ECLK>,
++				 <&cmu_disp CLK_SCLK_DECON0_VCLK>;
++			clock-names = "pclk_decon0", "aclk_decon0",
++				      "decon0_eclk", "decon0_vclk";
++			iommus = <&sysmmu_disp_ro>, <&sysmmu_disp_rw>;
++			interrupts = <GIC_SPI 190 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 188 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "vsync", "lcd_sys";
++			status = "disabled";
++		};
++
+ 		gpu: gpu@14ac0000 {
+ 			compatible = "samsung,exynos5433-mali", "arm,mali-t760";
+ 			reg = <0x14ac0000 0x5000>;
+@@ -566,8 +759,11 @@ gpu: gpu@14ac0000 {
+ 				     <GIC_SPI 242 IRQ_TYPE_LEVEL_HIGH>,
+ 				     <GIC_SPI 240 IRQ_TYPE_LEVEL_HIGH>;
+ 			interrupt-names = "job", "mmu", "gpu";
++			clocks = <&cmu_g3d CLK_ACLK_G3D>,
++				 <&cmu_g3d CLK_PCLK_SYSREG_G3D>;
++			clock-names = "core", "bus";
++			power-domains = <&pd_g3d>;
+ 			status = "disabled";
+-			/* TODO: operating points for DVFS, cooling device */
+ 		};
+ 
+ 		mmc_0: mmc@15740000 {
+@@ -655,10 +851,31 @@ ufs: ufs@15570000 {
+ 				<&clock_fsys1 SCLK_UFSUNIPRO20_USER>;
+ 			clock-names = "core_clk", "sclk_unipro_main";
+ 			freq-table-hz = <0 0>, <0 0>;
+-			pinctrl-names = "default";
+-			pinctrl-0 = <&ufs_rst_n &ufs_refclk_out>;
++			/* DSH: 删掉 pinctrl-0。
++			 * 它在 really_probe() → pinctrl_bind_pins() 阶段就会写
++			 * GPH1(0x14870120) / GPG2(0x14870100)，而这个 GPIO 块
++			 * 从未被 mainline 任何已 probe 设备写过 —— 是 UFS 挂死的
++			 * 头号嫌疑。UFS_RST_N 由 S-Boot 已经 mux 好，运行时用
++			 * HCI_GPIO_OUT(0x15570170) 控制，不需要 pinctrl 介入。
++			 * 等控制器跑起来后再单独验证 pinctrl。*/
+ 			phys = <&ufs_phy>;
+ 			phy-names = "ufs-phy";
++			/* DSH: 暂时禁用 UFS 控制器。
++			 *
++			 * 实测（p81）：UFS PHY 本身 probe 成功（"probe of 15571800.ufs-phy
++			 * returned 0"），说明 fsys1 时钟树与 PMU 隔离都可用；但一旦启用
++			 * 控制器，内核就卡死在 exynos_ufs_probe() 里（屏幕停在某个
++			 * "returned 0 after 96 usecs" 的下一条）。
++			 *
++			 * 按子代理分析，控制器还缺三层：
++			 *   1) CMU_TOP1 里 FSYS1 的三个父门控（0x105E080C bit24 /
++			 *      0x105E0A28 bit16 / 0x105E0A2C bit24）没人打开 ——
++			 *      fixed-clock 只改软件速率，不写硬件；需由 uniLoader 预置。
++			 *   2) 7420 的 UFSP/FMP/SMU 在 vendor 里走 SMC，mainline 直接
++			 *      MMIO 写 0x15572010..20C，可能被 secure monitor 挡住。
++			 *   3) GPH1-4 (XBOOTLDO0) 电源开关未建模。
++			 *
++			 * 待这三项补齐后再打开。*/
+ 			status = "disabled";
+ 		};
+ 
+@@ -722,12 +939,11 @@ atlas_thermal: cluster0-thermal {
+ 
+ 	timer {
+ 		compatible = "arm,armv8-timer";
++		interrupt-names = "sec-phys", "phys", "hyp-phys";
+ 		interrupts = <GIC_PPI 13
+ 				(GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+ 			     <GIC_PPI 14
+ 				(GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+-			     <GIC_PPI 11
+-				(GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+ 			     <GIC_PPI 10
+ 				(GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>;
+ 	};
+diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-gpio-test.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-gpio-test.dts
+new file mode 100644
+index 000000000..12ebc64c7
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-gpio-test.dts
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Diagnostic candidate A: PERIC1 oscillator bypass and an empty GPIO bus.
++ * No touchscreen or PMIC transaction is requested by this variant.
++ * CMU_PERIC1 accessibility itself still requires a hardware test.
++ */
++#include "exynos7420-zeroflte.dts"
++
++&clock_peric1 {
++	status = "okay";
++	/* Do not depend on disabled TOP0. Only the bus oscillator input
++	 * is exercised; UART/SPI/audio clocks remain unused in this test.
++	 */
++	clocks = <&fin_pll>, <&fin_pll>, <&fin_pll>, <&fin_pll>,
++		 <&fin_pll>, <&fin_pll>, <&fin_pll>, <&fin_pll>,
++		 <&fin_pll>, <&fin_pll>, <&fin_pll>, <&fin_pll>, <&fin_pll>;
++	assigned-clocks = <&clock_peric1 MOUT_ACLK_PERIC1_66_USER>;
++	assigned-clock-parents = <&fin_pll>;
++};
++
++/ {
++	tsp_gpio_test: i2c-tsp {
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpj1 0 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpj1 1 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		i2c-gpio,timeout-ms = <100>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		/* No default pinctrl state: existing get_sda/get_scl diagnostic
++		 * checkpoints run before GPIO direction changes touch GPJ1.
++		 */
++	};
++};
+diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-power-test.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-power-test.dts
+new file mode 100644
+index 000000000..081f97027
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-power-test.dts
+@@ -0,0 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Diagnostic candidate B: real supplies, without accessing GPJ1. */
++#include "exynos7420-zeroflte.dts"
++#include "exynos7420-zeroflte-touch-power.dtsi"
+diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-power.dtsi b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-power.dtsi
+new file mode 100644
+index 000000000..3db756818
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-power.dtsi
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Diagnostic supply candidate. Use touch-power-test.config before a boot
++ * build: the unrelated S2MPS15 RTC driver must remain disabled.
++ * Both buses replace the disabled stock HSI2C functions on these pins.
++ * S-Boot/APM bus ownership must be established before hardware use.
++ */
++/ {
++	/delete-node/ regulator-tsp-io;
++	/delete-node/ regulator-tsp-avdd;
++
++	/*
++	 * DSH: s2mps15 走 gpd2（MUIC 的 I2C）。
++	 * 实测：s2mps15 的 mainline s2mps11 驱动在 enable 时返回 -ENXIO，
++	 * 换到 gpg3 也一样 —— 所以是驱动/regmap 的问题，不是总线问题。
++	 * 因此这一版**不依赖 mainline 驱动**给 LDO15 上电，
++	 * 改由 /etc/rc 里的 i2cset 直接写 LDO15 控制寄存器（0x3f）。
++	 */
++	i2c-tsp-main-pmic {
++		compatible = "i2c-gpio";
++		/* DSH: 按原厂真机 DTB 修正引脚。
++		 * vendor hsi2c@13660000 里 s2mps15_pmic@66 的
++		 *   gpio_sda = <&gpg3 0 ...>;   gpio_scl = <&gpg3 1 ...>;
++		 * 实测证据：在 gpd2 上跑 i2cdetect 只找到 0x31（别的设备），
++		 * 0x66 完全没响应，所有读写都返回 -ENXIO。
++		 * 而 s2mpb02 在 gpg3-2/3 上工作正常（LDO17 = 0xec ✓）。
++		 * 所以两个 PMIC 共用 gpg3 这一个 bank，只是引脚不同：
++		 *   s2mps15  -> gpg3-0 / gpg3-1
++		 *   s2mpb02  -> gpg3-2 / gpg3-3
++		 */
++		sda-gpios = <&gpg3 0 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpg3 1 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		i2c-gpio,timeout-ms = <100>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		pmic@66 {
++			compatible = "samsung,s2mps15-pmic";
++			reg = <0x66>;
++			regulators {
++				tsp_io_ldo15: LDO15 {
++					regulator-name = "tsp_io";
++					/* DSH: 故意不写 regulator-min/max-microvolt。
++					 * 原因：写了之后 machine_constraints_voltage() 会调用
++					 * _regulator_get_voltage() → regmap_read(LDO15 VSEL=0x42)，
++					 * 实测返回 -ENXIO（s2mps15 的 regmap 拒绝了这次读），
++					 * 导致整个 regulator 注册失败（err=-6），
++					 * 进而 probe of s2mps15-regulator returned 6。
++					 * 不写电压约束就不会读寄存器，注册能成功；
++					 * 电压保持 S-Boot 留下的值（原厂就是 1.85V）。
++					 * 【已修正】根因是引脚接错（gpd2 -> gpg3-0/1），
++					 * 现在恢复电压约束和 always-on，让驱动真正上电。 */
++					regulator-min-microvolt = <1850000>;
++					regulator-max-microvolt = <1850000>;
++					regulator-always-on;
++					regulator-boot-on;
++				};
++			};
++		};
++	};
++
++	i2c-tsp-analog-pmic {
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpg3 2 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpg3 3 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		i2c-gpio,timeout-ms = <100>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		pmic@59 {
++			compatible = "samsung,s2mpb02";
++			reg = <0x59>;
++			regulators {
++				tsp_avdd_ldo17: ldo17 {
++					regulator-name = "tsp_avdd";
++					regulator-min-microvolt = <3300000>;
++					regulator-max-microvolt = <3300000>;
++					regulator-always-on;
++				};
++			};
++		};
++	};
++};
+diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-test.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-test.dts
+new file mode 100644
+index 000000000..e112fb2a2
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-test.dts
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Combined candidate, for use only after A and B have passed separately. */
++#include "exynos7420-zeroflte-touch-gpio-test.dts"
++#include "exynos7420-zeroflte-touch-power.dtsi"
++
++&tsp_gpio_test {
++	touchscreen@49 {
++		compatible = "st,stmfts";
++		reg = <0x49>;
++		interrupt-parent = <&gpa1>;
++		interrupts = <6 IRQ_TYPE_LEVEL_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&tsp_attn_pin>;
++		vdd-supply = <&tsp_io_ldo15>;
++		avdd-supply = <&tsp_avdd_ldo17>;
++		touchscreen-size-x = <4096>;
++		touchscreen-size-y = <4096>;
++	};
++};
+diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
+new file mode 100644
+index 000000000..a0a0ed810
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
+@@ -0,0 +1,925 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Samsung Galaxy S6 (SM-G9209, zeroflte, Exynos 7420) — mainline Linux 6.6
++ *
++ * 移植自 zenlte-linux6（S6 Edge+ / SM-G9280，同款 Exynos7420）的主线适配：
++ *   - SoC 级支持在 exynos7.dtsi（补丁已含 7420 的 DECON/SYSMMU/CMU/电源域）
++ *   - 显示走 simple-framebuffer：直接复用 S-Boot 已点亮的面板
++ *     （我方 video 保留区基址与 zenlte 完全相同：0xe2a00000，1440x2560）
++ *
++ * 第一版（milestone 1）只做：内存 + 显示 + 控制台，外设随后加。
++ */
++
++/dts-v1/;
++#include <dt-bindings/pinctrl/samsung.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++#include <dt-bindings/gpio/gpio.h>
++#include "exynos7.dtsi"
++
++/ {
++	model = "Samsung Galaxy S6 (SM-G9209 / zeroflte)";
++	compatible = "samsung,zeroflte", "samsung,exynos7420", "samsung,exynos7";
++
++	/* Describe the bus inherited from S-Boot without touching TOPC PLLs. */
++	peris_boot_bus: clock-peris-boot {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <66000000>;
++		clock-output-names = "aclk_peris_66";
++	};
++
++	/*
++	 * DSH: 用固定时钟替代被禁用的 CMU_TOP1 父时钟。
++	 *
++	 * CMU_TOP1(0x105e0000) 与 CMU_TOP0(0x105d0000)、CMU_TOP(0x10570000)
++	 * 一起被禁用 —— 实测启用它们会让内核在启动途中挂死总线（p69 验证）。
++	 * 但 FSYS0/FSYS1 的时钟 MUX 有 "fin_pll" 作为可选项：
++	 *   PNAME(mout_aclk_fsys1_200_user_p) = { "fin_pll", "aclk_fsys1_200" };
++	 * 因此这里直接给出与 S-Boot 实际频率一致的固定时钟，让 UFS/USB
++	 * 的时钟树能在不触碰 TOP1 寄存器的前提下建立起来。
++	 */
++	fsys1_aclk200: clock-fsys1-aclk200 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <200000000>;
++		clock-output-names = "aclk_fsys1_200";
++	};
++	fsys1_mmc0: clock-fsys1-mmc0 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <200000000>;
++		clock-output-names = "sclk_mmc0";
++	};
++	fsys1_mmc1: clock-fsys1-mmc1 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <200000000>;
++		clock-output-names = "sclk_mmc1";
++	};
++	fsys1_unipro: clock-fsys1-unipro {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <200000000>;
++		clock-output-names = "sclk_ufsunipro20";
++	};
++	fsys1_phy: clock-fsys1-phy {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <26000000>;
++		clock-output-names = "sclk_phy_fsys1";
++	};
++	fsys1_phy26m: clock-fsys1-phy26m {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <26000000>;
++		clock-output-names = "sclk_phy_fsys1_26m";
++	};
++	fsys0_aclk200: clock-fsys0-aclk200 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <200000000>;
++		clock-output-names = "aclk_fsys0_200";
++	};
++	/*
++	 * DSH P1: 以下几个固定时钟是**替代**被 disable 的 CMU_TOP1 里的同名 gate。
++	 * 依据：clk-exynos7.c 的 PNAME 是**按名字**连父的
++	 *   PNAME(mout_sclk_usbdrd300_user_p) = { "fin_pll", "sclk_usbdrd300" };
++	 * 而 "sclk_usbdrd300" 原本定义在 TOP1 的 gate 表（clk-exynos7.c:568）。
++	 * TOP1 一旦 disabled，of_clk_init 就跳过它，这些名字就再也不会注册，
++	 * 于是对应 mux 的第二个父为 NULL —— clk_get_rate() 会返回 0。
++	 */
++	fsys0_usbdrd300: clock-fsys0-usbdrd300 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <200000000>;
++		clock-output-names = "sclk_usbdrd300";
++	};
++
++	/*
++	 * DSH P1 关键项：PNAME(mout_fsys1_group_p) 的第二个父是 "fin_pll_26m"
++	 *   PNAME(mout_fsys1_group_p) = { "fin_pll", "fin_pll_26m",
++	 *                                 "sclk_phy_fsys1_26m" };
++	 * 而全树（驱动 + DTS）**没有任何地方定义** fin_pll_26m。
++	 * 若 S-Boot 把 MUX_SEL_FSYS10[17:16] 留在 1（26 MHz XO），
++	 * mout_fsys1_phyclk_sel1 的父就是 NULL，clk_get_rate() 返回 0。
++	 * 补一个同名固定时钟，让 sel=0/1/2 三种取值都有合理速率。
++	 */
++	fsys0_fin_pll_26m: clock-fsys0-fin-pll-26m {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <26000000>;
++		clock-output-names = "fin_pll_26m";
++	};
++
++	fsys0_mmc2: clock-fsys0-mmc2 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <200000000>;
++		clock-output-names = "sclk_mmc2";
++	};
++
++	/*
++	 * DSH: 触摸屏（P1）—— ST FTS，地址 0x49，走 i2c-gpio。
++	 *
++	 * 为什么用 i2c-gpio 而不是真 hsi2c：
++	 *   原厂触摸挂在 hsi2c@14E10000，但 mainline 没有这个节点，而且
++	 *   它的时钟来自 CMU_PERIC0/PERIC1，父时钟在 TOP0 —— 已实证读
++	 *   TOP CMU 会挂死总线。i2c-gpio 完全绕开这条时钟链。
++	 *
++	 * 线序（vendor exynos7420.dtsi:873-874 + zenlte 主线）：
++	 *   SDA = gpj1-0   SCL = gpj1-1   （注意不是反过来的）
++	 *
++	 * 供电：
++	 *   tsp_io   = s2mps15 LDO15 1.85V（mainline s2mps11 驱动支持）
++	 *   tsp_avdd = s2mpb02 LDO17 3.3V（mainline 无驱动 → 先用 fixed 假设已开）
++	 *   若芯片不响应，需要用户态 i2cset 0x59 0x2E 0xEC 手动给 avdd 上电
++	 *   （s2mpb02 @ I2C 0x59，LDO17 控制寄存器 0x2E，bit7=EN，0xEC=3.3V）
++	 */
++	reg_tsp_io: regulator-tsp-io {
++		compatible = "regulator-fixed";
++		regulator-name = "tsp_io";
++		regulator-min-microvolt = <1850000>;
++		regulator-max-microvolt = <1850000>;
++		regulator-always-on;
++	};
++
++	reg_tsp_avdd: regulator-tsp-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "tsp_avdd";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		regulator-always-on;
++	};
++
++/* DSH: 触摸屏（P1）。风险控制：p90 曾挂死，但那时 IOMMU 还没关；
++ * 现在 CONFIG_EXYNOS_IOMMU=n。启动时用 loader 的 watchdog arm 兜底。 */
++	/* DSH p117: i2c-tsp 节点临时移除 —— 验证"访问 GPJ1 会挂总线"。
++	 * 验证完再按结论恢复（或改为打开 PERIC1 对应时钟门控）。*/
++
++
++
++	chosen {
++		/*
++		 * console=tty0   —— 调试信息直接打在屏幕上（无串口线时的唯一反馈通道）
++		 * clk_ignore_unused / pd_ignore_unused —— 与 simple-framebuffer 方案配套，
++		 *   避免关掉 bootloader 点亮屏幕时用到的时钟与电源域
++		 */
++		bootargs = "console=tty0 maxcpus=1 loglevel=8 clk_ignore_unused pd_ignore_unused deferred_probe_timeout=0 rodata=off";
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/* S-Boot 把 initramfs 放在这里（与 zenlte 相同，实测值） */
++		/* uniLoader 的 CONFIG_RAMDISK_ENTRY=0x44000000 */
++		linux,initrd-start = <0x0 0x44000000>;
++		linux,initrd-end = <0x0 0x444ae70b>;	/* + 4,908,811 */
++
++		/* S-Boot 已在 0xe2a00000 准备好 1440x2560 的扫描缓冲 */
++		framebuffer@e2a00000 {
++			compatible = "simple-framebuffer";
++			reg = <0x0 0xe2a00000 0x0 0x1000000>;
++			width = <1440>;
++			height = <2560>;
++			stride = <5760>;
++			format = "a8r8g8b8";
++		};
++	};
++
++	reserved-memory {
++
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/* S-Boot keeps scanning this buffer while Linux starts. */
++		framebuffer@e2a00000 {
++			reg = <0x0 0xe2a00000 0x0 0x1000000>;
++			no-map;
++		};
++
++		/* Stock Exynos7420 reserves this 24 MiB for the EL3 monitor.
++		 * It is not usable RAM for memblock or kernel page tables. */
++		trustzone@fe800000 {
++			reg = <0x0 0xfe800000 0x0 0x1800000>;
++			no-map;
++		};
++
++		/*
++		 * DSH: 原厂 S-Boot/secure 世界使用的 DRAM 区，zenlte 主线 DTB
++		 * （参考-zenlte主线移植/zenlte.dts:1731-1758）全部 no-map 保留，
++		 * 我们之前漏掉了。原厂依据：
++		 *   - last_kmsg.log:377  sec_debug: reserve (0x40000000, 0x1000)
++		 *   - last_kmsg.log:319/375 cmdline sec_tima_log=0x200000@0x48002000
++		 *                          sec_avc_log=0x40000@0x48204000
++		 * 不保留时 Linux 会把这些页当普通 RAM 分配，可能覆盖 secure 世界
++		 * 的日志/共享缓冲（是"原厂布局 vs 我们布局"的最后一处实质差异；
++		 * 与八核 SMP 挂死的因果关系尚未证实，属 A/B 候选）。
++		 */
++		sec-debug@40000000 {
++			reg = <0x0 0x40000000 0x0 0x10000>;
++			no-map;
++		};
++
++		tima@48002000 {
++			reg = <0x0 0x48002000 0x0 0x200000>;
++			no-map;
++		};
++
++		avc@48204000 {
++			reg = <0x0 0x48204000 0x0 0x40000>;
++			no-map;
++		};
++
++		/*
++		 * 三星持久日志区（S-Boot/安卓内核共用 0x46c00000 起 2MB）。
++		 * 我们只取尾部 512KB：S-Boot 的日志写在开头 ~32KB，
++		 * recovery 内核日志也只占前段，因此这里的内容能存活到下次进 TWRP，
++		 * 可用 /proc/last_kmsg 读出我们内核的启动日志。
++		 */
++		ramoops@46d80000 {
++			compatible = "ramoops";
++			/* DSH: 保持原大小（512KB / console 256KB）。
++			 * 试过扩到 2MB 但 reserved-memory 只保留 512KB，
++			 * 两者不一致会导致内存冲突（实测启动挂住）。
++			 * 日志量问题改由移除 initcall_debug 解决。*/
++			reg = <0x0 0x46d80000 0x0 0x80000>;
++			console-size = <0x40000>;
++			pmsg-size = <0x20000>;
++			record-size = <0x10000>;
++			max-reason = <2>;
++		};
++	};
++
++	memory@40000000 {
++		device_type = "memory";
++		reg = <0x0 0x40000000 0x0 0xc0000000>;
++	};
++};
++
++/* 显示控制器：dtsi 里默认 disabled，这里使能（刻意不接 pd_disp） */
++&decon {
++	status = "okay";
++};
++
++/*
++ * 这台机器的 S-Boot 会关闭部分时钟/电源域，而 mainline 的 of_clk_init
++ * 一旦去读被关掉的 CMU 寄存器会直接挂死总线（uniLoader 探针实测：
++ * cmu_top0 @0x105d0000 一读即死）。先全部禁用，确保内核能跑到 console。
++ */
++/* Keep the inherited PLL and mux configuration during timer bring-up. */
++&{/soc@0/clock-controller@10570000} {
++	status = "disabled";
++};
++
++&{/soc@0/clock-controller@105d0000} {
++	status = "disabled";
++};
++
++&{/soc@0/clock-controller@105e0000} {
++	status = "disabled";
++};
++
++&{/soc@0/clock-controller@105b0000} {
++	status = "disabled";
++};
++
++&{/soc@0/clock-controller@13610000} {
++	status = "disabled";
++};
++
++&{/soc@0/clock-controller@14c80000} {
++	status = "disabled";
++};
++
++/* DSH: CMU_PERIS 恢复启用 —— MCT 的 PCLK_MCT 就来自这里。*/
++&{/soc@0/clock-controller@10040000} {
++	status = "okay";
++	clocks = <&fin_pll>, <&peris_boot_bus>;
++};
++
++&fin_pll {
++	clock-frequency = <24000000>;
++};
++
++&{/soc@0/timer@101c0000} {
++	status = "okay";
++};
++
++/*
++ * DSH: Exynos7420 固件不初始化 CNTVOFF_EL2。
++ *
++ * S-Boot/secure monitor 把内核（以及所有从核）放在 EL1 启动，从不在 EL2
++ * 执行 `msr cntvoff_el2, xzr`（主线只在从 EL2 进入时做，见
++ * arch/arm64/include/asm/el2_setup.h）。CNTVOFF_EL2 只有 EL2 能写，EL1 的
++ * 内核无法修正，于是每核 CNTVCT 各带一个随机偏移 —— 而 arm64 booting.rst
++ * 要求"从 EL1 进入内核时固件必须给所有核设一致的 CNTVOFF"。
++ *
++ * 原厂 DTB 的同一节点写着 "use-clocksource-only; use-physical-timer;"，
++ * 即三星自己也只用物理计数器（CNTPCT 是 SoC 全局 system counter，不受
++ * CNTVOFF 影响）做 clocksource。这里沿用同一语义，让 arm_arch_timer.c 的
++ * OOL workaround 把 counter 读取重定向到 CNTPCT，并自动关闭会读 CNTVCT 的
++ * vDSO fast path。
++ *
++ * uniLoader 也会在 /timer 注入同名属性（uniLoader/main/diag.c），这里显式
++ * 写下来是为了让 DTB 自解释、不依赖 loader 的注入。
++ */
++&{/timer} {
++	arm,cpu-registers-not-fw-configured;
++};
++
++/* DSH: CMU_FSYS0 恢复 —— USB3/DWC3 与 MMC2 的时钟源（父时钟用固定时钟）*/
++&{/soc@0/clock-controller@10e90000} {
++	status = "okay";
++	clocks = <&fin_pll>, <&fsys0_aclk200>, <&fsys0_mmc2>,
++		 <&fsys0_usbdrd300>, <&fsys0_fin_pll_26m>;
++};
++
++/* DSH: CMU_FSYS1 恢复 —— UFS 与 UFS PHY 的时钟源（父时钟用固定时钟）*/
++&{/soc@0/clock-controller@156e0000} {
++	status = "okay";
++	clocks = <&fin_pll>, <&fsys1_aclk200>, <&fsys1_mmc0>, <&fsys1_mmc1>,
++		 <&fsys1_unipro>, <&fsys1_phy>, <&fsys1_phy26m>,
++		 <&fsys0_fin_pll_26m>;
++};
++
++&{/soc@0/power-domain@105c4080} {
++	status = "disabled";
++};
++
++/*
++ * DSH: 启用 GPU（Mali-T760 MP8）所需的 CMU_G3D 和 pd_g3d。
++ *
++ * 依据（见 文档/05-专项/IOMMU修复-20261018.md 的 GPU 纠正一节）：
++ *   - panfrost 不用 EXYNOS_IOMMU（只用 io-pgtable 库），所以 IOMMU 不阻塞 GPU
++ *   - 之前 GPU 不绑定驱动，是因为本文件把 cmu_g3d 关了 →
++ *     gpu 的 core/bus 时钟拿不到 → panfrost_clk_init() 返回 -EPROBE_DEFER
++ *   - pd_g3d 的地址在 exynos7.dtsi 里写错了（0x105c4060 实际是 pd-cam1），
++ *     已修正为 0x105c4100
++ *
++ * cmu_g3d 节点本身没有 clocks 属性，可以独立启用，不会触发依赖链。
++ * 0x14AA0000 / 0x105C4100 都**不是**已知死区（死区是 0x14C00000 起）。
++ */
++&{/soc@0/clock-controller@14aa0000} {
++	status = "okay";
++};
++
++&{/soc@0/power-domain@105c4100} {
++	status = "okay";
++};
++
++&{/soc@0/clock-controller@114c0000} {
++	status = "disabled";
++};
++
++/* 默认关闭；DSH_ENABLE_DISP_IOMMU=1 时由下面的 #if 段改回 okay。 */
++&{/soc@0/clock-controller@13ad0000} {
++	status = "disabled";
++};
++
++/*
++ * ==========================================================================
++ * CMU_DISP (0x13AD0000) 与两个 DISP SYSMMU —— IOMMU 修复的安全约定
++ * 详见 文档/05-专项/IOMMU修复-20261018.md
++ *
++ * CMU_DISP 供给 sysmmu_disp_ro/rw 的 aclk/pclk/master 三个时钟。它保持
++ * disabled 时：
++ *   - of_clk_init() 不会去读 CMU_DISP 寄存器；
++ *   - sysmmu@13a00000/13a10000 的 devm_clk_get() 返回 -EPROBE_DEFER，
++ *     probe 在**任何 MMIO 之前**返回，绝不可能碰未上电的 SYSMMU 块；
++ *   - 因此 CONFIG_EXYNOS_IOMMU=y 在本板是安全的（只是暂时不工作）。
++ *
++ * 反过来，一旦打开 CMU_DISP，内核会在 of_clk_init() 阶段访问
++ * 0x13AD0000 —— 在没实测过它可访问之前，这可能直接挂死 AXI 总线。
++ * 打开前必须先用 loader + 看门狗探测（地址清单见上述报告），
++ * 然后把下面 DSH_ENABLE_DISP_IOMMU 改成 1。
++ *
++ * 注意：仅打开 CMU_DISP 还不够 —— 它的上游时钟来自 CMU_TOP0
++ * (0x105D0000)，而本板 TOP0 读就挂死（p69 实测）。zenlte 可以直接用
++ * TOP0 的 aclk_disp_400，本板只能用 fixed-clock 顶替（与 FSYS0/FSYS1
++ * 同一套办法）。
++ * ==========================================================================
++ */
++#define DSH_ENABLE_DISP_IOMMU 0
++
++#if DSH_ENABLE_DISP_IOMMU
++/*
++ * EXPERIMENTAL（默认关闭，可整段删除回退）：
++ * 用 fixed-clock 顶替 CMU_TOP0 提供给 CMU_DISP 的三路上游时钟。
++ * 频率取 bootloader 典型值，只用于软件 clk_get_rate() 计算；
++ * 真实硬件分频由 S-Boot 配好、且 SYSMMU 只需要 gate 打开即可。
++ */
++/ {
++	disp_top_aclk_400: clock-disp-top-aclk-400 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <400000000>;
++		clock-output-names = "top_aclk_disp_400";
++	};
++
++	disp_top_sclk_eclk: clock-disp-top-eclk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <148500000>;
++		clock-output-names = "top_sclk_decon_int_eclk";
++	};
++
++	disp_top_sclk_vclk: clock-disp-top-vclk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <148500000>;
++		clock-output-names = "top_sclk_decon_vclk";
++	};
++};
++
++&cmu_disp {
++	status = "okay";
++};
++#endif /* DSH_ENABLE_DISP_IOMMU */
++
++
++/* DSH: 触摸相关 pinctrl */
++&pinctrl_touch {
++	tsp_i2c_pins: tsp-i2c-pins {
++		samsung,pins = "gpj1-0", "gpj1-1";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_INPUT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
++	};
++};
++
++&pinctrl_alive {
++	tsp_attn_pin: tsp-attn-pin {
++		samsung,pins = "gpa1-6";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++	};
++};
++
++
++/*
++ * DSH: USB gadget 串口（内核自己提供 /dev/ttyGS0 → 主机 /dev/ttyACM）
++ *
++ * 这样即使没有屏幕也能抓到内核/用户态输出，是后续所有调试的基础。
++ *
++ * 关键设计：内核**不驱动 PHY**。
++ *   uniLoader 已经在跳转前把 Exynos5 USB3 DRD PHY 完整初始化好
++ *   （时钟、PMU 去隔离、COMMONONN/REF_SSP_EN/SSC_EN 上电边沿、
++ *    PORTRESET 释放），mainline 的 phy-exynos5-usbdrd 在 7420 上有一处
++ *   已知差异（它写 PHYUTMICLKSEL bit2，而三星 CAL 序列写 PHYPIPE bit4），
++ *   贸然让主线 PHY 驱动 reset 反而会把已校准的状态弄坏。
++ *   dwc3_core_get_phy() 允许 PHY 缺失（core.c:1328-1343），所以删掉
++ *   phys/phy-names 并把 PHY 节点 disable 即可。
++ */
++&usbdrd {
++	usb@0 {
++		dr_mode = "peripheral";
++		maximum-speed = "high-speed";
++		snps,dis_u2_susphy_quirk;
++		snps,dis_enblslpm_quirk;
++		/delete-property/ phys;
++		/delete-property/ phy-names;
++	};
++};
++
++&usbdrd_phy {
++	/* 由 uniLoader 负责初始化，内核不碰 */
++	status = "disabled";
++};
++
++/*
++ * DSH: 无人值守测试用的两层看门狗。
++ *   硬件层：本节点。驱动 CONFIG_S3C2410_WATCHDOG，userspace 打开
++ *           /dev/watchdog 后若不喂狗，WDT_APL 会复位 SoC。
++ *           用途：内核硬挂时也能把机器救回来，让下一轮测试继续。
++ *   用户态层：/sbin/wd（initramfs 内），300 秒无进展就 sync + 重启。
++ *   时钟来自 CMU_PERIS 的 PCLK_WDT，clock_peris 已 okay。
++ */
++/*
++ * DSH: 暂时保持 disabled。
++ * p113 同时启用了「触摸」和「本看门狗」，并让 loader 提前 arm 了 WDT，
++ * 结果启动到一半整机挂死且loader 的 WDT 复位没能把机器救回来。
++ * 为了把变量拆开，p114 只启用触摸，看门狗单独做一个版本验证。
++ */
++&watchdog {
++	status = "disabled";
++};
++
++/*
++ * DSH: 启用 UFS 控制器。
++ *
++ * 硬件实测（2026-10-18，loader 侧带看门狗兜底的安全读取）已证明：
++ *   UFS HCI CAP   (0x15570000) = 0x0383ff0f   <- 控制器有电有时钟
++ *   UFS HCI VER   (0x15570008) = 0x00000200   <- UFS 2.0
++ *   GPH1CON       (0x14870120) = 0x00210022   <- gph1-4 输出、gph1-5 func2
++ *   pinctrl_bus1  (0x14870000) 可访问
++ *   pinctrl_fsys1 (0x15690000) 可访问
++ *
++ * 并且 p78/p81 那次「启用 UFS 就挂死」发生在 CONFIG_EXYNOS_IOMMU=y 的时期，
++ * 现在 IOMMU 已关闭 —— 所以当时的真凶很可能是 IOMMU，而不是 UFS 本身。
++ *
++ * 风险控制：测试时先在 loader 里 watchdog arm（约 32 秒），
++ * 若内核挂死会由 WDT 自动复位回 loader。
++ */
++/* UFS + USB candidate: retain the PHY and run the real link startup. */
++&ufs {
++	status = "okay";
++	/* DSH: 7420 用 SMC 配置 FMP/SMU，不裸访问 UFSP */
++	compatible = "samsung,exynos7420-ufs", "samsung,exynos7-ufs";
++};
++
++/*
++ * DSH: 合入 Sol 的 candidate B（真 PMIC 供电测试）。
++ * 硬件实测已证明 pinctrl_bus0 (0x13470000) 可访问：
++ *   gpd2CON = 0x00001100   gpg3CON = 0x00001111
++ * 而 pinctrl_touch (GPJ1) 与 CMU_PERIC1 都不可访问，所以放弃 GPJ1 路线。
++ * 本变体不驱动触摸芯片（STMFTS 仍为 n），只验证：
++ *   - i2c-gpio 能否在 gpd2 / gpg3 上工作
++ *   - s2mps15 (0x66) / s2mpb02 (0x59) 能否 probe
++ *   - tsp_io(1.85V) / tsp_avdd(3.3V) 能否真的被打开
++ */
++#include "exynos7420-zeroflte-touch-power.dtsi"
++
++/*
++ * ============================================================
++ * DSH: 触摸走真 hsi2c@14E10000（原厂就是这个控制器）
++ * ============================================================
++ *
++ * 来源：vendor ctc_stock.dts 里
++ *   hsi2c@14E10000 { clocks=<...0x7f...>; secure-mode;
++ *       touchscreen@20 { compatible="stm,fts_touch"; reg=<0x49>;
++ *           pinctrl-0=<&attn-irq>;   <- 只配 IRQ，不配 I2C 引脚
++ *           stm,irq_gpio=<&gpa1 6 0>;
++ *           stm,regulator_dvdd="tsp_io"; stm,regulator_avdd="tsp_avdd";
++ *       };
++ *   };
++ *
++ * 关键事实（全部硬件实测）：
++ *   - 0x14E10000 可读 = 0x00000000       控制器活着 ✓
++ *   - 0x10580000（gpa1 所在块）可读 ✓     IRQ 引脚可配 ✓
++ *   - 0x14CE0000（GPJ1 pinmux）读就挂死 ✗  所以绝对不能碰
++ *   - tsp_io=1850mV / tsp_avdd=3300mV 都已使能 ✓
++ *
++ * 结论：I2C 引脚（gpj1-0/1）由 S-Boot/安全世界 mux 到 hsi2c7，
++ *       内核只负责 IRQ 引脚，因此完全不需要 pinctrl@14CE0000。
++ * 时钟用 fixed-clock 顶替，避开通不可达的 CMU_PERIC1(0x14C80000)。
++ */
++
++/* hsi2c7 的工作时钟。真实来源是 CMU_PERIC1 的 PCLK_HSI2C7，
++ * 但那个 CMU 地址不可访问，所以用一个固定频率顶替：
++ * i2c-exynos5 只用 clk_get_rate() 算分频，frequency 由 clock-frequency
++ * 属性另外给出，所以这里给个合理值即可。 */
++/ {
++	hsi2c7_clk: clock-hsi2c7 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <133000000>;
++		clock-output-names = "sclk_hsi2c7";
++	};
++};
++
++/*
++ * DSH: 触摸走真 hsi2c_7。
++ *
++ * 主线 exynos7.dtsi 里 hsi2c_7 基址写的是 0x13e10000，但 GIC 中断号
++ * 462 与原厂 hsi2c@14E10000 完全一致，且实测 0x14E10000 可读
++ * (=0x00000000)、0x14C_xxxx 一读就挂死。判定 0x13e10000 是笔误。
++ *
++ * 时钟：主线用 <&clock_peric1 PCLK_HSI2C7>，但 clock_peric1 被 disable、
++ * CMU_PERIC1(0x14C80000) 不可访问，故用 fixed-clock 顶替。
++ *
++ * pinctrl：主线 pinctrl-0=<&hs_i2c7_bus> 会写 pinctrl@14CE0000，而该块
++ * 读就挂死，必须删除。原厂触摸节点也只配 IRQ 引脚（gpa1-6），
++ * I2C 引脚由 S-Boot/安全世界 mux 好。
++ *
++ * 供电：tsp_io=1850mV(LDO15)、tsp_avdd=3300mV(LDO17) 均已实测使能。
++ */
++&hsi2c_7 {
++	reg = <0x14e10000 0x1000>;
++	interrupts = <GIC_SPI 462 IRQ_TYPE_LEVEL_HIGH>;
++	#address-cells = <1>;
++	#size-cells = <0>;
++	clocks = <&hsi2c7_clk>;
++	clock-names = "hsi2c";
++	/delete-property/ pinctrl-names;
++	/delete-property/ pinctrl-0;
++	clock-frequency = <400000>;
++	status = "okay";
++
++	touchscreen@49 {
++		compatible = "st,stmfts";
++		reg = <0x49>;
++		interrupt-parent = <&gpa1>;
++		interrupts = <6 IRQ_TYPE_LEVEL_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&tsp_attn_pin>;
++		vdd-supply = <&tsp_io_ldo15>;
++		avdd-supply = <&tsp_avdd_ldo17>;
++		touchscreen-size-x = <4096>;
++		touchscreen-size-y = <4096>;
++	};
++};
++
++/*
++ * DSH 2026-10-20: MAX77843（charger + fuel gauge + MUIC）。
++ * 详见 文档/05-专项/电池驱动移植-20261020.md
++ *
++ * 位置：hsi2c_1 (0x13650000)。硬件事实（vendor ctc_stock.dts）：
++ *   - SDA/SCL = gpd2-3 / gpd2-2（pinctrl "hs-i2c1-bus"，func2，pull-up）
++ *     实测 gpd2CON=0x00001100 ⇒ 当前是 func1 output，必须靠 pinctrl mux 到 func2
++ *   - MAX77843 是四 I2C 地址芯片：
++ *       0x66 = TOPSYS/PMIC（MFD 主地址）  0x69 = charger
++ *       0x36 = fuel gauge                  0x25 = MUIC
++ *   - IRQ = gpa1-4（vendor max77843,irq-gpio = <&gpa1 4 1>，低有效）
++ *
++ * hsi2c_1 的时钟：mainline exynos7.dtsi 指向 clock_peric0 的 PCLK_HSI2C1，
++ * 而本文件把 clock-controller@13610000(CMU_PERIC0) 整体 disable 了
++ * ⇒ hsi2c_1 会永远 -EPROBE_DEFER、i2c 总线不会出现。
++ * 这里按触摸 hsi2c_7 的既有做法用 fixed-clock 顶替（i2c-exynos5 只用
++ * clk_get_rate 算分频，真实门控由 S-Boot 留下）。pinctrl 用 mainline
++ * 自带的 hs_i2c1_bus（gpd2-3/2 func2），pinctrl_bus0(0x13470000) 已实测可访问。
++ *
++ * 两种绑定方式二选一：
++ *   DSH_MAX77843_USE_MFD=0（默认，最稳）：直接把 0x36/0x69 作为独立 i2c
++ *     设备（fuelgauge@36 / charger@69），完全不依赖 MFD/0x66/IRQ。
++ *   DSH_MAX77843_USE_MFD=1：走主线 MFD（max77843@66 + cell 子节点），
++ *     需要 CONFIG_MFD_MAX77843=y，且 0x66 必须能响应。
++ */
++/ {
++	hsi2c1_clk: clock-hsi2c1 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <133000000>;
++		clock-output-names = "sclk_hsi2c1";
++	};
++};
++
++#define DSH_MAX77843_USE_MFD 0
++
++/*
++ * DSH 2026-10-20 p215 实测：使能 hsi2c_1 后系统挂死（AXI 静默挂死，看门狗复位）。
++ * 根因判断：S-Boot 把 CMU_PERIC0(0x13610000) 的 HSI2C1 门控关掉了，
++ * 而我们把 clock-controller@13610000 整体 disable，无法用 CCF 打开它
++ * ⇒ 内核第一次读 0x13650000 控制器寄存器就 AXI 永不应答。
++ * 因此默认改用 i2c-gpio（只用已实测可访问的 pinctrl_bus0 gpd2-2/3），
++ * 完全避开 0x13650000 / CMU_PERIC0。
++ * 以后若在 loader/CCF 里把 PERIC0 门控打开，可把 DSH_MAX77843_USE_HSI2C1 改 1 切回硬件 I2C。
++ */
++#define DSH_MAX77843_USE_HSI2C1 0
++
++#if DSH_MAX77843_USE_MFD
++&pinctrl_alive {
++	chg_irq: chg-irq {
++		samsung,pins = "gpa1-4";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
++	};
++};
++
++&hsi2c_1 {
++	clocks = <&hsi2c1_clk>;
++	clock-names = "hsi2c";
++	clock-frequency = <400000>;
++	status = "okay";
++
++	max77843@66 {
++		compatible = "maxim,max77843";
++		reg = <0x66>;
++		interrupt-parent = <&gpa1>;
++		interrupts = <4 IRQ_TYPE_LEVEL_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&chg_irq>;
++
++		fuelgauge {
++			compatible = "maxim,max77843-fuelgauge";
++		};
++
++		charger {
++			compatible = "maxim,max77843-charger";
++		};
++	};
++};
++#elif DSH_MAX77843_USE_HSI2C1
++/* 备用：硬件 I2C。仅当 PERIC0/HSI2C1 门控已打开时可用（p215 会挂死）。 */
++&hsi2c_1 {
++	clocks = <&hsi2c1_clk>;
++	clock-names = "hsi2c";
++	clock-frequency = <400000>;
++	status = "okay";
++
++	/* MAX77843 fuel gauge block (MAX17050 compatible) */
++	fuelgauge@36 {
++		compatible = "maxim,max77843-fuelgauge";
++		reg = <0x36>;
++	};
++
++	/* MAX77843 charger block (read-only first stage) */
++	charger@69 {
++		compatible = "maxim,max77843-charger";
++		reg = <0x69>;
++	};
++};
++#else
++/*
++ * DSH 默认（p217+）：i2c-gpio 访问 MAX77843。
++ *
++ * 为什么：hsi2c_1(0x13650000) 的时钟门控在 CMU_PERIC0(0x13610000)，
++ * 而该 CMU 节点在本板被整体禁用（S-Boot 门控状态未知，p215 一访问就挂死）。
++ * i2c-gpio 只用 pinctrl_bus0 的 gpd2-2/3（0x13470000，已实测可访问），
++ * 同板已证明可行：touch-power dtsi 里的 s2mps15/s2mpb02 就是 i2c-gpio
++ * 挂在 gpg3 上且工作正常。
++ *
++ * 引脚（vendor ctc_stock.dts hsi2c@13650000）：
++ *   gpio_sda = <&gpd2 2>   gpio_scl = <&gpd2 3>
++ * 100kHz 足够：电量计/充电器都是秒级轮询，不追求带宽。
++ */
++/ {
++	i2c_max77843: i2c-max77843 {
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpd2 2 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpd2 3 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		i2c-gpio,timeout-ms = <100>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		/* MAX77843 fuel gauge block (MAX17050 compatible) */
++		fuelgauge@36 {
++			compatible = "maxim,max77843-fuelgauge";
++			reg = <0x36>;
++		};
++
++		/* MAX77843 charger block (read-only first stage) */
++		charger@69 {
++			compatible = "maxim,max77843-charger";
++			reg = <0x69>;
++		};
++	};
++};
++#endif /* DSH_MAX77843_USE_MFD / DSH_MAX77843_USE_HSI2C1 */
++
++/*
++ * DSH: UFS PHY 时钟二分测试。
++ *
++ * 已确认挂死链：UFS 启用 + phys 依赖
++ *   -> phy_power_on
++ *      -> ctrl_isol(false)        ✅ PMU 0x105C0720 实测可读
++ *      -> clk_bulk_prepare_enable ❌ 就是这里（跳过 calibrate 仍挂）
++ *      -> calibrate               ✅ 已排除
++ *
++ * PHY 原厂要 4 个时钟：
++ *   SCLK_COMBO_PHY_EMBEDDED_26M
++ *   PHYCLK_UFS20_RX1_SYMBOL_USER
++ *   PHYCLK_UFS20_RX0_SYMBOL_USER
++ *   PHYCLK_UFS20_TX0_SYMBOL_USER
++ * 这 4 个都在 clock_fsys1 的 fsys1_gate_clks[] 里，clk_get 能成功，
++ * 所以挂死在 clk_enable 写某个 CMU_FSYS1 gate 寄存器的时候。
++ *
++ * 先只保留 ref_clk 一个，确认是不是另外三个 symbol clock 之一。
++ */
++
++/*
++ * DSH: 启用 Mali-T760 MP8 GPU（Exynos7420）。
++ *
++ * 依据 vendor ctc_stock.dts 的 mali 节点：
++ *   reg = <0x14ac0000 0x5000>;              ← 和主线 exynos7.dtsi 完全一致 ✓
++ *   interrupts = <SPI 241> <SPI 242> <SPI 240>;  ← 也一致 ✓
++ *   interrupt-names = "JOB", "MMU", "GPU";
++ *
++ * 主线的 gpu@14ac0000 节点 compatible 是
++ *   "samsung,exynos5433-mali", "arm,mali-t760"
++ * panfrost 匹配第二个 "arm,mali-t760"（Midgard gen3），
++ * CONFIG_DRM_PANFROST=y 已经足够，6.6 没有单独的 Midgard ARCH 选项。
++ *
++ * cmu_g3d(0x14AA0000) 和 pd_g3d(PMU 0x105C4060) 在主线 DTS 里
++ * 默认就是 okay，且 0x14AA0000 在已实测的不可访问区(0x14C00000 起)之前。
++ */
++&gpu {
++	/*
++	 * DSH: 暂时禁用 panfrost。
++	 *
++	 * 2026-10-19 实测（p207）：gnome-shell 起来后关闭 panfrost 的 perfcnt fd，
++	 * 触发 pm_runtime_resume → panfrost_device_resume → panfrost_gpu_soft_reset()
++	 * 读 0x14AC0000 → **Asynchronous SError Interrupt → Kernel panic**。
++	 *
++	 * 根因：pd_g3d (PMU 0x105C4100) / CMU_G3D (0x14AA0000) 看似 status=okay，
++	 * 但 genpd 的 g3d 上电序列没有真正让 GPU 时钟/电源就绪，panfrost 一访问就 SError。
++	 *
++	 * 先禁用 GPU，让 mutter 回退到 llvmpipe 软件渲染，保证 GNOME 可用；
++	 * GPU 电源序列修好后再打开。
++	 */
++	status = "okay";
++	/*
++	 * DSH p211: GPU 保留 power-domains = <&pd_g3d>，但 pd_g3d 现在带
++	 * GENPD_FLAG_ALWAYS_ON（exynos7.dtsi 的 samsung,exynos7420-g3d-pd +
++	 * exynos-pm-domains.c）。
++	 *
++	 * p207 崩溃链：panfrost job 结束 50ms autosuspend → genpd 把 pd_g3d 断电
++	 * （0x105C4100=0，通用 5433 序列，无 vendor 上电序列）→ gnome-shell
++	 * 关 perfcnt fd 触发 runtime resume → genpd 名义上电 → panfrost 读
++	 * 0x14AC0000 → Asynchronous SError → panic。
++	 *
++	 * p211 原理：域永不 power-off，genpd_power_on() 因 status==ON 直接返回，
++	 * 不完整的 exynos_pd_power_on() 一次都不会执行；panfrost 的 suspend/resume
++	 * 只操作 GPU 内部 power 寄存器（上游标准路径），因此不再 SError。
++	 *
++	 * p210 备选（二选一，互斥）：不挂 power-domains、靠 cmdline 的
++	 * pd_ignore_unused 保住域。它依赖 cmdline、且破坏 device-genpd 拓扑，
++	 * 仅在 p211 出问题时回退用。回退方法：把下面一行取消注释。
++	 */
++	/delete-property/ power-domains;
++};
++
++/*
++ * ==========================================================================
++ * DSH: WiFi —— BCM4358（PCIe channel 1，Vendor:Device = 14e4:43e9）
++ * 详见 文档/05-专项/WiFi移植-20261019.md
++ *
++ * 与原厂 ctc_stock.dts / zenlte mainline DTS 的对应关系：
++ *   reg[0] "dbi"      0x157B0000  DWC core 配置空间
++ *   reg[1] "elbi"     0x15660000  链路状态/中断（GIC SPI 205）
++ *   reg[2] "phy"      0x15630000  combo PHY 模拟寄存器
++ *   reg[3] "block"    0x1005265C  SYSREG：PHY refclk 选择 + CMN_RST
++ *   reg[4] "pmu"      0x105C071C  PMU：PCIe PHY 上电控制 bit0
++ *   reg[5] "cmu"      0x156E0F00  CMU Q-Channel 强制打开 bit0
++ *   reg[6] "phy_pcs"  0x156F00E4  PHY PCS 控制
++ *   reg[7] "gates"    0x156E0000  CMU_FSYS1：PCIe 的 12 个门控都在这里
++ *   reg[8] "config"   0x1C000000  ATU config 窗口（CPU 侧）
++ *
++ * 为什么这个节点挂在根节点而不是 &soc：soc@0 的 ranges 只覆盖
++ * 0x00000000~0x18000000，而 config 窗口 0x1C000000 在范围之外；
++ * 放在 soc 下面会导致 of_address_to_resource() 翻译失败。
++ *
++ * 时钟门控：主线 clk-exynos7.c 还没有 CMU_FSYS1 的 PCIe gate 定义，
++ * 所以由驱动直接读改写 CMU_FSYS1 寄存器（"gates" 资源），
++ * 这与 zenlte 主线移植的做法一致。若以后补齐 CCF 定义可改为 clocks。
++ *
++ * 逐步启用：把 DSH_ENABLE_PCIE_WIFI 改成 0 重新编译即可完全关闭，
++ * 不影响当前已可用的 8 核/UFS/触摸/USB。
++ * ==========================================================================
++ */
++#define DSH_ENABLE_PCIE_WIFI 1
++
++#if DSH_ENABLE_PCIE_WIFI
++&pinctrl_bus1 {
++	pcie1_clkreq: pcie1-clkreq {
++		samsung,pins = "gpf0-6";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_2>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS7_PIN_DRV_LV4>;
++	};
++
++	pcie1_perst: pcie1-perst {
++		samsung,pins = "gpg2-0";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_OUTPUT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS7_PIN_DRV_LV4>;
++	};
++
++	cfg_wlanen: cfg-wlanen {
++		samsung,pins = "gpf4-6";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_OUTPUT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS7_PIN_DRV_LV4>;
++	};
++};
++
++&pinctrl_alive {
++	wlan_host_wake: wlan-host-wake {
++		samsung,pins = "gpa2-3";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
++	};
++};
++
++/ {
++	pcie1: pcie@157b0000 {
++		compatible = "samsung,exynos7420-pcie";
++		reg = <0x00 0x157b0000 0x00 0x1000>,	/* dbi */
++		      <0x00 0x15660000 0x00 0x1000>,	/* elbi */
++		      <0x00 0x15630000 0x00 0x1000>,	/* phy */
++		      <0x00 0x1005265c 0x00 0x04>,	/* block */
++		      <0x00 0x105c071c 0x00 0x04>,	/* pmu */
++		      <0x00 0x156e0f00 0x00 0x04>,	/* cmu */
++		      <0x00 0x156f00e4 0x00 0x04>,	/* phy_pcs */
++		      <0x00 0x156e0000 0x00 0x0d00>,	/* gates */
++		      <0x00 0x1c000000 0x00 0x1000>;	/* config */
++		reg-names = "dbi", "elbi", "phy", "block", "pmu", "cmu",
++			    "phy_pcs", "gates", "config";
++		#address-cells = <3>;
++		#size-cells = <2>;
++		#interrupt-cells = <1>;
++		device_type = "pci";
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SPI 205 IRQ_TYPE_LEVEL_HIGH>;
++		bus-range = <0x00 0xff>;
++		num-lanes = <1>;
++		ranges = <0x82000000 0 0x1c011000  0 0x1c011000  0 0x03feefff>;
++		dma-ranges = <0x42000000 0 0  0 0  1 0>;
++		perst-gpios = <&gpg2 0 GPIO_ACTIVE_LOW>;
++		wl-en-gpios = <&gpf4 6 GPIO_ACTIVE_HIGH>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pcie1_clkreq &pcie1_perst &cfg_wlanen
++			     &wlan_host_wake>;
++		status = "okay";
++	};
++};
++#endif /* DSH_ENABLE_PCIE_WIFI */

@@ -1,0 +1,114 @@
+diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch_timer.c
+index 7dd2c615b..a267b4dee 100644
+--- a/drivers/clocksource/arm_arch_timer.c
++++ b/drivers/clocksource/arm_arch_timer.c
+@@ -22,6 +22,7 @@
+ #include <linux/of_irq.h>
+ #include <linux/of_address.h>
+ #include <linux/io.h>
++#include <linux/math64.h>
+ #include <linux/slab.h>
+ #include <linux/sched/clock.h>
+ #include <linux/sched_clock.h>
+@@ -515,6 +516,57 @@ static const struct arch_timer_erratum_workaround ool_workarounds[] = {
+ 		.disable_compat_vdso = true,
+ 	},
+ #endif
++#ifdef CONFIG_ARM64
++	/*
++	 * DSH: Exynos7420 (SM-G9209 / zeroflte) -- broken firmware and CNTVOFF.
++	 *
++	 * The boot chain (S-Boot/secure monitor -> uniLoader -> kernel) enters
++	 * Linux at EL1 on every CPU and never programs CNTVOFF_EL2.  An arm64
++	 * kernel only clears CNTVOFF in __init_el2_timers (el2_setup.h), i.e.
++	 * when it is entered at EL2; CNTVOFF itself is writable only from EL2,
++	 * so at EL1 the kernel cannot fix it up.
++	 *
++	 * With mainline's "booted at EL1 -> use CNTVCT" policy every CPU then
++	 * reads a virtual counter carrying its own random offset (arm64
++	 * booting.rst requires CNTVOFF to be programmed with a consistent
++	 * value by the firmware when entering the kernel at EL1).
++	 *
++	 * Consequences: sched_clock()/printk timestamps differ per CPU, and
++	 * the timekeeper's global cycle_last is updated in one CPU's counter
++	 * domain while other CPUs read theirs, producing multi-second and
++	 * even 2^56-cycle time jumps (after which no hrtimer fires again).
++	 *
++	 * The vendor DT describes exactly this hardware: the arch timer is
++	 * "use-clocksource-only; use-physical-timer" and the MCT is
++	 * "use-clockevent-only".  The architected system counter read through
++	 * CNTPCT is global (the system counter is shared by all CPUs), so
++	 * pretending to be a counter-read erratum makes the OOL workaround
++	 * framework redirect the "virtual" read to CNTPCT, use the stable
++	 * (out-of-line) accessors and disable the vDSO fast path (see
++	 * arch_timer_enable_workaround(): it clears vdso_clock_mode whenever
++	 * ->read_cntvct_el0 is set, because the arm64 vDSO always reads
++	 * CNTVCT).
++	 *
++	 * Matching is done on the timer node itself (arch_timer_of_init() ->
++	 * arch_timer_check_ool_workaround(ate_match_dt, np)), so the property
++	 * has to live in the /timer node.  uniLoader already injects
++	 * "arm,cpu-registers-not-fw-configured" there and the zeroflte board
++	 * DTS sets it too; "use-physical-timer" is accepted as an alias so the
++	 * stock/vendor DTB keeps working unchanged.
++	 */
++	{
++		.match_type = ate_match_dt,
++		.id = "arm,cpu-registers-not-fw-configured",
++		.desc = "DSH: broken Exynos7420 firmware (CNTVOFF not configured)",
++		.read_cntvct_el0 = arch_counter_get_cntpct,
++	},
++	{
++		.match_type = ate_match_dt,
++		.id = "use-physical-timer",
++		.desc = "DSH: broken Exynos7420 firmware (CNTVOFF not configured)",
++		.read_cntvct_el0 = arch_counter_get_cntpct,
++	},
++#endif
+ };
+ 
+ typedef bool (*ate_match_fn_t)(const struct arch_timer_erratum_workaround *,
+@@ -1004,6 +1056,28 @@ static int arch_timer_starting_cpu(unsigned int cpu)
+ 	struct clock_event_device *clk = this_cpu_ptr(arch_timer_evt);
+ 	u32 flags;
+ 
++#ifdef CONFIG_ARM64
++	/*
++	 * DSH diagnostic (Exynos7420): S-Boot/secure monitor enters the
++	 * kernel at EL1 and never programs CNTVOFF_EL2, so (CNTVCT - CNTPCT)
++	 * is a per-CPU, essentially random offset -- the root cause of the
++	 * wild printk timestamps.  The workaround above makes the kernel
++	 * clock use the global CNTPCT, so these lines stay constant relative
++	 * to each other; the raw deltas are the proof of the broken virtual
++	 * offset.  Read-only registers, no functional effect.
++	 */
++	{
++		u64 vct = read_sysreg(cntvct_el0);
++		u64 pct = read_sysreg(cntpct_el0);
++		s64 off = (s64)(vct - pct);
++
++		pr_info("DSH: CPU%u CNTVCT=%llu CNTPCT=%llu CNTVOFF_implied=%lld ticks (~%lld ms)\n",
++			cpu, vct, pct, off,
++			arch_timer_rate > 1000 ?
++				div_s64(off, arch_timer_rate / 1000) : -1);
++	}
++#endif
++
+ 	__arch_timer_setup(ARCH_TIMER_TYPE_CP15, clk);
+ 
+ 	flags = check_ppi_trigger(arch_timer_ppi[arch_timer_uses_ppi]);
+diff --git a/drivers/clocksource/exynos_mct.c b/drivers/clocksource/exynos_mct.c
+index ef8cb1b71..cae590590 100644
+--- a/drivers/clocksource/exynos_mct.c
++++ b/drivers/clocksource/exynos_mct.c
+@@ -471,6 +471,10 @@ static int exynos4_mct_starting_cpu(unsigned int cpu)
+ 	evt->features = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT |
+ 			CLOCK_EVT_FEAT_PERCPU;
+ 	evt->rating = MCT_CLKEVENTS_RATING;
++	/* The stock zeroflte firmware uses MCT for clockevents. Prefer it to
++	 * the architectural timer (450) while retaining arch counter reads. */
++	if (of_machine_is_compatible("samsung,zeroflte"))
++		evt->rating = 500;
+ 
+ 	exynos4_mct_write(TICK_BASE_CNT, mevt->base + MCT_L_TCNTB_OFFSET);
+ 

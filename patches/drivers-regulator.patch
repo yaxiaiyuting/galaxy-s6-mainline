@@ -1,0 +1,166 @@
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index 965d4f0c1..70b7a624e 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -1284,6 +1284,15 @@ config REGULATOR_S2MPA01
+ 	 This driver controls Samsung S2MPA01 voltage output regulator
+ 	 via I2C bus. S2MPA01 has 10 Bucks and 26 LDO outputs.
+ 
++config REGULATOR_S2MPB02
++	tristate "Samsung S2MPB02 LDO17 regulator"
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  Support the LDO17 output of the Samsung S2MPB02 PMIC. This output
++	  supplies the touchscreen analog rail on the Galaxy S6 SM-G9209.
++	  Other regulators, interrupts and flash LEDs are not supported.
++
+ config REGULATOR_S2MPS11
+ 	tristate "Samsung S2MPS11/13/14/15/S2MPU02 voltage regulator"
+ 	depends on MFD_SEC_CORE || COMPILE_TEST
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index 23074714a..1210fac31 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -150,6 +150,7 @@ obj-$(CONFIG_REGULATOR_RTQ2134) += rtq2134-regulator.o
+ obj-$(CONFIG_REGULATOR_RTQ6752)	+= rtq6752-regulator.o
+ obj-$(CONFIG_REGULATOR_RTQ2208) += rtq2208-regulator.o
+ obj-$(CONFIG_REGULATOR_S2MPA01) += s2mpa01.o
++obj-$(CONFIG_REGULATOR_S2MPB02) += s2mpb02-regulator.o
+ obj-$(CONFIG_REGULATOR_S2MPS11) += s2mps11.o
+ obj-$(CONFIG_REGULATOR_S5M8767) += s5m8767.o
+ obj-$(CONFIG_REGULATOR_SC2731) += sc2731-regulator.o
+diff --git a/drivers/regulator/s2mpb02-regulator.c b/drivers/regulator/s2mpb02-regulator.c
+new file mode 100644
+index 000000000..78e4a02dc
+--- /dev/null
++++ b/drivers/regulator/s2mpb02-regulator.c
+@@ -0,0 +1,112 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* S2MPB02 LDO17 support, based on Samsung's universal7420 register map. */
++
++#include <linux/bits.h>
++#include <linux/i2c.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/regmap.h>
++#include <linux/regulator/driver.h>
++
++#define S2MPB02_REG_ID		0x00
++#define S2MPB02_REG_L17CTRL	0x2e
++#define S2MPB02_LDO_VSEL_MASK	GENMASK(6, 0)
++#define S2MPB02_LDO_ENABLE_MASK	BIT(7)
++
++static bool s2mpb02_readable_reg(struct device *dev, unsigned int reg)
++{
++	return reg == S2MPB02_REG_ID || reg == S2MPB02_REG_L17CTRL;
++}
++
++static bool s2mpb02_writeable_reg(struct device *dev, unsigned int reg)
++{
++	return reg == S2MPB02_REG_L17CTRL;
++}
++
++static const struct regmap_config s2mpb02_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = S2MPB02_REG_L17CTRL,
++	.readable_reg = s2mpb02_readable_reg,
++	.writeable_reg = s2mpb02_writeable_reg,
++	.cache_type = REGCACHE_NONE,
++};
++
++static const struct regulator_ops s2mpb02_ldo_ops = {
++	.list_voltage = regulator_list_voltage_linear,
++	.map_voltage = regulator_map_voltage_linear,
++	.get_voltage_sel = regulator_get_voltage_sel_regmap,
++	.set_voltage_sel = regulator_set_voltage_sel_regmap,
++	.is_enabled = regulator_is_enabled_regmap,
++	.enable = regulator_enable_regmap,
++	.disable = regulator_disable_regmap,
++};
++
++static const struct regulator_desc s2mpb02_ldo17 = {
++	.name = "LDO17",
++	.of_match = "ldo17",
++	.regulators_node = "regulators",
++	.id = 17,
++	.ops = &s2mpb02_ldo_ops,
++	.type = REGULATOR_VOLTAGE,
++	.owner = THIS_MODULE,
++	.min_uV = 600000,
++	.uV_step = 25000,
++	.n_voltages = 128,
++	.vsel_reg = S2MPB02_REG_L17CTRL,
++	.vsel_mask = S2MPB02_LDO_VSEL_MASK,
++	.enable_reg = S2MPB02_REG_L17CTRL,
++	.enable_mask = S2MPB02_LDO_ENABLE_MASK,
++	.enable_time = 180,
++};
++
++static int s2mpb02_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct regulator_config config = { .dev = dev };
++	struct regulator_dev *rdev;
++	struct regmap *regmap;
++	unsigned int id;
++	int ret;
++
++	regmap = devm_regmap_init_i2c(client, &s2mpb02_regmap_config);
++	if (IS_ERR(regmap))
++		return dev_err_probe(dev, PTR_ERR(regmap), "failed to create regmap\n");
++
++	ret = regmap_read(regmap, S2MPB02_REG_ID, &id);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to read chip ID\n");
++
++	config.regmap = regmap;
++	rdev = devm_regulator_register(dev, &s2mpb02_ldo17, &config);
++	if (IS_ERR(rdev))
++		return dev_err_probe(dev, PTR_ERR(rdev), "failed to register LDO17\n");
++
++	dev_info(dev, "S2MPB02 ID %02x; LDO17 regulator registered\n", id);
++	return 0;
++}
++
++static const struct of_device_id s2mpb02_of_match[] = {
++	{ .compatible = "samsung,s2mpb02" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, s2mpb02_of_match);
++
++static const struct i2c_device_id s2mpb02_i2c_id[] = {
++	{ "s2mpb02-regulator", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, s2mpb02_i2c_id);
++
++static struct i2c_driver s2mpb02_driver = {
++	.driver = {
++		.name = "s2mpb02-regulator",
++		.of_match_table = s2mpb02_of_match,
++	},
++	.probe = s2mpb02_probe,
++	.id_table = s2mpb02_i2c_id,
++};
++module_i2c_driver(s2mpb02_driver);
++
++MODULE_DESCRIPTION("Samsung S2MPB02 LDO17 regulator driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/regulator/s2mps11.c b/drivers/regulator/s2mps11.c
+index 570b61420..a89faf2dd 100644
+--- a/drivers/regulator/s2mps11.c
++++ b/drivers/regulator/s2mps11.c
+@@ -1202,8 +1202,9 @@ static int s2mps11_pmic_probe(struct platform_device *pdev)
+ 						&regulators[i], &config);
+ 		if (IS_ERR(regulator)) {
+ 			ret = PTR_ERR(regulator);
+-			dev_err(&pdev->dev, "regulator init failed for %d\n",
+-				i);
++			dev_err(&pdev->dev,
++				"regulator init failed for %d (%s) err=%d\n",
++				i, regulators[i].name, ret);
+ 			goto out;
+ 		}
+ 

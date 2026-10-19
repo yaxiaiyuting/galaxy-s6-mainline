@@ -1,0 +1,223 @@
+#!/bin/sh
+PATH=/bin:/sbin; export PATH
+
+# The initramfs owns the gadget. Keep legacy g_serial disabled in the kernel.
+usb_acm_start()
+(
+    set -e
+    mkdir -p /sys/kernel/config
+    if [ ! -d /sys/kernel/config/usb_gadget ]; then
+        mount -t configfs none /sys/kernel/config
+    fi
+    G=/sys/kernel/config/usb_gadget/g9209
+    mkdir -p "$G"
+    printf '0x1209\n' > "$G/idVendor"
+    printf '0x9210\n' > "$G/idProduct"
+    printf '0x0200\n' > "$G/bcdUSB"
+    printf '0x0100\n' > "$G/bcdDevice"
+    printf '0x02\n' > "$G/bDeviceClass"
+    mkdir -p "$G/strings/0x409" "$G/configs/c.1/strings/0x409"
+    printf 'G9209UFSUSB\n' > "$G/strings/0x409/serialnumber"
+    printf 'G9209 bringup\n' > "$G/strings/0x409/manufacturer"
+    printf 'G9209 Linux 6.6 UFS + ACM\n' > "$G/strings/0x409/product"
+    printf 'ACM console\n' > "$G/configs/c.1/strings/0x409/configuration"
+    printf '100\n' > "$G/configs/c.1/MaxPower"
+    mkdir -p "$G/functions/acm.usb0"
+    ln -s "$G/functions/acm.usb0" "$G/configs/c.1/acm.usb0"
+    # DSH: 加一个 ECM 网卡功能，让手机通过 USB 线拿到网络
+    # （WiFi 需要 wpa_supplicant，而 cloud 镜像没装，装它又要网络 —— 用 USB 打破鸡生蛋）
+    if mkdir -p "$G/functions/ecm.usb0" 2>/dev/null; then
+        printf '%s\n' "02:11:22:33:44:55" > "$G/functions/ecm.usb0/dev_addr" 2>/dev/null
+        printf '%s\n' "02:11:22:33:44:66" > "$G/functions/ecm.usb0/host_addr" 2>/dev/null
+        ln -sf "$G/functions/ecm.usb0" "$G/configs/c.1/ecm.usb0" 2>/dev/null
+        DSH_ECM=1
+    fi
+    ATTEMPT=0
+    UDC=
+    while [ "$ATTEMPT" -lt 10 ]; do
+        for DEVICE in /sys/class/udc/*; do
+            [ -e "$DEVICE" ] || continue
+            UDC=${DEVICE##*/}
+            break
+        done
+        [ -z "$UDC" ] || break
+        ATTEMPT=$((ATTEMPT + 1))
+        sleep 1
+    done
+    if [ -z "$UDC" ]; then
+        echo 'G9209 USB ERROR: no UDC after 10 seconds' >&2
+        exit 1
+    fi
+    printf '%s\n' "$UDC" > "$G/UDC"
+    echo "G9209 USB ACM bound to $UDC; serial=G9209UFSUSB"
+)
+
+usb_console()
+{
+    # Reopen the console when the shell exits or the gadget disconnects.
+    while :; do
+        /bin/setsid /bin/getty -L -n -i -l /bin/sh 115200 ttyGS0 vt100
+        sleep 1
+    done
+}
+
+mkdir -p /sys/kernel/debug
+mount -t debugfs none /sys/kernel/debug 2>/dev/null
+USB_READY=0
+if usb_acm_start; then
+    USB_READY=1
+else
+    echo 'G9209 USB ERROR: configfs ACM setup failed'
+fi
+
+# ===== DSH: 切根到 UFS 上的 Debian =====
+# 所有日志同时写到 /dev/ttyGS0（USB 控制台可见）和 /dev/console（屏幕）
+DSH_TTY=/dev/ttyGS0
+dsh_log()
+{
+    echo "G9209 $*" > $DSH_TTY 2>/dev/null
+    echo "G9209 $*" > /dev/console 2>/dev/null
+}
+
+dsh_try_switch_root()
+{
+    PART="$1"
+    TARGET="$2"
+    dsh_log "switch: start, part=$PART target=$TARGET"
+    dsh_log "switch: ttyGS0 exists: $([ -c /dev/ttyGS0 ] && echo YES || echo NO)"
+    N=0
+    while [ "$N" -lt 60 ]; do
+        [ -b "$PART" ] && break
+        N=$((N + 1))
+        sleep 1
+    done
+    dsh_log "switch: waited ${N}s, $PART: $([ -b "$PART" ] && echo FOUND || echo MISSING)"
+    dsh_log "switch: block devs: $(ls /dev/sd* /dev/mmcblk* 2>/dev/null | tr '\n' ' ')"
+    [ -b "$PART" ] || return 1
+
+    if ! mount -t ext4 -o rw "$PART" /mnt; then
+        dsh_log "switch: mount FAILED"
+        return 1
+    fi
+    dsh_log "switch: mounted OK"
+    dsh_log "switch: $TARGET -> $(ls -la /mnt$TARGET 2>&1 | head -1)"
+
+    mount -t proc    proc     /mnt/proc 2>/dev/null
+    mount -t sysfs   sysfs    /mnt/sys  2>/dev/null
+    mount -t devtmpfs devtmpfs /mnt/dev 2>/dev/null
+    mount -t tmpfs   tmpfs    /mnt/run  2>/dev/null
+
+    # DSH: 给 Debian 里准备 USB 网络的静态配置（ECM 会在 Debian 里变成 usb0）
+    mkdir -p /mnt/etc/systemd/network
+    printf '[Match]\nName=usb0\n\n[Network]\nAddress=192.168.42.2/24\nGateway=192.168.42.1\nDNS=223.5.5.5\nDNS=114.114.114.114\n' > /mnt/etc/systemd/network/20-usb0-static.network 2>/dev/null
+    dsh_log "net: usb0 static 192.168.42.2/24 written"
+
+    dsh_log "switch: mounts prepared"
+
+    # ---- 挂载之后做 chroot 自检（这才是有效检测）----
+    dsh_log "precheck: chroot test start"
+    if chroot /mnt /bin/sh -c 'echo PRECHECK-SH-OK; /sbin/init --version 2>&1 | head -3; uname -r' > /dev/ttyGS0 2>&1; then
+        dsh_log "precheck: chroot + /sbin/init OK"
+    else
+        dsh_log "precheck: chroot FAILED -- refuse to handover"
+        umount /mnt/dev /mnt/sys /mnt/proc /mnt/run /mnt 2>/dev/null
+        return 1
+    fi
+    # ---- PID1 handover ----
+    # 本脚本是 pmsg-init 的子进程（PID>=2），busybox switch_root 会因
+    # getpid()!=1 直接打印 usage 退出。所以把参数写给 PID1，然后 exit 88；
+    # pmsg-init 收到 88 后由它自己 exec /bin/switch_root（那时它才是 PID1）。
+    printf '%s\n%s\n' "/mnt" "$TARGET" > /tmp/dsh-handover
+    dsh_log "switch: HANDOVER to PID1 (exit 88), target=$TARGET"
+    # 实测 date -s 会让 hrtimer 子系统挂死（p200/p201），所以不动系统时间。
+    # systemd 的 clock_apply_epoch 会尝试拨快时钟，那由内核定时器修复后再解决。
+    exit 88
+}
+
+// DSH placeholder
+# ===== DSH PRECHECK: 在 switch_root 前用 chroot 全面自检 Debian 环境 =====
+dsh_precheck()
+{
+    L=/dev/ttyGS0
+    echo "=== PRECHECK BEGIN ===" > $L 2>&1
+    mount -t proc    proc     /mnt/proc 2>/dev/null
+    mount -t sysfs   sysfs    /mnt/sys  2>/dev/null
+    mount -t devtmpfs devtmpfs /mnt/dev 2>/dev/null
+    mount -t tmpfs   tmpfs    /mnt/run  2>/dev/null
+    echo "--- host uname ---" > $L
+    uname -a > $L 2>&1
+    echo "--- chroot test ---" > $L
+    chroot /mnt /bin/sh -c '
+        echo "[chroot] ok, pid=$$"
+        echo "[chroot] uname: $(uname -r)"
+        echo "[chroot] /sbin/init: $(ls -la /sbin/init)"
+        echo "[chroot] systemd version:"
+        /sbin/init --version 2>&1 | head -3
+        echo "[chroot] mounts:"
+        grep -E " (proc|sysfs|devtmpfs|tmpfs) " /proc/mounts | head -6
+        echo "[chroot] cgroup2 mount test:"
+        mkdir -p /sys/fs/cgroup
+        if mount -t cgroup2 none /sys/fs/cgroup 2>/tmp/cgerr; then
+            echo "[chroot] CGROUP2-OK"
+            ls /sys/fs/cgroup | head -3
+        else
+            echo "[chroot] CGROUP2-FAIL: $(cat /tmp/cgerr)"
+        fi
+        echo "[chroot] /dev/ttyGS0: $(ls -la /dev/ttyGS0 2>&1)"
+        echo "[chroot] /dev/console: $(ls -la /dev/console 2>&1)"
+        echo "[chroot] /proc/1: $(ls /proc/1 2>&1 | head -2 | tr "\n" " ")"
+        echo "[chroot] dbus dir: $(ls -d /run/dbus 2>&1)"
+        echo "[chroot] systemd libs:"
+        ldd /lib/systemd/systemd 2>&1 | head -8
+        echo "[chroot] DONE"
+    ' > $L 2>&1
+    echo "=== PRECHECK END ===" > $L 2>&1
+}
+
+# 切根策略：
+#   - command 为空               -> 默认启动 Debian
+#   - command 含 "bootdebian"    -> 显式启动 Debian
+#   - command 含 "norootfs"      -> 显式禁用
+#   - 其它任何 setcmd            -> 走诊断流程（保持 overnight/test 脚本可用）
+DSH_SWITCH=0
+DSH_CMD=""
+if [ -r /sys/firmware/devicetree/base/chosen/g9209,command ]; then
+    DSH_CMD=$(tr -d '\000' < /sys/firmware/devicetree/base/chosen/g9209,command)
+fi
+case "$DSH_CMD" in
+    *norootfs*)   DSH_SWITCH=0 ;;
+    "")           DSH_SWITCH=1 ;;
+    *bootdebian*) DSH_SWITCH=1 ;;
+    *)            DSH_SWITCH=0 ;;
+esac
+dsh_log "boot: cmd_len=${#DSH_CMD} switch=$DSH_SWITCH"
+if [ "$DSH_SWITCH" = 1 ]; then
+    # 先切到 shell 验证根文件系统；确认后再改成 /sbin/init
+    dsh_try_switch_root /dev/sda20 /sbin/init
+    dsh_log "switch: FAILED, staying in ramfs"
+    sleep 3
+fi
+
+echo 'G9209 DIAGNOSTICS BEGIN (RAM rootfs; no physical filesystem mounts)'
+uname -a
+echo 'G9209 uptime'; cat /proc/uptime
+echo 'G9209 partitions'; cat /proc/partitions
+echo 'G9209 block'; ls /sys/class/block
+echo 'G9209 input'; grep -E '^N:|^H:' /proc/bus/input/devices
+echo 'G9209 UDC'; ls /sys/class/udc
+echo 'G9209 mounts'; cat /proc/mounts
+echo 'G9209 UFS probe result'; dmesg | grep -E 'ufs|UFS|scsi|sd[a-z]' | tail -40
+if [ -r /sys/firmware/devicetree/base/chosen/g9209,command ]; then
+    CMD=$(tr -d '\000' < /sys/firmware/devicetree/base/chosen/g9209,command)
+    echo 'G9209 COMMAND BEGIN'
+    /bin/sh -c "$CMD"
+    RESULT=$?
+    echo "G9209 COMMAND END status=$RESULT"
+    exit "$RESULT"
+fi
+if [ "$USB_READY" = 1 ]; then
+    # Detach all pipe descriptors so PID 1 can finish its diagnostic report.
+    usb_console </dev/null >/dev/console 2>&1 &
+    echo 'G9209 USB shell ready on ttyGS0; no automatic idle reboot'
+fi
+echo 'G9209 no job supplied; staying in diagnostic userspace'

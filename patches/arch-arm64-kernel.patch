@@ -1,0 +1,655 @@
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 7b236994f..e96add776 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -72,6 +72,27 @@
+ 
+ 	.section ".idmap.text","a"
+ 
++	/* Board-local, opt-in probe ABI in dsh_regs[12..15]. No stack is
++	 * available here. x9-x11 are dead at each call site. Normal boot has
++	 * no magic/callback and falls straight through. */
++	.macro dsh_probe_checkpoint stage
++	adr_l	x9, dsh_regs
++	ldr	x10, [x9, #120]
++	mov_q	x11, 0x44534850524f4245
++	cmp	x10, x11
++	b.ne	.Lprobe_continue\@
++	mov	x10, #\stage
++	str	x10, [x9, #112]
++	ldr	x11, [x9, #104]
++	cmp	x10, x11
++	b.ne	.Lprobe_continue\@
++	ldr	x11, [x9, #96]
++	cbz	x11, .Lprobe_continue\@
++	mov	x0, #\stage
++	b	dsh_probe_exit
++.Lprobe_continue\@:
++	.endm
++
+ 	/*
+ 	 * The following callee saved general purpose registers are used on the
+ 	 * primary lowlevel boot path:
+@@ -87,9 +108,17 @@
+ 	 *  x28        create_idmap()                           callee preserved temp register
+ 	 */
+ SYM_CODE_START(primary_entry)
++	/* DSH_MIN: 最先安装异常向量表（物理地址，idmap 覆盖范围内），
++	 * 之后任何异常都会被捕获并把现场存入 dsh_regs。
++	 * 注意：只能用 x9 —— x0 是设备树物理地址，必须原样保留！*/
++	adr_l	x9, dsh_vectors
++	msr	vbar_el1, x9
++	isb
++	dsh_probe_checkpoint 1
+ 	bl	record_mmu_state
+ 	bl	preserve_boot_args
+ 	bl	create_idmap
++	dsh_probe_checkpoint 2
+ 
+ 	/*
+ 	 * If we entered with the MMU and caches on, clean the ID mapped part
+@@ -120,6 +149,7 @@ SYM_CODE_START(primary_entry)
+ 	mov	x0, x25
+ #endif
+ 	bl	__cpu_setup			// initialise processor
++	dsh_probe_checkpoint 3
+ 	b	__primary_switch
+ SYM_CODE_END(primary_entry)
+ 
+@@ -178,14 +208,16 @@ SYM_CODE_START_LOCAL(preserve_boot_args)
+ SYM_CODE_END(preserve_boot_args)
+ 
+ SYM_FUNC_START_LOCAL(clear_page_tables)
+-	/*
+-	 * Clear the init page tables.
+-	 */
++	/* DSH_MIN: 原实现是 `b __pi_memset` 尾调用，实测会挂死（标记停在 0x2401
++	 * 之后再无进展），故改为 8 字节/次的内联清零。*/
+ 	adrp	x0, init_pg_dir
+ 	adrp	x1, init_pg_end
+ 	sub	x2, x1, x0
+ 	mov	x1, xzr
+-	b	__pi_memset			// tail call
++0:	str	x1, [x0], #8
++	subs	x2, x2, #8
++	b.ne	0b
++	ret
+ SYM_FUNC_END(clear_page_tables)
+ 
+ /*
+@@ -395,6 +427,17 @@ SYM_FUNC_START_LOCAL(create_idmap)
+ 	mov	x6, #SWAPPER_BLOCK_SHIFT
+ 	bl	remap_region
+ 
++	/* Keep the diagnostic data writable through the temporary identity map.
++	 * The default mapping above is read-only; an exception handler writing
++	 * these variables would otherwise fault again after enabling the MMU. */
++	adrp	x1, _text
++	adrp	x2, dsh_regs
++	adrp	x3, dsh_marker + PAGE_SIZE
++	bic	x4, x2, #SWAPPER_BLOCK_SIZE - 1
++	mov_q	x5, SWAPPER_RW_MMUFLAGS
++	mov	x6, #SWAPPER_BLOCK_SHIFT
++	bl	remap_region
++
+ 	/* Remap the FDT after the kernel image */
+ 	adrp	x1, _text
+ 	adrp	x22, _end + SWAPPER_BLOCK_SIZE
+@@ -470,10 +513,27 @@ SYM_FUNC_END(create_kernel_mapping)
+  *   x0 = __pa(KERNEL_START)
+  */
+ SYM_FUNC_START_LOCAL(__primary_switched)
++	dsh_probe_checkpoint 7
++	adr_l	x9, dsh_marker
++	mov	x10, #0x2225
++	str	x10, [x9]
++	dc	cvac, x9
++	dsb	sy
+ 	adr_l	x4, init_task
+ 	init_cpu_task x4, x5, x6
+-
++	dsh_probe_checkpoint 8
++
++	/* Probe vectors must use the high mapping before TTBR0 is removed. */
++	adr_l	x9, dsh_regs
++	ldr	x10, [x9, #120]
++	mov_q	x11, 0x44534850524f4245
++	cmp	x10, x11
++	b.ne	.Lprobe_linux_vectors
++	adr_l	x8, dsh_vectors
++	b	.Lprobe_set_vectors
++.Lprobe_linux_vectors:
+ 	adr_l	x8, vectors			// load VBAR_EL1 with virtual
++.Lprobe_set_vectors:
+ 	msr	vbar_el1, x8			// vector table address
+ 	isb
+ 
+@@ -496,6 +556,7 @@ SYM_FUNC_START_LOCAL(__primary_switched)
+ 	sub	x2, x2, x0
+ 	bl	__pi_memset
+ 	dsb	ishst				// Make zero page visible to PTW
++	dsh_probe_checkpoint 9
+ 
+ #if VA_BITS > 48
+ 	adr_l	x8, vabits_actual		// Set this early so KASAN early init
+@@ -512,6 +573,7 @@ SYM_FUNC_START_LOCAL(__primary_switched)
+ #endif
+ 	mov	x0, x21				// pass FDT address in x0
+ 	bl	early_fdt_map			// Try mapping the FDT early
++	dsh_probe_checkpoint 10
+ 	mov	x0, x20				// pass the full boot status
+ 	bl	init_feature_override		// Parse cpu feature overrides
+ #ifdef CONFIG_UNWIND_PATCH_PAC_INTO_SCS
+@@ -520,6 +582,7 @@ SYM_FUNC_START_LOCAL(__primary_switched)
+ 	mov	x0, x20
+ 	bl	finalise_el2			// Prefer VHE if possible
+ 	ldp	x29, x30, [sp], #16
++	dsh_probe_checkpoint 11
+ 	bl	start_kernel
+ 	ASM_BUG()
+ SYM_FUNC_END(__primary_switched)
+@@ -744,8 +807,16 @@ SYM_FUNC_START(__enable_mmu)
+ 	msr	ttbr0_el1, x2			// load TTBR0
+ 	load_ttbr1 x1, x1, x3
+ 
++	/* Board bring-up restriction: retain bits [29:0], including M/C/I.
++	 * The previous BIC mask was 0xc000ffffffffffff: it cleared M and
++	 * retained bits [61:48], so reaching RET never proved MMU enablement.
++	 * No evidence here establishes firmware emulation of ID registers. */
++	and	x0, x0, #0x3fffffff
++
+ 	set_sctlr_el1	x0
+ 
++	/* set_sctlr_el1 already includes ic iallu; dsb nsh; isb. */
++
+ 	ret
+ SYM_FUNC_END(__enable_mmu)
+ 
+@@ -874,6 +945,24 @@ SYM_FUNC_START_LOCAL(__primary_switch)
+ 	adrp	x1, reserved_pg_dir
+ 	adrp	x2, init_idmap_pg_dir
+ 	bl	__enable_mmu
++	dsh_probe_checkpoint 4
++	adr_l	x9, dsh_regs
++	mrs	x10, tcr_el1
++	str	x10, [x9]
++	mrs	x10, mair_el1
++	str	x10, [x9, #8]
++	mrs	x10, sctlr_el1
++	str	x10, [x9, #16]
++	mrs	x10, ttbr1_el1
++	str	x10, [x9, #24]
++	mrs	x10, ttbr0_el1
++	str	x10, [x9, #32]
++	dc	cvac, x9
++	adr_l	x9, dsh_marker
++	mov	x10, #0x2221
++	str	x10, [x9]
++	dc	cvac, x9
++	dsb	sy
+ #ifdef CONFIG_RELOCATABLE
+ 	adrp	x23, KERNEL_START
+ 	and	x23, x23, MIN_KIMG_ALIGN - 1
+@@ -890,13 +979,196 @@ SYM_FUNC_START_LOCAL(__primary_switch)
+ #endif
+ 	bl	clear_page_tables
+ 	bl	create_kernel_mapping
++	dsh_probe_checkpoint 5
++	adr_l	x9, dsh_marker
++	mov	x10, #0x2223
++	str	x10, [x9]
++	dc	cvac, x9
++	dsb	sy
+ 
+ 	adrp	x1, init_pg_dir
+ 	load_ttbr1 x1, x1, x2
++	adr_l	x9, dsh_marker
++	mov	x10, #0x2501
++	str	x10, [x9]
++	dc	cvac, x9
++	dsb	sy
+ #ifdef CONFIG_RELOCATABLE
+ 	bl	__relocate_kernel
+ #endif
++	dsh_probe_checkpoint 6
+ 	ldr	x8, =__primary_switched
+ 	adrp	x0, KERNEL_START		// __pa(KERNEL_START)
+ 	br	x8
+ SYM_FUNC_END(__primary_switch)
++
++/* Called at the beginning of C start_kernel; inert on normal boot. */
++SYM_FUNC_START(dsh_probe_c_entry)
++	dsh_probe_checkpoint 12
++	ret
++SYM_FUNC_END(dsh_probe_c_entry)
++
++/* A probe ends this kernel run. Snapshot the tested state BEFORE repairing
++ * TTBR0, then reinstall the initial identity map from the high mapping.
++ * cpu_uninstall_idmap() must run unchanged; its empty TTBR0 cannot execute
++ * the physical exit trampoline. init_idmap_pg_dir is distinct from the
++ * init_pg_dir freed by paging_init(), and remains live through setup_arch.
++ * Scope: EL1, 4K/39-bit VA, payload PA 0x90000000, before free_initmem(). */
++	/* The permanent kernel mapping marks .idmap.text as NX at its high VA.
++	 * Keep this diagnostic entry executable through TTBR1 after paging_init;
++	 * the initial identity map also covers this ordinary .text address. */
++	.pushsection .text, "ax"
++SYM_CODE_START(dsh_probe_exit)
++	msr	daifset, #0xf
++	adr_l	x9, dsh_regs
++	ldr	x10, [x9, #184]
++	cbnz	x10, .Lprobe_park
++	mov	x10, #1
++	str	x10, [x9, #184]
++	mrs	x10, tcr_el1
++	str	x10, [x9]
++	mrs	x10, mair_el1
++	str	x10, [x9, #8]
++	mrs	x10, sctlr_el1
++	str	x10, [x9, #16]
++	mrs	x10, ttbr1_el1
++	str	x10, [x9, #24]
++	mrs	x10, ttbr0_el1
++	str	x10, [x9, #32]
++	mov	x10, sp
++	str	x10, [x9, #40]
++	mrs	x10, CurrentEL
++	str	x10, [x9, #48]
++	ldr	x17, [x9, #96]
++	/* Low-VA checkpoints still execute through the original identity map.
++	 * Only the high-VA path can safely replace TTBR0 underneath itself. */
++	mrs	x10, sctlr_el1
++	tbz	x10, #0, .Lprobe_jump_phys
++	adr	x10, .
++	tbz	x10, #63, .Lprobe_jump_phys
++	adr_l	x11, _text
++	mov_q	x12, 0x90000000
++	sub	x11, x11, x12		// high-VA to physical offset
++	adr_l	x10, reserved_pg_dir
++	sub	x10, x10, x11
++	dsb	ishst
++	msr	ttbr0_el1, x10
++	isb
++	tlbi	vmalle1
++	dsb	ish
++	isb
++	mrs	x10, tcr_el1
++	bic	x10, x10, #0x3f
++	mov	x12, #(64 - VA_BITS)
++	orr	x10, x10, x12
++	msr	tcr_el1, x10
++	isb
++	adr_l	x10, init_idmap_pg_dir
++	sub	x10, x10, x11
++	msr	ttbr0_el1, x10
++	isb
++.Lprobe_jump_phys:
++	adr_l	x9, dsh_probe_exit_phys
++	adr_l	x10, _text
++	sub	x9, x9, x10
++	mov_q	x10, 0x90000000
++	add	x9, x9, x10
++	br	x9
++SYM_INNER_LABEL(dsh_probe_exit_phys, SYM_L_LOCAL)
++	/* All memory touched so far is inside the loaded kernel (including
++	 * its page tables); make it coherent before returning with M/C off. */
++	adr_l	x10, _text
++	adr_l	x11, _end
++.Lprobe_flush:
++	dc	civac, x10
++	add	x10, x10, #64
++	cmp	x10, x11
++	b.lo	.Lprobe_flush
++	dsb	sy
++	mrs	x10, sctlr_el1
++	bic	x10, x10, #SCTLR_ELx_M
++	bic	x10, x10, #SCTLR_ELx_C
++	msr	sctlr_el1, x10
++	isb
++	ic	iallu
++	dsb	sy
++	isb
++	br	x17
++.Lprobe_park:
++	wfe
++	b	.Lprobe_park
++SYM_CODE_END(dsh_probe_exit)
++	.popsection
++
++/* ===== DSH_MIN: 最小异常向量表 =====
++ * 设计原则：处理程序自身必须绝对可靠，所以每一步都先留痕（写 dsh_regs[11] 计数器），
++ * 这样即使处理程序内部再出问题，也能从内存里看出它走到哪一步。*/
++	.pushsection .text, "ax"
++	.align	11
++dsh_vectors:
++	.rept	16
++	b	dsh_sync_handler
++	.align	7
++	.endr
++
++dsh_sync_handler:
++	/* 步骤 1：写"已进入处理程序"标记（最早、最简单）*/
++	adr_l	x15, dsh_marker
++	mov	x16, #0x2800
++	str	x16, [x15]
++	/* 步骤 2：计数器 = 1 */
++	adr_l	x15, dsh_regs
++	mov	x16, #1
++	str	x16, [x15, #88]
++	/* 步骤 3：ESR */
++	mrs	x16, esr_el1
++	str	x16, [x15, #64]
++	mov	x16, #2
++	str	x16, [x15, #88]
++	/* 步骤 4：FAR */
++	mrs	x16, far_el1
++	str	x16, [x15, #72]
++	mov	x16, #3
++	str	x16, [x15, #88]
++	/* 步骤 5：ELR */
++	mrs	x16, elr_el1
++	str	x16, [x15, #80]
++	mov	x16, #4
++	str	x16, [x15, #88]
++	/* On an armed probe, deliver the actual fault over loader USB. */
++	ldr	x9, [x15, #120]
++	mov_q	x10, 0x44534850524f4245
++	cmp	x9, x10
++	b.ne	.Lprobe_no_fault_return
++	ldr	x9, [x15, #96]
++	cbz	x9, .Lprobe_no_fault_return
++	mov	x0, #0x8000
++	b	dsh_probe_exit
++.Lprobe_no_fault_return:
++	/* A physical framebuffer is not in the temporary identity map.
++	 * Only draw with MMU off, or this handler would recurse on its store. */
++	mrs	x9, sctlr_el1
++	tbnz	x9, #0, 3f
++	mov	x9, #0xe2a0
++	lsl	x9, x9, #16
++	mov	w10, #0xff00
++	movk	w10, #0xff00, lsl #16
++	mov	x11, #46080
++1:	str	w10, [x9], #4
++	str	w10, [x9], #4
++	subs	x11, x11, #1
++	b.ne	1b
++3:
++	mov	x16, #5
++	adr_l	x15, dsh_regs
++	str	x16, [x15, #88]
++	dc	cvac, x15
++	add	x15, x15, #64
++	dc	cvac, x15
++	adr_l	x15, dsh_marker
++	dc	cvac, x15
++	dsb	sy
++2:	wfe
++	wfi
++	b	2b
++	.popsection
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index 417a8a86b..8da6ba04b 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -181,16 +181,62 @@ asmlinkage void __init early_fdt_map(u64 dt_phys)
+ 	early_fdt_ptr = fixmap_remap_fdt(dt_phys, &fdt_size, PAGE_KERNEL);
+ }
+ 
++/*
++ * DSH: 在 C 代码里触发一次探针检查点，等价于 head.S 里的 dsh_probe_checkpoint。
++ * 如果 loader 已武装（dsh_regs[15]==魔数）且目标就是本检查点，就直接跳到
++ * loader 回调；本次内核运行就此结束，下次探针重新拷贝原始 Image。
++ * 未武装时开销极小，直接返回。
++ */
++void dsh_probe_c(unsigned int stage)
++{
++	extern volatile unsigned long dsh_regs[];
++	extern void dsh_probe_exit(unsigned long stage);	/* 内核侧跳板 */
++	unsigned long target;
++
++	if (dsh_regs[15] != 0x44534850524f4245UL)	/* "DSHPROBE" */
++		return;
++	dsh_regs[14] = stage;
++	target = dsh_regs[13];
++	if (stage != target || !dsh_regs[12])
++		return;
++	/*
++	 * 关键：必须交给内核侧的 dsh_probe_exit 跳板，而【不能】直接调 loader 的
++	 * 回调地址。因为此刻 MMU 开着、页表只映射了内核镜像，loader 所在的
++	 * 0x47000000 区域没有映射 —— 直接跳过去会触发取指异常：
++	 *   ESR=0x86000005 (EC=0x21 instruction abort, DFSC=5 translation fault L1)
++	 *   FAR=ELR=loader 回调地址
++	 * dsh_probe_exit 负责关 MMU/缓存并完成物理地址过渡。
++	 */
++	dsh_probe_exit(stage);
++}
++
+ static void __init setup_machine_fdt(phys_addr_t dt_phys)
+ {
+ 	int size;
+-	void *dt_virt = fixmap_remap_fdt(dt_phys, &size, PAGE_KERNEL);
++	void *dt_virt;
+ 	const char *name;
++	extern volatile unsigned long dsh_marker;
++	extern volatile unsigned long dsh_regs[];
++
++	dsh_marker = 0x4011;		/* 进入 setup_machine_fdt */
++	dsh_probe_c(13);		/* 探针：进入 setup_machine_fdt */
++	dsh_regs[20] = dt_phys;		/* 引导程序给的 DT 物理地址 */
++
++	dt_virt = fixmap_remap_fdt(dt_phys, &size, PAGE_KERNEL);
++
++	dsh_regs[21] = (unsigned long)dt_virt;	/* 映射后的虚拟地址（0 = 映射失败）*/
++	dsh_regs[22] = (unsigned long)size;
++	dsh_marker = 0x4012;		/* fixmap_remap_fdt 返回 */
++	dsh_probe_c(14);		/* 探针：DT 映射返回 */
+ 
+ 	if (dt_virt)
+ 		memblock_reserve(dt_phys, size);
++	else
++		dsh_marker = 0x4013;	/* ★ dt_virt 为 NULL —— 映射失败 */
+ 
++	dsh_probe_c(15);		/* 探针：即将扫描设备树 */
+ 	if (!dt_virt || !early_init_dt_scan(dt_virt)) {
++		dsh_marker = 0x40FF;	/* ★★★ 设备树无效，即将进入死循环 ★★★ */
+ 		pr_crit("\n"
+ 			"Error: invalid device tree blob at physical address %pa (virtual address 0x%px)\n"
+ 			"The dtb must be 8-byte aligned and must not exceed 2 MB in size\n"
+@@ -206,15 +252,22 @@ static void __init setup_machine_fdt(phys_addr_t dt_phys)
+ 			cpu_relax();
+ 	}
+ 
++	dsh_probe_c(16);		/* 探针：设备树扫描成功 */
++	dsh_marker = 0x4014;		/* ★ early_init_dt_scan 成功 ✓ */
++
++	dsh_probe_c(17);		/* 探针：即将改为只读映射 */
+ 	/* Early fixups are done, map the FDT as read-only now */
+ 	fixmap_remap_fdt(dt_phys, &size, PAGE_KERNEL_RO);
++	dsh_probe_c(18);		/* ★ 探针：只读重映射返回 */
+ 
+ 	name = of_flat_dt_get_machine_name();
++	dsh_probe_c(19);		/* 探针：取到机器型号 */
+ 	if (!name)
+ 		return;
+ 
+ 	pr_info("Machine model: %s\n", name);
+ 	dump_stack_set_arch_desc("%s (DT)", name);
++	dsh_probe_c(20);		/* ★ 探针：setup_machine_fdt 完全走完 */
+ }
+ 
+ static void __init request_standard_resources(void)
+@@ -305,18 +358,31 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 	 */
+ 	arm64_use_ng_mappings = kaslr_requires_kpti();
+ 
++	/* DSH: 由 uniLoader 在下次启动时读出的进度标记 */
++	{
++		extern volatile unsigned long dsh_marker;
++		struct { const char *what; unsigned long val; } *unused = 0;
++		(void)unused;
++		dsh_marker = 0x4001;	/* setup_arch 开始 */
++	}
++
+ 	early_fixmap_init();
+ 	early_ioremap_init();
+ 
+ 	setup_machine_fdt(__fdt_pointer);
++	dsh_probe_c(21);		/* ★★ 探针：setup_machine_fdt 已返回 */
++	{ extern volatile unsigned long dsh_marker; dsh_marker = 0x4002; }	/* 设备树解析完成 */
+ 
+ 	/*
+ 	 * Initialise the static keys early as they may be enabled by the
+ 	 * cpufeature code and early parameters.
+ 	 */
+ 	jump_label_init();
++	dsh_probe_c(22);		/* 探针：jump_label 初始化完成 */
+ 	parse_early_param();
++	{ extern volatile unsigned long dsh_marker; dsh_marker = 0x4003; }	/* 早期参数解析完成 */
+ 
++	dsh_probe_c(23);		/* ★ 探针：parse_early_param 完成 */
+ 	dynamic_scs_init();
+ 
+ 	/*
+@@ -324,13 +390,17 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 	 * earlycon. (Report possible System Errors once we can report this
+ 	 * occurred).
+ 	 */
++	dsh_probe_c(24);		/* 探针：DAIF 恢复完成 */
+ 	local_daif_restore(DAIF_PROCCTX_NOIRQ);
+ 
+ 	/*
+ 	 * TTBR0 is only used for the identity mapping at this stage. Make it
+ 	 * point to zero page to avoid speculatively fetching new entries.
+ 	 */
++	dsh_probe_c(25);		/* 探针：即将卸载恒等映射 */
+ 	cpu_uninstall_idmap();
++	dsh_probe_c(26);		/* ★★ 探针：恒等映射已卸载 */
++	{ extern volatile unsigned long dsh_marker; dsh_marker = 0x4004; }	/* 恒等映射已卸载 */
+ 
+ 	xen_early_init();
+ 	efi_init();
+@@ -342,9 +412,19 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 			   FW_BUG "Booted with MMU enabled!");
+ 	}
+ 
++	/* USB DMA and the diagnostic return context stay owned by the loader.
++	 * Keep allocators from reusing its relocated image/arena during probes. */
++	{
++		extern volatile unsigned long dsh_regs[];
++		if (dsh_regs[15] == 0x44534850524f4245UL)
++			memblock_reserve(0x47000000, 0x02000000);
++	}
+ 	arm64_memblock_init();
++	dsh_probe_c(27);		/* 探针：memblock 初始化完成 */
+ 
+ 	paging_init();
++	dsh_probe_c(28);		/* ★★ 探针：paging_init（线性映射）完成 */
++	{ extern volatile unsigned long dsh_marker; dsh_marker = 0x4005; }	/* 线性映射建立完成 ★ */
+ 
+ 	acpi_table_upgrade();
+ 
+@@ -353,8 +433,12 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 
+ 	if (acpi_disabled)
+ 		unflatten_device_tree();
++	dsh_probe_c(29);		/* ★ 探针：设备树展开完成 */
++	{ extern volatile unsigned long dsh_marker; dsh_marker = 0x4006; }	/* 设备树展开完成 */
+ 
+ 	bootmem_init();
++	dsh_probe_c(30);		/* 探针：bootmem 完成 */
++	{ extern volatile unsigned long dsh_marker; dsh_marker = 0x4007; }	/* bootmem 完成 */
+ 
+ 	kasan_init();
+ 
+@@ -366,10 +450,13 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 		psci_dt_init();
+ 	else
+ 		psci_acpi_init();
++	{ extern volatile unsigned long dsh_marker; dsh_marker = 0x4008; }	/* ★ PSCI 初始化完成 */
+ 
++	dsh_probe_c(31);		/* ★★★ 探针：PSCI 初始化完成 */
+ 	init_bootcpu_ops();
+ 	smp_init_cpus();
+ 	smp_build_mpidr_hash();
++	{ extern volatile unsigned long dsh_marker; dsh_marker = 0x4009; }	/* SMP CPU 初始化完成 */
+ 
+ 	/* Init percpu seeds for random tags after cpus are set up. */
+ 	kasan_init_sw_tags();
+diff --git a/arch/arm64/kernel/time.c b/arch/arm64/kernel/time.c
+index b5855eb74..06a1158ad 100644
+--- a/arch/arm64/kernel/time.c
++++ b/arch/arm64/kernel/time.c
+@@ -56,17 +56,31 @@ void __init time_init(void)
+ {
+ 	u32 arch_timer_rate;
+ 
++	extern void dsh_probe_c(unsigned int stage);
++
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4140); }
++	dsh_probe_c(40);		/* ★ 进入 time_init */
+ 	of_clk_init(NULL);
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4141); }
++	dsh_probe_c(41);		/* ★★★ of_clk_init 返回（时钟驱动探测完成）*/
+ 	timer_probe();
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4142); }
++	dsh_probe_c(42);		/* ★★ timer_probe 返回 */
+ 
+ 	tick_setup_hrtimer_broadcast();
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4143); }
++	dsh_probe_c(43);		/* 探针：hrtimer 广播建立 */
+ 
+ 	arch_timer_rate = arch_timer_get_rate();
+ 	if (!arch_timer_rate)
+ 		panic("Unable to initialise architected timer.\n");
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4144); }
++	dsh_probe_c(44);		/* ★★ arch timer 频率可取 */
+ 
+ 	/* Calibrate the delay loop directly */
+ 	lpj_fine = arch_timer_rate / HZ;
+ 
+ 	pv_time_init();
++{ extern void dsh_mark(unsigned long); dsh_mark(0x4145); }
++	dsh_probe_c(45);		/* ★★★ time_init 完全结束 */
+ }
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index 8b70759cd..bab322d6c 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -18,6 +18,7 @@
+ #include <linux/module.h>
+ #include <linux/kexec.h>
+ #include <linux/delay.h>
++#include <linux/dsh_diag.h>
+ #include <linux/efi.h>
+ #include <linux/init.h>
+ #include <linux/sched/signal.h>
+@@ -204,6 +205,7 @@ static int __die(const char *str, long err, struct pt_regs *regs)
+ }
+ 
+ static DEFINE_RAW_SPINLOCK(die_lock);
++extern unsigned long dsh_diag_test_mode;
+ 
+ /*
+  * This function is protected against re-entrancy.
+@@ -212,6 +214,21 @@ void die(const char *str, struct pt_regs *regs, long err)
+ {
+ 	int ret;
+ 	unsigned long flags;
++	char dsh_message[160];
++
++	/* The controlled bootstrap run must retain the exception before oops
++	 * console output or die_lock can hide the original fault. Normal boots
++	 * retain the standard oops path without any diagnostic reset. */
++	if (READ_ONCE(dsh_diag_test_mode) == 1) {
++		unsigned long esr = read_sysreg(esr_el1);
++		unsigned long far = read_sysreg(far_el1);
++
++		scnprintf(dsh_message, sizeof(dsh_message),
++			  "die: %.72s ESR=%016lx FAR=%016lx",
++			  str ? str : "(null)", esr, far);
++		dsh_diag_panic(dsh_message, esr,
++			       regs ? instruction_pointer(regs) : 0);
++	}
+ 
+ 	raw_spin_lock_irqsave(&die_lock, flags);
+ 

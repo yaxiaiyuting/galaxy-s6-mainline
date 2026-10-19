@@ -1,0 +1,489 @@
+diff --git a/drivers/ufs/core/ufshcd.c b/drivers/ufs/core/ufshcd.c
+index 8382e8cfa..9c806c79d 100644
+--- a/drivers/ufs/core/ufshcd.c
++++ b/drivers/ufs/core/ufshcd.c
+@@ -4694,7 +4694,9 @@ static int ufshcd_hba_execute_hce(struct ufs_hba *hba)
+ 	ufshcd_vops_hce_enable_notify(hba, PRE_CHANGE);
+ 
+ 	/* start controller initialization sequence */
++	pr_emerg("DSHUFS-CORE: hba_start (writing HCE)\n");
+ 	ufshcd_hba_start(hba);
++	pr_emerg("DSHUFS-CORE: hba_start done, polling HCE\n");
+ 
+ 	/*
+ 	 * To initialize a UFS host controller HCE bit must be set to 1.
+@@ -4735,6 +4737,7 @@ static int ufshcd_hba_execute_hce(struct ufs_hba *hba)
+ 
+ int ufshcd_hba_enable(struct ufs_hba *hba)
+ {
++	pr_emerg("DSHUFS-CORE: hba_enable enter\n");
+ 	int ret;
+ 
+ 	if (hba->quirks & UFSHCI_QUIRK_BROKEN_HCE) {
+@@ -4838,9 +4841,13 @@ static int ufshcd_link_startup(struct ufs_hba *hba)
+ 
+ link_startup:
+ 	do {
+-		ufshcd_vops_link_startup_notify(hba, PRE_CHANGE);
++		ret = ufshcd_vops_link_startup_notify(hba, PRE_CHANGE);
++		if (ret)
++			goto out;
+ 
++		dev_info(hba->dev, "link startup: issuing DME_LINKSTARTUP\n");
+ 		ret = ufshcd_dme_link_startup(hba);
++		dev_info(hba->dev, "link startup: DME_LINKSTARTUP ret=%d\n", ret);
+ 
+ 		/* check if device is detected by inter-connect layer */
+ 		if (!ret && !ufshcd_is_device_present(hba)) {
+@@ -8620,7 +8627,9 @@ static int ufshcd_device_init(struct ufs_hba *hba, bool init_dev_params)
+ 
+ 	hba->ufshcd_state = UFSHCD_STATE_RESET;
+ 
++	pr_emerg("DSHUFS-INIT: calling link_startup\n");
+ 	ret = ufshcd_link_startup(hba);
++	pr_emerg("DSHUFS-INIT: link_startup ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -8638,12 +8647,16 @@ static int ufshcd_device_init(struct ufs_hba *hba, bool init_dev_params)
+ 		ufshcd_config_mcq(hba);
+ 
+ 	/* Verify device initialization by sending NOP OUT UPIU */
++	pr_emerg("DSHUFS-INIT: calling verify_dev_init\n");
+ 	ret = ufshcd_verify_dev_init(hba);
++	pr_emerg("DSHUFS-INIT: verify_dev_init ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* Initiate UFS initialization, and waiting until completion */
++	pr_emerg("DSHUFS-INIT: calling complete_dev_init\n");
+ 	ret = ufshcd_complete_dev_init(hba);
++	pr_emerg("DSHUFS-INIT: complete_dev_init ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -8784,16 +8797,22 @@ static void ufshcd_async_scan(void *data, async_cookie_t cookie)
+ 	struct ufs_hba *hba = (struct ufs_hba *)data;
+ 	int ret;
+ 
++	pr_emerg("DSHUFS-SCAN: async_scan enter\n");
+ 	down(&hba->host_sem);
+ 	/* Initialize hba, detect and initialize UFS device */
++	pr_emerg("DSHUFS-SCAN: calling probe_hba\n");
+ 	ret = ufshcd_probe_hba(hba, true);
++	pr_emerg("DSHUFS-SCAN: probe_hba ret=%d\n", ret);
+ 	up(&hba->host_sem);
+ 	if (ret)
+ 		goto out;
+ 
+ 	/* Probe and add UFS logical units  */
++	pr_emerg("DSHUFS-SCAN: calling add_lus\n");
+ 	ret = ufshcd_add_lus(hba);
++	pr_emerg("DSHUFS-SCAN: add_lus ret=%d\n", ret);
+ out:
++	pr_emerg("DSHUFS-SCAN: async_scan done ret=%d\n", ret);
+ 	/*
+ 	 * If we failed to initialize the device or the device is not
+ 	 * present, turn off the power/clocks etc.
+@@ -9085,8 +9104,10 @@ static int ufshcd_setup_clocks(struct ufs_hba *hba, bool on)
+ out:
+ 	if (ret) {
+ 		list_for_each_entry(clki, head, list) {
+-			if (!IS_ERR_OR_NULL(clki->clk) && clki->enabled)
++			if (!IS_ERR_OR_NULL(clki->clk) && clki->enabled) {
+ 				clk_disable_unprepare(clki->clk);
++				clki->enabled = false;
++			}
+ 		}
+ 	} else if (!ret && on) {
+ 		spin_lock_irqsave(hba->host->host_lock, flags);
+@@ -10244,6 +10265,7 @@ static const struct blk_mq_ops ufshcd_tmf_ops = {
+  */
+ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
+ {
++	pr_emerg("DSHUFS-CORE: ufshcd_init enter irq=%u\n", irq);
+ 	int err;
+ 	struct Scsi_Host *host = hba->host;
+ 	struct device *dev = hba->dev;
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+index 3396e0388..fbad755e5 100644
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -8,6 +8,8 @@
+  *
+  */
+ 
++#include <linux/arm-smccc.h>
++#include <linux/dsh_diag.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/module.h>
+@@ -42,7 +44,9 @@
+ #define UFS_SW_RST_MASK		(UFS_UNIPRO_SW_RST | UFS_LINK_SW_RST)
+ #define HCI_DATA_REORDER	0x60
+ #define HCI_UNIPRO_APB_CLK_CTRL	0x68
+-#define UNIPRO_APB_CLK(v, x)	(((v) & ~0xF) | ((x) & 0xF))
++#define UNIPRO_APB_CLK_MASK	0xF
++#define UNIPRO_APB_CLK(v, x)	\
++	(((v) & ~UNIPRO_APB_CLK_MASK) | ((x) & UNIPRO_APB_CLK_MASK))
+ #define HCI_AXIDMA_RWDATA_BURST_LEN	0x6C
+ #define HCI_GPIO_OUT		0x70
+ #define HCI_ERR_EN_PA_LAYER	0x78
+@@ -150,6 +154,12 @@ enum {
+ #define UFSPSLUN0	0x208
+ #define UFSPSCTRL0	0x20C
+ 
++/* Exynos7420 firmware interface, matching the vendor FMP/SMU calls. */
++#define EXYNOS7420_SMC_FMP	0xC2001810
++#define EXYNOS7420_SMC_SMU	0xC2001820
++#define EXYNOS7420_FMP_SECURITY	0x8
++#define EXYNOS7420_UFS_FMP	0x15572000
++
+ #define CNTR_DIV_VAL 40
+ 
+ static void exynos_ufs_auto_ctrl_hcc(struct exynos_ufs *ufs, bool en);
+@@ -415,13 +425,16 @@ static int exynos_ufs_get_clk_info(struct exynos_ufs *ufs)
+ 	struct ufs_hba *hba = ufs->hba;
+ 	struct list_head *head = &hba->clk_list_head;
+ 	struct ufs_clk_info *clki;
+-	unsigned long pclk_rate;
++	unsigned long pclk_rate, core_clk_rate;
+ 	u32 f_min, f_max;
+ 	u8 div = 0;
+ 	int ret = 0;
+ 
+-	if (list_empty(head))
++	if (list_empty(head)) {
++		dev_err(hba->dev, "no clock info\n");
++		ret = -EINVAL;
+ 		goto out;
++	}
+ 
+ 	list_for_each_entry(clki, head, list) {
+ 		if (!IS_ERR(clki->clk)) {
+@@ -439,18 +452,22 @@ static int exynos_ufs_get_clk_info(struct exynos_ufs *ufs)
+ 	}
+ 
+ 	ufs->mclk_rate = clk_get_rate(ufs->clk_unipro_main);
+-	pclk_rate = clk_get_rate(ufs->clk_hci_core);
++	core_clk_rate = clk_get_rate(ufs->clk_hci_core);
++	if (!ufs->mclk_rate || !core_clk_rate) {
++		dev_err(hba->dev, "invalid clock rates: mclk %lu, core %lu\n",
++			ufs->mclk_rate, core_clk_rate);
++		ret = -EINVAL;
++		goto out;
++	}
++	pclk_rate = core_clk_rate;
+ 	f_min = ufs->pclk_avail_min;
+ 	f_max = ufs->pclk_avail_max;
+ 
+ 	if (ufs->opts & EXYNOS_UFS_OPT_HAS_APB_CLK_CTRL) {
+-		do {
+-			pclk_rate /= (div + 1);
+-
+-			if (pclk_rate <= f_max)
+-				break;
++		while (pclk_rate > f_max && div < UNIPRO_APB_CLK_MASK) {
+ 			div++;
+-		} while (pclk_rate >= f_min);
++			pclk_rate = core_clk_rate / (div + 1);
++		}
+ 	}
+ 
+ 	if (unlikely(pclk_rate < f_min || pclk_rate > f_max)) {
+@@ -708,14 +725,41 @@ static void exynos_ufs_establish_connt(struct exynos_ufs *ufs)
+ 	ufshcd_dme_set(hba, UIC_ARG_MIB(T_CONNECTIONSTATE), CPORT_CONNECTED);
+ }
+ 
+-static void exynos_ufs_config_smu(struct exynos_ufs *ufs)
++static int exynos_ufs_config_smu(struct exynos_ufs *ufs)
+ {
+ 	u32 reg, val;
+ 
++	dsh_diag_note(0x80, "ufs:smu:hci");
++
++	/*
++	 * Exynos7420 firmware owns UFSP. Use the vendor firmware interface
++	 * with encryption disabled instead of accessing UFSP registers.
++	 */
++	if (of_device_is_compatible(ufs->hba->dev->of_node, "samsung,exynos7420-ufs")) {
++		struct arm_smccc_res res;
++
++		pr_emerg("DSHUFS: config_smu: 7420 -> SMC FMP\n");
++		arm_smccc_smc(EXYNOS7420_SMC_FMP, EXYNOS7420_FMP_SECURITY,
++			      EXYNOS7420_UFS_FMP, 0,
++			      0, 0, 0, 0, &res);
++		pr_emerg("DSHUFS: config_smu: FMP ret=%ld\n", (long)res.a0);
++		if (res.a0)
++			return -EIO;
++
++		pr_emerg("DSHUFS: config_smu: 7420 -> SMC SMU\n");
++		arm_smccc_smc(EXYNOS7420_SMC_SMU, 0, 0, 0,
++			      0, 0, 0, 0, &res);
++		pr_emerg("DSHUFS: config_smu: SMU ret=%ld\n", (long)res.a0);
++
++		return res.a0 ? -EIO : 0;
++	}
++
+ 	exynos_ufs_disable_auto_ctrl_hcc_save(ufs, &val);
+ 
+ 	/* make encryption disabled by default */
++	pr_emerg("DSHUFS: config_smu: reading UFSPRSECURITY\n");
+ 	reg = ufsp_readl(ufs, UFSPRSECURITY);
++	pr_emerg("DSHUFS: config_smu: UFSPRSECURITY=0x%x\n", reg);
+ 	ufsp_writel(ufs, reg | NSSMU, UFSPRSECURITY);
+ 	ufsp_writel(ufs, 0x0, UFSPSBEGIN0);
+ 	ufsp_writel(ufs, 0xffffffff, UFSPSEND0);
+@@ -723,6 +767,8 @@ static void exynos_ufs_config_smu(struct exynos_ufs *ufs)
+ 	ufsp_writel(ufs, 0xf1, UFSPSCTRL0);
+ 
+ 	exynos_ufs_auto_ctrl_hcc_restore(ufs, &val);
++
++	return 0;
+ }
+ 
+ static void exynos_ufs_config_sync_pattern_mask(struct exynos_ufs *ufs,
+@@ -953,19 +999,37 @@ static void exynos_ufs_config_intr(struct exynos_ufs *ufs, u32 errs, u8 index)
+ 	}
+ }
+ 
++static bool exynos_ufs_core_clk_enabled(struct ufs_hba *hba)
++{
++	struct ufs_clk_info *clki;
++
++	list_for_each_entry(clki, &hba->clk_list_head, list) {
++		if (!strcmp(clki->name, "core_clk"))
++			return clki->enabled;
++	}
++
++	return false;
++}
++
+ static int exynos_ufs_setup_clocks(struct ufs_hba *hba, bool on,
+ 				   enum ufs_notify_change_status status)
+ {
+ 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+ 
+-	if (!ufs)
++	/* Error cleanup can request clocks off after runtime suspend did so. */
++	if (!ufs || !exynos_ufs_core_clk_enabled(hba))
+ 		return 0;
+ 
+-	if (on && status == PRE_CHANGE) {
++	/* HCI registers are accessible only while the external clock is on. */
++	if (on && status == POST_CHANGE) {
+ 		if (ufs->opts & EXYNOS_UFS_OPT_BROKEN_AUTO_CLK_CTRL)
+ 			exynos_ufs_disable_auto_ctrl_hcc(ufs);
+ 		exynos_ufs_ungate_clks(ufs);
+-	} else if (!on && status == POST_CHANGE) {
++	} else if (!on && status == PRE_CHANGE) {
++		/*
++		 * Stop the internal clocks before the core disables the external
++		 * clock. POST_CHANGE would access an unclocked HCI register bank.
++		 */
+ 		exynos_ufs_gate_clks(ufs);
+ 		if (ufs->opts & EXYNOS_UFS_OPT_BROKEN_AUTO_CLK_CTRL)
+ 			exynos_ufs_enable_auto_ctrl_hcc(ufs);
+@@ -977,6 +1041,7 @@ static int exynos_ufs_setup_clocks(struct ufs_hba *hba, bool on,
+ static int exynos_ufs_pre_link(struct ufs_hba *hba)
+ {
+ 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
++	int ret;
+ 
+ 	/* hci */
+ 	exynos_ufs_config_intr(ufs, DFES_DEF_L2_ERRS, UNIPRO_L2);
+@@ -988,16 +1053,18 @@ static int exynos_ufs_pre_link(struct ufs_hba *hba)
+ 	exynos_ufs_config_unipro(ufs);
+ 
+ 	/* m-phy */
+-	exynos_ufs_phy_init(ufs);
++	ret = exynos_ufs_phy_init(ufs);
++	if (ret)
++		return ret;
+ 	if (!(ufs->opts & EXYNOS_UFS_OPT_SKIP_CONFIG_PHY_ATTR)) {
+ 		exynos_ufs_config_phy_time_attr(ufs);
+ 		exynos_ufs_config_phy_cap_attr(ufs);
+ 	}
+ 
+-	exynos_ufs_setup_clocks(hba, true, PRE_CHANGE);
++	exynos_ufs_setup_clocks(hba, true, POST_CHANGE);
+ 
+ 	if (ufs->drv_data->pre_link)
+-		ufs->drv_data->pre_link(ufs);
++		return ufs->drv_data->pre_link(ufs);
+ 
+ 	return 0;
+ }
+@@ -1130,6 +1197,8 @@ static inline void exynos_ufs_priv_init(struct ufs_hba *hba,
+ 
+ static int exynos_ufs_init(struct ufs_hba *hba)
+ {
++	dsh_diag_note(0x60, "ufs:init:enter");
++	pr_emerg("DSHUFS: init enter\n");
+ 	struct device *dev = hba->dev;
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct exynos_ufs *ufs;
+@@ -1153,6 +1222,8 @@ static int exynos_ufs_init(struct ufs_hba *hba)
+ 		return PTR_ERR(ufs->reg_unipro);
+ 	}
+ 
++	pr_emerg("DSHUFS: ioremap done\n");
++
+ 	/* ufs protector */
+ 	ufs->reg_ufsp = devm_platform_ioremap_resource_byname(pdev, "ufsp");
+ 	if (IS_ERR(ufs->reg_ufsp)) {
+@@ -1160,12 +1231,14 @@ static int exynos_ufs_init(struct ufs_hba *hba)
+ 		return PTR_ERR(ufs->reg_ufsp);
+ 	}
+ 
++	pr_emerg("DSHUFS: before parse_dt\n");
+ 	ret = exynos_ufs_parse_dt(dev, ufs);
+ 	if (ret) {
+ 		dev_err(dev, "failed to get dt info.\n");
+ 		goto out;
+ 	}
+ 
++	pr_emerg("DSHUFS: parse_dt ok, getting phy\n");
+ 	ufs->phy = devm_phy_get(dev, "ufs-phy");
+ 	if (IS_ERR(ufs->phy)) {
+ 		ret = PTR_ERR(ufs->phy);
+@@ -1173,6 +1246,7 @@ static int exynos_ufs_init(struct ufs_hba *hba)
+ 		goto out;
+ 	}
+ 
++	pr_emerg("DSHUFS: phy got, priv_init\n");
+ 	exynos_ufs_priv_init(hba, ufs);
+ 
+ 	if (ufs->drv_data->drv_init) {
+@@ -1183,11 +1257,18 @@ static int exynos_ufs_init(struct ufs_hba *hba)
+ 		}
+ 	}
+ 
++	pr_emerg("DSHUFS: before get_clk_info\n");
+ 	ret = exynos_ufs_get_clk_info(ufs);
++	pr_emerg("DSHUFS: get_clk_info ret=%d\n", ret);
+ 	if (ret)
+ 		goto out;
++	pr_emerg("DSHUFS: specify_phy_time_attr\n");
+ 	exynos_ufs_specify_phy_time_attr(ufs);
+-	exynos_ufs_config_smu(ufs);
++	pr_emerg("DSHUFS: >>> before config_smu\n");
++	ret = exynos_ufs_config_smu(ufs);
++	if (ret)
++		goto out;
++	pr_emerg("DSHUFS: <<< after config_smu OK\n");
+ 	return 0;
+ 
+ out:
+@@ -1293,8 +1374,11 @@ static void exynos_ufs_post_hibern8(struct ufs_hba *hba, u8 enter)
+ }
+ 
+ static int exynos_ufs_hce_enable_notify(struct ufs_hba *hba,
++
+ 					enum ufs_notify_change_status status)
+ {
++	pr_emerg("DSHUFS: hce_enable_notify status=%d\n", status);
++
+ 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+ 	int ret = 0;
+ 
+@@ -1401,13 +1485,15 @@ static int exynos_ufs_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op,
+ static int exynos_ufs_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
+ {
+ 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
++	int ret;
+ 
+-	if (!ufshcd_is_link_active(hba))
+-		phy_power_on(ufs->phy);
+-
+-	exynos_ufs_config_smu(ufs);
++	if (!ufshcd_is_link_active(hba)) {
++		ret = phy_power_on(ufs->phy);
++		if (ret)
++			return ret;
++	}
+ 
+-	return 0;
++	return exynos_ufs_config_smu(ufs);
+ }
+ 
+ static int exynosauto_ufs_vh_link_startup_notify(struct ufs_hba *hba,
+@@ -1589,6 +1675,7 @@ static struct ufs_hba_variant_ops ufs_hba_exynosauto_vh_ops = {
+ 
+ static int exynos_ufs_probe(struct platform_device *pdev)
+ {
++	dsh_diag_note(0x50, "ufs:probe:enter");
+ 	int err;
+ 	struct device *dev = &pdev->dev;
+ 	const struct ufs_hba_variant_ops *vops = &ufs_hba_exynos_ops;
+@@ -1763,7 +1850,19 @@ static struct platform_driver exynos_ufs_pltform = {
+ 		.of_match_table = exynos_ufs_of_match,
+ 	},
+ };
+-module_platform_driver(exynos_ufs_pltform);
++/*
++ * DSH: 改成 late_initcall，让 UFS 在 framebuffer(simplefb) 起来之后才 probe。
++ *
++ * 原因：console=tty0 在 simplefb 出现之前没有任何显示后端，早期输出全部丢失。
++ * 而 UFS probe 挂死时我们唯一的信息来源就是屏幕，所以必须把 UFS 挪到
++ * 显示后端就绪之后再 probe，这样 pr_emerg 的每一行都能看到。
++ * 正式提交前应改回 module_platform_driver。
++ */
++static int __init exynos_ufs_late_init(void)
++{
++	return platform_driver_register(&exynos_ufs_pltform);
++}
++late_initcall(exynos_ufs_late_init);
+ 
+ MODULE_AUTHOR("Alim Akhtar <alim.akhtar@samsung.com>");
+ MODULE_AUTHOR("Seungwon Jeon  <essuuj@gmail.com>");
+diff --git a/drivers/ufs/host/ufshcd-pltfrm.c b/drivers/ufs/host/ufshcd-pltfrm.c
+index 797a4dfe4..887d5e751 100644
+--- a/drivers/ufs/host/ufshcd-pltfrm.c
++++ b/drivers/ufs/host/ufshcd-pltfrm.c
+@@ -338,19 +338,25 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
+ 	int irq, err;
+ 	struct device *dev = &pdev->dev;
+ 
++	pr_emerg("DSHUFS-PLT: probe enter\n");
++
+ 	mmio_base = devm_platform_ioremap_resource(pdev, 0);
++	pr_emerg("DSHUFS-PLT: ioremap %s\n", IS_ERR(mmio_base) ? "FAILED" : "ok");
+ 	if (IS_ERR(mmio_base)) {
+ 		err = PTR_ERR(mmio_base);
+ 		goto out;
+ 	}
+ 
+ 	irq = platform_get_irq(pdev, 0);
++	pr_emerg("DSHUFS-PLT: irq=%d\n", irq);
+ 	if (irq < 0) {
+ 		err = irq;
+ 		goto out;
+ 	}
+ 
++	pr_emerg("DSHUFS-PLT: alloc_host ...\n");
+ 	err = ufshcd_alloc_host(dev, &hba);
++	pr_emerg("DSHUFS-PLT: alloc_host ret=%d\n", err);
+ 	if (err) {
+ 		dev_err(dev, "Allocation failed\n");
+ 		goto out;
+@@ -358,7 +364,9 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
+ 
+ 	hba->vops = vops;
+ 
++	pr_emerg("DSHUFS-PLT: parse_clock_info ...\n");
+ 	err = ufshcd_parse_clock_info(hba);
++	pr_emerg("DSHUFS-PLT: parse_clock_info ret=%d\n", err);
+ 	if (err) {
+ 		dev_err(dev, "%s: clock parse failed %d\n",
+ 				__func__, err);
+@@ -373,7 +381,9 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
+ 
+ 	ufshcd_init_lanes_per_dir(hba);
+ 
++	pr_emerg("DSHUFS-PLT: >>> calling ufshcd_init\n");
+ 	err = ufshcd_init(hba, mmio_base, irq);
++	pr_emerg("DSHUFS-PLT: <<< ufshcd_init ret=%d\n", err);
+ 	if (err) {
+ 		dev_err_probe(dev, err, "Initialization failed with error %d\n",
+ 			      err);
