@@ -1,0 +1,18 @@
+[Unit]
+Description=G9209 session fixes (/tmp perms + user extensions)
+Before=gdm.service
+After=systemd-tmpfiles-setup.service
+
+[Service]
+Type=oneshot
+# 修复 /tmp/.X11-unix 权限（否则 gnome-shell 报
+# "Failed to start X Wayland: Directory /tmp/.X11-unix is not writable"
+# 并且 root 的 Wayland 会话根本起不来，屏幕停在 GDM greeter）
+ExecStart=/bin/sh -c 'chmod 1777 /tmp; mkdir -p /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix; chown root:root /tmp/.X11-unix'
+# 确保用户扩展没被全局禁用（disable-user-extensions=true 会让
+# Dash to Dock 等所有扩展都不加载，左侧任务栏就没了）
+ExecStart=/bin/sh -c 'for u in /run/user/*/; do [ -S "${u}bus" ] || continue; XDG_RUNTIME_DIR="$u" DBUS_SESSION_BUS_ADDRESS="unix:path=${u}bus" gsettings set org.gnome.shell disable-user-extensions false 2>/dev/null || true; done'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

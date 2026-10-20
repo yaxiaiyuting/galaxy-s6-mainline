@@ -1,0 +1,88 @@
+diff --git a/drivers/input/keyboard/cypress-mbr-touchkey.c b/drivers/input/keyboard/cypress-mbr-touchkey.c
+--- a/drivers/input/keyboard/cypress-mbr-touchkey.c
++++ b/drivers/input/keyboard/cypress-mbr-touchkey.c
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include <linux/bits.h>
++#include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/i2c.h>
+ #include <linux/input.h>
+@@ -28,6 +29,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/property.h>
++#include <linux/regulator/consumer.h>
+ #include <linux/slab.h>
+ 
+ #define MBR_TOUCHKEY_KEYCODE_REG	0x03
+@@ -106,6 +108,27 @@
+ 		return dev_err_probe(&client->dev, -ENODEV,
+ 				     "missing interrupt\n");
+ 
++	/*
++	 * The CY8CMBR31x5 core rail (vtouch_3.3v = S2MPS15 LDO21 on
++	 * zeroflte) is not enabled by the bootloader: reading PMIC
++	 * register 0x48 after boot shows bit[7:6] = 00 (off) and the
++	 * controller then NAKs its address.  Enable it explicitly here
++	 * so probe ordering is handled by the regulator core's deferred
++	 * probe rather than by initcall order.
++	 *
++	 * devm_regulator_get_enable() also disables the rail again when
++	 * the device goes away; a missing supply is not fatal (dummy
++	 * regulator), which keeps the driver usable on boards where the
++	 * rail is always on.
++	 */
++	error = devm_regulator_get_enable(&client->dev, "vdd");
++	if (error)
++		return dev_err_probe(&client->dev, error,
++				     "failed to enable VDD supply\n");
++
++	/* Datasheet/vendor ic-stabilizing-time: let the IC boot. */
++	msleep(150);
++
+ 	touchkey = devm_kzalloc(&client->dev, sizeof(*touchkey), GFP_KERNEL);
+ 	if (!touchkey)
+ 		return -ENOMEM;
+@@ -117,8 +140,8 @@
+ 					       touchkey->keycodes,
+ 					       MBR_TOUCHKEY_MAX_KEYS);
+ 	if (touchkey->num_keycodes <= 0) {
+-		touchkey->keycodes[0] = KEY_BACK;
+-		touchkey->keycodes[1] = KEY_MENU;
++		touchkey->keycodes[0] = KEY_MENU;
++		touchkey->keycodes[1] = KEY_BACK;
+ 		touchkey->num_keycodes = 2;
+ 	}
+ 
+@@ -150,6 +173,17 @@
+ 	touchkey->input = input;
+ 	i2c_set_clientdata(client, touchkey);
+ 
++	/*
++	 * Register the input device before hooking up the interrupt: the
++	 * ATTN line may already be asserted when we request the IRQ, and
++	 * the threaded handler must not report keys on an unregistered
++	 * input device.
++	 */
++	error = input_register_device(input);
++	if (error)
++		return dev_err_probe(&client->dev, error,
++				     "failed to register input device\n");
++
+ 	error = devm_request_threaded_irq(&client->dev, client->irq, NULL,
+ 					  mbr_touchkey_irq_handler,
+ 					  IRQF_ONESHOT,
+@@ -158,11 +192,6 @@
+ 		return dev_err_probe(&client->dev, error,
+ 				     "failed to request IRQ %d\n", client->irq);
+ 
+-	error = input_register_device(input);
+-	if (error)
+-		return dev_err_probe(&client->dev, error,
+-				     "failed to register input device\n");
+-
+ 	return 0;
+ }
+ 

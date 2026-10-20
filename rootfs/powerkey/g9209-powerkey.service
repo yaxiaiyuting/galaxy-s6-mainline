@@ -1,0 +1,17 @@
+[Unit]
+Description=G9209 power key daemon (lock/unlock like Android)
+After=gdm.service
+Wants=gdm.service
+
+[Service]
+Type=simple
+# ★关键：必须给守护程序 D-Bus 会话环境，否则它调 gdbus 会失败
+Environment=XDG_RUNTIME_DIR=/run/user/0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
+ExecStart=/usr/local/bin/powerkeyd
+Restart=always
+RestartSec=3
+SupplementaryGroups=input
+
+[Install]
+WantedBy=multi-user.target

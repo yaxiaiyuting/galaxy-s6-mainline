@@ -1,0 +1,410 @@
+diff --git a/sound/soc/samsung/Kconfig b/sound/soc/samsung/Kconfig
+index 93c2b1b08..74de6a425 100644
+--- a/sound/soc/samsung/Kconfig
++++ b/sound/soc/samsung/Kconfig
+@@ -146,4 +146,19 @@ config SND_SOC_SAMSUNG_MIDAS_WM1811
+ 	help
+ 	  Say Y if you want to add support for SoC audio on the Midas boards.
+ 
++config SND_SOC_ZEROFLTE
++	tristate "SoC I2S Audio support for Samsung Galaxy S6 (zeroflte)"
++	depends on SND_SOC_SAMSUNG
++	depends on MFD_MADERA
++	depends on MFD_CS47L85
++	depends on GPIOLIB || COMPILE_TEST
++	select SND_SOC_CS47L85
++	select SND_SOC_MADERA
++	select SND_SAMSUNG_I2S
++	help
++	  Say Y if you want to add support for the WM1840 (CS47L85)
++	  codec on the Samsung Galaxy S6 (Exynos7420 / zeroflte).
++	  The codec is connected through a bit-banged SPI bus, is the
++	  I2S clock master and drives the headphone output.
++
+ endif #SND_SOC_SAMSUNG
+diff --git a/sound/soc/samsung/Makefile b/sound/soc/samsung/Makefile
+index f5d327b90..edcccc4dd 100644
+--- a/sound/soc/samsung/Makefile
++++ b/sound/soc/samsung/Makefile
+@@ -42,3 +42,6 @@ obj-$(CONFIG_SND_SOC_ARNDALE) += snd-soc-arndale.o
+ obj-$(CONFIG_SND_SOC_SAMSUNG_TM2_WM5110) += snd-soc-tm2-wm5110.o
+ obj-$(CONFIG_SND_SOC_SAMSUNG_ARIES_WM8994) += snd-soc-aries-wm8994.o
+ obj-$(CONFIG_SND_SOC_SAMSUNG_MIDAS_WM1811) += snd-soc-midas-wm1811.o
++
++snd-soc-zeroflte-objs := zeroflte.o
++obj-$(CONFIG_SND_SOC_ZEROFLTE) += snd-soc-zeroflte.o
+diff --git a/sound/soc/samsung/zeroflte.c b/sound/soc/samsung/zeroflte.c
+new file mode 100644
+index 000000000..6158a9ff7
+--- /dev/null
++++ b/sound/soc/samsung/zeroflte.c
+@@ -0,0 +1,369 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ALSA SoC machine driver for Samsung Galaxy S6 (SM-G9209 / zeroflte)
++ *
++ * The board carries a Cirrus Logic WM1840 (CS47L85 "Clearwater", Madera
++ * family) codec on SPI0 and wires its AIF1 to the Exynos7420 I2S0
++ * controller.  The speakers are driven through a separate MAX98505 class-D
++ * amplifier connected to codec AIF4; that link is not described here yet
++ * (phase 3), so this driver only exposes the headphone path:
++ *
++ *	AP (I2S0, slave) <== AIF1 ==> WM1840 (I2S master) --> HPOUT1L/R
++ *
++ * Clocking (see 文档/05-专项/音频移植调研-20261021.md):
++ *
++ *   - We must not touch CMU_AUD's PLL/mux: "mout_aud_pll_user" and
++ *     "dout_aud_cdclk" also feed the Bluetooth UART, which is a verified
++ *     working feature on this board.
++ *   - Instead the AP only provides MCLK1 = 24 MHz from the PMU CLKOUT
++ *     (PMU_DEBUG, 0x105c0a00), the codec's FLL1 multiplies it up to
++ *     SYSCLK and the codec is the I2S bit/frame clock master (CBP_CFP).
++ *   - The AP side just needs PCLK_I2S (6 MHz, already enabled by S-Boot).
++ *
++ * Copyright (c) 2026
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/mfd/madera/core.h>
++#include <linux/mfd/madera/registers.h>
++#include <linux/mfd/syscon.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <sound/soc.h>
++#include <sound/soc-dai.h>
++
++#include "i2s.h"
++#include "../codecs/madera.h"
++
++#define DRV_NAME		"zeroflte-audio"
++
++/* MCLK1 comes from the PMU CLKOUT, which is the 24 MHz XXTI crystal. */
++#define ZEROFLTE_MCLK1_HZ	24000000
++
++/*
++ * PMU_DEBUG (PMU base 0x105c0000 + 0x0a00).
++ *   bit 0      CLKOUT_DISABLE (1 = clock off)
++ *   bits 12:8  CLKOUT_SEL, 0x10 = XXTI (24 MHz)
++ * vendor writes 0x1000 to enable and 0x1001 to disable.
++ */
++#define ZEROFLTE_PMU_DEBUG		0x0a00
++#define ZEROFLTE_PMU_CLKOUT_MASK	0x1f01
++#define ZEROFLTE_PMU_CLKOUT_ON		0x1000
++
++struct zeroflte_priv {
++	struct regmap *pmu;
++	struct gpio_desc *ldoena;
++	bool pmu_clkout_on;
++};
++
++/*
++ * Pick SYSCLK for a given sample rate.
++ *
++ * madera_get_sysclk_setting() only accepts a fixed set of rates
++ * (5.6448/6.144/11.2896/12.288/22.5792/24.576/45.1584/49.152/90.3168/
++ * 98.304 MHz), so "rate * 512" works for 44.1k/48k/88.2k/96k/192k but
++ * produces unsupported values for 8k/16k/32k.  Keep the 512 fs ratio for
++ * the high rates and fall back to the base rate of the same audio family
++ * for the low ones; the codec only needs SYSCLK to be an integer multiple
++ * of the BCLK it generates.
++ */
++static unsigned int zeroflte_sysclk(unsigned int rate)
++{
++	unsigned int mult;
++
++	/*
++	 * Same family split as madera_hw_params(): multiples of 4 kHz use the
++	 * 48 kHz BCLK table, everything else the 44.1 kHz one.  Below the
++	 * base rate the 24.576/22.5792 MHz clocks divide evenly by any rate
++	 * of their family (e.g. 24576000/12000 = 2048).
++	 */
++	if (rate % 4000 == 0) {
++		mult = max(rate / 48000, 1U);
++		return 24576000 * mult;		/* 48k family */
++	}
++
++	mult = max(rate / 44100, 1U);
++	return 22579200 * mult;			/* 44.1k family */
++}
++
++static int zeroflte_hw_params(struct snd_pcm_substream *substream,
++			      struct snd_pcm_hw_params *params)
++{
++	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
++	struct snd_soc_component *component = asoc_rtd_to_codec(rtd, 0)->component;
++	struct snd_soc_dai *cpu_dai = asoc_rtd_to_cpu(rtd, 0);
++	unsigned int sysclk = zeroflte_sysclk(params_rate(params));
++	int ret;
++
++	dev_dbg(rtd->dev, "%s: rate %uHz, sysclk %uHz\n", __func__,
++		params_rate(params), sysclk);
++
++	/* FLL1: 24 MHz MCLK1 -> SYSCLK */
++	ret = snd_soc_component_set_pll(component, MADERA_FLL1_REFCLK,
++					MADERA_FLL_SRC_MCLK1,
++					ZEROFLTE_MCLK1_HZ, sysclk);
++	if (ret) {
++		dev_err(rtd->dev, "Failed to set FLL1 to %uHz: %d\n",
++			sysclk, ret);
++		return ret;
++	}
++
++	/* SYSCLK_1 <- FLL1 */
++	ret = snd_soc_component_set_sysclk(component, MADERA_CLK_SYSCLK_1,
++					   MADERA_CLK_SRC_FLL1, sysclk,
++					   SND_SOC_CLOCK_IN);
++	if (ret) {
++		dev_err(rtd->dev, "Failed to set SYSCLK to %uHz: %d\n",
++			sysclk, ret);
++		return ret;
++	}
++
++	/*
++	 * AP I2S0 is the clock consumer: gate the internal CDCLK and run the
++	 * block from PCLK.  Its own SCLK_I2S stays at 1.2 MHz and is unused.
++	 */
++	ret = snd_soc_dai_set_sysclk(cpu_dai, SAMSUNG_I2S_CDCLK, 0,
++				     SND_SOC_CLOCK_IN);
++	if (ret)
++		return ret;
++
++	return snd_soc_dai_set_sysclk(cpu_dai, SAMSUNG_I2S_OPCLK, 0,
++				      SAMSUNG_I2S_OPCLK_PCLK);
++}
++
++static const struct snd_soc_ops zeroflte_ops = {
++	.hw_params = zeroflte_hw_params,
++};
++
++SND_SOC_DAILINK_DEFS(aif1,
++	DAILINK_COMP_ARRAY(COMP_CPU(SAMSUNG_I2S_DAI)),
++	DAILINK_COMP_ARRAY(COMP_CODEC("cs47l85-codec", "cs47l85-aif1")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++static struct snd_soc_dai_link zeroflte_dai_link = {
++	.name		= "WM1840 AIF1",
++	.stream_name	= "HiFi",
++	.dai_fmt	= SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
++			  SND_SOC_DAIFMT_CBP_CFP,
++	.ops		= &zeroflte_ops,
++	SND_SOC_DAILINK_REG(aif1),
++};
++
++static const struct snd_soc_dapm_widget zeroflte_widgets[] = {
++	SND_SOC_DAPM_HP("Headphone", NULL),
++};
++
++static const struct snd_soc_dapm_route zeroflte_routes[] = {
++	{ "Headphone", NULL, "HPOUT1L" },
++	{ "Headphone", NULL, "HPOUT1R" },
++	/*
++	 * The codec's "HPOUT1L/R Input 1..4" muxes power up selecting "None",
++	 * so the default DAPM graph does not connect AIF1 playback to the
++	 * output mixers and a plain "aplay" would stay silent until a UCM
++	 * profile programs them.  "HPOUT1x Mixer" is a virtual mixer with no
++	 * kcontrols, so a static route into it is exactly how the codec wires
++	 * its own mux outputs; add one from the AIF1 RX widgets so playback
++	 * works out of the box.  Userspace can still pick another source
++	 * through the "HPOUT1L/R Input 1" mux if it wants to.
++	 */
++	{ "HPOUT1L Mixer", NULL, "AIF1RX1" },
++	{ "HPOUT1R Mixer", NULL, "AIF1RX2" },
++};
++
++/*
++ * Codec AIF pins (0-based GPIO numbers as used by the Madera pin tables).
++ * aif1 = GPIO15..18, aif4 = GPIO27..30 (for the phase 3 MAX98505 link).
++ */
++static const unsigned int zeroflte_aif1_pins[] = { 14, 15, 16, 17 };
++static const unsigned int zeroflte_aif4_pins[] = { 26, 27, 28, 29 };
++
++/*
++ * Mux the codec GPIOs used for AIF1/AIF4 to the "alt" function.
++ *
++ * We cannot use the generic pinctrl bindings here: the pinctrl provider is
++ * the "madera-pinctrl" MFD child, which is only created from inside the SPI
++ * driver's probe.  Putting pinctrl-0 on the codec DT node would make the
++ * device core's pinctrl_bind_pins() (called before ->probe()) walk up the
++ * tree, find no provider and return -EPROBE_DEFER forever, because that very
++ * probe is what would create the provider.  So program the pin function
++ * registers directly instead; this is what the Madera pinctrl driver does
++ * for an "aifN" group (MADERA_GP1_FN = 0).
++ */
++static int zeroflte_codec_pinmux(struct snd_soc_card *card)
++{
++	const unsigned int *pins;
++	size_t n_pins;
++	struct snd_soc_pcm_runtime *rtd;
++	struct snd_soc_component *component = NULL;
++	int i, ret;
++
++	for_each_card_rtds(card, rtd) {
++		component = asoc_rtd_to_codec(rtd, 0)->component;
++		break;
++	}
++
++	if (!component)
++		return -ENODEV;
++
++	/*
++	 * The codec may already be runtime-suspended (its regmap would be
++	 * cache-only), so bring it up for the register writes.
++	 */
++	ret = pm_runtime_get_sync(component->dev);
++	if (ret < 0) {
++		pm_runtime_put_noidle(component->dev);
++		return ret;
++	}
++
++	/* Phase 2: headphone path only needs AIF1. */
++	pins = zeroflte_aif1_pins;
++	n_pins = ARRAY_SIZE(zeroflte_aif1_pins);
++	for (i = 0; i < n_pins; i++) {
++		ret = snd_soc_component_update_bits(component,
++				MADERA_GPIO1_CTRL_1 + 2 * pins[i],
++				MADERA_GP1_FN_MASK, 0);
++		if (ret)
++			goto out;
++	}
++
++	/* Also mux AIF4 so the phase 3 amplifier link only needs a DAI link. */
++	for (i = 0; i < ARRAY_SIZE(zeroflte_aif4_pins); i++) {
++		ret = snd_soc_component_update_bits(component,
++				MADERA_GPIO1_CTRL_1 + 2 * zeroflte_aif4_pins[i],
++				MADERA_GP1_FN_MASK, 0);
++		if (ret)
++			goto out;
++	}
++
++	dev_info(card->dev, "codec AIF1/AIF4 pins muxed\n");
++out:
++	pm_runtime_put(component->dev);
++
++	return ret;
++}
++
++static int zeroflte_late_probe(struct snd_soc_card *card)
++{
++	struct zeroflte_priv *priv = snd_soc_card_get_drvdata(card);
++	int ret;
++
++	ret = zeroflte_codec_pinmux(card);
++	if (ret)
++		dev_warn(card->dev, "Failed to mux codec AIF pins: %d\n", ret);
++
++	if (!priv->pmu)
++		return 0;
++
++	/* Turn on the 24 MHz PMU CLKOUT that feeds codec MCLK1. */
++	ret = regmap_update_bits(priv->pmu, ZEROFLTE_PMU_DEBUG,
++				 ZEROFLTE_PMU_CLKOUT_MASK,
++				 ZEROFLTE_PMU_CLKOUT_ON);
++	if (ret) {
++		dev_err(card->dev, "Failed to enable PMU CLKOUT: %d\n", ret);
++		return ret;
++	}
++
++	priv->pmu_clkout_on = true;
++	dev_info(card->dev, "PMU CLKOUT enabled (MCLK1 = %u Hz)\n",
++		 ZEROFLTE_MCLK1_HZ);
++
++	/* Give MCLK1 time to settle before the FLL is started. */
++	msleep(10);
++
++	return 0;
++}
++
++static struct snd_soc_card zeroflte_card = {
++	.name		= "zeroflte",
++	.owner		= THIS_MODULE,
++	.dai_link	= &zeroflte_dai_link,
++	.num_links	= 1,
++	.dapm_widgets	= zeroflte_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(zeroflte_widgets),
++	.dapm_routes	= zeroflte_routes,
++	.num_dapm_routes = ARRAY_SIZE(zeroflte_routes),
++	.late_probe	= zeroflte_late_probe,
++};
++
++static int zeroflte_probe(struct platform_device *pdev)
++{
++	struct snd_soc_card *card = &zeroflte_card;
++	struct zeroflte_priv *priv;
++	int ret;
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	/*
++	 * Board quirk: the codec's LDOENA pin (gpf5-7) has to be high for
++	 * the internal LDOs/charge pump.  The vendor code drives it from
++	 * pinctrl, madera itself has no such property.
++	 */
++	priv->ldoena = devm_gpiod_get_optional(&pdev->dev, "ldoena",
++					       GPIOD_OUT_HIGH);
++	if (IS_ERR(priv->ldoena)) {
++		dev_warn(&pdev->dev, "Failed to get LDOENA GPIO: %ld\n",
++			 PTR_ERR(priv->ldoena));
++		priv->ldoena = NULL;
++	} else if (priv->ldoena) {
++		dev_info(&pdev->dev, "codec LDOENA driven high\n");
++	}
++
++	/*
++	 * The PMU syscon is optional: without it the codec still gets MCLK1
++	 * if S-Boot left the CLKOUT enabled.  Do not fail the card for it.
++	 */
++	priv->pmu = syscon_regmap_lookup_by_phandle(pdev->dev.of_node,
++						   "samsung,pmu-syscon");
++	if (IS_ERR(priv->pmu)) {
++		dev_warn(&pdev->dev,
++			 "No samsung,pmu-syscon (%ld), PMU CLKOUT not controlled\n",
++			 PTR_ERR(priv->pmu));
++		priv->pmu = NULL;
++	}
++
++	card->dev = &pdev->dev;
++	snd_soc_card_set_drvdata(card, priv);
++
++	ret = snd_soc_of_parse_card_name(card, "model");
++	if (ret) {
++		dev_err(&pdev->dev, "Failed to parse card name: %d\n", ret);
++		return ret;
++	}
++
++	return devm_snd_soc_register_card(&pdev->dev, card);
++}
++
++static const struct of_device_id zeroflte_of_match[] = {
++	{ .compatible = "samsung,zeroflte-audio" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, zeroflte_of_match);
++
++static struct platform_driver zeroflte_driver = {
++	.probe	= zeroflte_probe,
++	.driver	= {
++		.name		= DRV_NAME,
++		.of_match_table	= zeroflte_of_match,
++	},
++};
++module_platform_driver(zeroflte_driver);
++
++MODULE_DESCRIPTION("ASoC machine driver for Samsung Galaxy S6 (zeroflte)");
++MODULE_AUTHOR("G9209 mainline port");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:" DRV_NAME);
++/*
++ * Loading the card driver is enough to bring the whole stack up in a sane
++ * order: the bit-banged SPI bus first, then the DMA controller, the Madera
++ * MFD and its children and finally the I2S and codec bits.
++ */
++MODULE_SOFTDEP("pre: spi-bitbang spi-gpio pl330 madera irq-madera "
++	       "pinctrl-madera madera-spi snd-soc-madera snd-soc-wm-adsp "
++	       "snd-soc-cs47l85 snd-soc-s3c-dma snd-soc-i2s");

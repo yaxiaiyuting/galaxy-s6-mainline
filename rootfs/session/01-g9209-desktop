@@ -1,0 +1,29 @@
+# G9209 桌面配置（dconf 系统默认，确保每个会话都生效）
+[org/gnome/shell]
+disable-user-extensions=false
+enabled-extensions=['dash-to-dock@micxgx.gmail.com', 'ubuntu-appindicators@ubuntu.com', 'apps-menu@gnome-shell-extensions.gcampax.github.com', 'panel-osd@berend.de.schouwer.gmail.com']
+
+[org/gnome/shell/extensions/dash-to-dock]
+dock-position='LEFT'
+dock-fixed=true
+autohide=false
+extend-height=true
+dash-max-icon-size=52
+show-apps-at-top=true
+background-opacity=0.75
+click-action='launch'
+scroll-action='do-nothing'
+
+[org/gnome/desktop/interface]
+enable-hot-corners=false
+enable-animations=false
+
+[org/gnome/desktop/screensaver]
+lock-enabled=true
+lock-delay=0
+
+[org/gnome/desktop/lockdown]
+disable-lock-screen=false
+
+[org/gnome/settings-daemon/plugins/power]
+power-button-action='nothing'

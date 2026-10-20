@@ -1,0 +1,16 @@
+[Unit]
+Description=G9209 touchscreen power (MAX77838 LDO2/LDO4)
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=gdm.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/g9209-touch-power.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

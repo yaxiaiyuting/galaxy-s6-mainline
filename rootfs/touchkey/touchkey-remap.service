@@ -1,0 +1,13 @@
+[Unit]
+Description=G9209 touchkey BACK/RECENT remapper (BACK->Alt+Left, RECENT->Super)
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+ExecStart=/usr/local/bin/touchkey-remap
+Restart=always
+RestartSec=2
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

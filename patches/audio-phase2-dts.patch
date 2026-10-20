@@ -1,0 +1,241 @@
+--- a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
+@@ -1490,3 +1490,201 @@
+ 	};
+ };
+ 
++/*
++ * ==========================================================================
++ * DSH 2026-10-21: 音频 Phase 2 —— WM1840（CS47L85 / Madera）+ 耳机
++ * 调研报告：文档/05-专项/音频移植调研-20261021.md
++ * 实现报告：文档/05-专项/音频Phase2实现-20261021.md
++ *
++ * 拓扑：
++ *   AP: Exynos7420 I2S0 (0x11440000, slave)  <== AIF1 ==>
++ *   Codec: WM1840 (SPI 控制, I2S master, HPOUT1L/R -> 耳机)
++ *
++ * 三条硬约束（改动前务必读报告）：
++ *   1) SPI0 的 PCLK/SCLK 门控在 CMU_PERIC1(0x14C80000) —— AXI 死区，
++ *      绝不能碰。所以 codec 控制面用 spi-gpio（pinctrl_bus0 0x13470000，
++ *      已实测可访问）。
++ *   2) 音频时钟走 codec master + FLL1，MCLK1 = PMU CLKOUT 24MHz。
++ *      **不动 CMU_AUD**：mout_aud_pll_user / dout_aud_cdclk 同时供
++ *      蓝牙 UART，改了蓝牙会断。
++ *   3) ALSA/ASoC 全部是模块（=m）。BOOT 分区只剩约 3.4MiB 余量。
++ *
++ * 上机前必须确认的项见报告；本段全部是新增节点，不改已有节点。
++ * 删除本段（或把 DSH_AUDIO_PHASE2 改成 0）即可完全回滚。
++ * ==========================================================================
++ */
++#define DSH_AUDIO_PHASE2 1
++
++#if DSH_AUDIO_PHASE2
++
++/* ------------------------------------------------------------------ */
++/* 1) Codec MCLK1：来自 PMU CLKOUT 的 24MHz（固定时钟，仅供速率计算）  */
++/* ------------------------------------------------------------------ */
++/ {
++	codec_mclk1: clock-codec-mclk1 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <24000000>;
++		clock-output-names = "wm1840_mclk1";
++	};
++};
++
++/* ------------------------------------------------------------------ */
++/* 2) SPI-GPIO：codec 控制面                                           */
++/*                                                                     */
++/* 引脚（vendor exynos7420-pinctrl.dtsi:460 spi0_bus / spi0_cs_func）：*/
++/*   SCLK = gpd8-0   MOSI = gpd6-0   MISO = gpd6-1   CS = gpd8-1       */
++/*                                                                     */
++/* TODO(verify on device): MOSI/MISO 的对应关系是**推断**。vendor 的  */
++/*   spi0_bus 只给了 "gpd8-0","gpd6-0","gpd6-1" 的顺序，没有写明方向。 */
++/*   若上机时 madera 读 ID 得到 0x0000/0xffff：                        */
++/*     把下面 mosi-gpios / miso-gpios 两行交换，重新编译 DTB 即可。    */
++/*   （已用 ZEROFLTE_SPI_SWAP_MOSI_MISO 开关做好，改 0/1 即可。）      */
++/*                                                                     */
++/* 速度 1MHz：只读写寄存器，不传音频数据，probe+patch 几秒可接受。     */
++/* ------------------------------------------------------------------ */
++#define ZEROFLTE_SPI_SWAP_MOSI_MISO 0
++
++&pinctrl_bus0 {
++	/*
++	 * 全部先切成 GPIO 输入（function 0），不驱动任何线。
++	 * spi-gpio 在 probe 时会用 gpiod 把 SCLK/MOSI/CS 设成输出、
++	 * MISO 设成输入；这里若预置成 output 会有短暂争用（MISO 是
++	 * codec 的输出）。
++	 */
++	spi_codec_pins: spi-codec-pins {
++		samsung,pins = "gpd8-0", "gpd6-0", "gpd6-1", "gpd8-1";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_INPUT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS7_PIN_DRV_LV1>;
++	};
++};
++
++/ {
++	spi_codec: spi-codec {
++		compatible = "spi-gpio";
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&spi_codec_pins>;
++
++		sck-gpios  = <&gpd8 0 GPIO_ACTIVE_HIGH>;
++#if ZEROFLTE_SPI_SWAP_MOSI_MISO
++		mosi-gpios = <&gpd6 1 GPIO_ACTIVE_HIGH>;
++		miso-gpios = <&gpd6 0 GPIO_ACTIVE_HIGH>;
++#else
++		mosi-gpios = <&gpd6 0 GPIO_ACTIVE_HIGH>;
++		miso-gpios = <&gpd6 1 GPIO_ACTIVE_HIGH>;
++#endif
++		cs-gpios   = <&gpd8 1 GPIO_ACTIVE_LOW>;
++		num-chipselects = <1>;
++
++		status = "okay";
++
++		wm1840: codec@0 {
++			compatible = "cirrus,wm1840";
++			reg = <0>;
++			spi-max-frequency = <1000000>;
++
++			/*
++			 * IRQ = gpa2-5（vendor `interrupts = <5 0 0>`）。
++			 * codec 的 IRQ 是低有效、电平触发。EINT 的 pinmux
++			 * 由 samsung pinctrl 在 request_irq 时自动配置。
++			 */
++			interrupt-parent = <&gpa2>;
++			interrupts = <5 IRQ_TYPE_LEVEL_LOW>;
++
++			/* RESET = gpf4-0（低有效）。vendor `wlf,reset`。 */
++			reset-gpios = <&gpf4 0 GPIO_ACTIVE_LOW>;
++
++			/*
++			 * MCLK1 = PMU CLKOUT 24MHz。madera 只用它做 FLL 参考，
++			 * 由 machine driver 在 late_probe 打开 CLKOUT。
++			 * mclk2（32.768kHz）本板没接，madera 会打一条 warn，
++			 * 不影响播放。
++			 */
++			clocks = <&codec_mclk1>;
++			clock-names = "mclk1";
++
++			/*
++			 * 供电（vendor zeroflte_chn_00.dts:144-154）：
++			 *   DCVDD   = LDO26 1.2V
++			 *   其余    = LDO16 1.8V
++			 * AVDD/DBVDD1 是 madera core 的 bulk supply（必需），
++			 * MICVDD/DBVDD2-4/CPVDD1-2/SPKVDDL/R 是 codec 子设备
++			 * 通过 supply alias 继承的 DAPM 供电（也全部给出，
++			 * 否则 DAPM 注册 regulator widget 时会 -ENODEV）。
++			 */
++			AVDD-supply    = <&ldo16_reg>;
++			DBVDD1-supply  = <&ldo16_reg>;
++			DBVDD2-supply  = <&ldo16_reg>;
++			DBVDD3-supply  = <&ldo16_reg>;
++			DBVDD4-supply  = <&ldo16_reg>;
++			DCVDD-supply   = <&ldo26_reg>;
++			CPVDD1-supply  = <&ldo16_reg>;
++			CPVDD2-supply  = <&ldo16_reg>;
++			MICVDD-supply  = <&ldo16_reg>;
++			SPKVDDL-supply = <&ldo16_reg>;
++			SPKVDDR-supply = <&ldo16_reg>;
++
++			/*
++			 * 注意：**故意不写 pinctrl-0**。
++			 * madera-pinctrl 是 MFD 子设备，它的 pinctrl provider
++			 * 只有在 SPI probe 内部（madera_dev_init -> mfd_add_devices）
++			 * 才会创建；而设备核心在调用 SPI probe **之前**就执行
++			 * pinctrl_bind_pins()，此时找不到 provider，会返回
++			 * -EPROBE_DEFER 并永久重试（provider 永远等不到），
++			 * codec 就永远 probe 不了。
++			 * 因此 AIF1/AIF4 的 pin mux 由 machine driver 在
++			 * late_probe 里直接写 MADERA_GPIO1_CTRL_1.FN=0 完成。
++			 */
++		};
++	};
++};
++
++/* ------------------------------------------------------------------ */
++/* 3) I2S0：AP 做 slave，只需 PCLK_I2S（现场 6MHz）                    */
++/*                                                                     */
++/* 引脚 gpz0-0..6，在 pinctrl_aud(0x114B0000)；BT UART 用同一块的      */
++/* gpz1，已实测可访问。I2S0 节点本体在 exynos7.dtsi，这里只补 pinctrl。*/
++/* ------------------------------------------------------------------ */
++&pinctrl_aud {
++	i2s0_bus: i2s0-bus {
++		samsung,pins = "gpz0-0", "gpz0-1", "gpz0-2", "gpz0-3",
++			       "gpz0-4", "gpz0-5", "gpz0-6";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_2>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
++		samsung,pin-drv = <EXYNOS7_PIN_DRV_LV1>;
++	};
++};
++
++&i2s0 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&i2s0_bus>;
++	status = "okay";
++};
++
++/* ------------------------------------------------------------------ */
++/* 4) 声卡                                                             */
++/* ------------------------------------------------------------------ */
++/ {
++	sound: sound {
++		compatible = "samsung,zeroflte-audio";
++		model = "zeroflte";
++
++		/* PMU syscon：machine driver 用它打开 CLKOUT（PMU_DEBUG 0x0a00） */
++		samsung,pmu-syscon = <&pmu_system_controller>;
++
++		/*
++		 * LDOENA = gpf5-7（vendor `wlf,ldoena`，高有效）。
++		 * 这是板级 quirk，madera 主文件不解析它，由 machine driver
++		 * 在 probe 时拉高。
++		 */
++		ldoena-gpios = <&gpf5 7 GPIO_ACTIVE_HIGH>;
++
++		status = "okay";
++	};
++};
++
++#endif /* DSH_AUDIO_PHASE2 */
+--- a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-power.dtsi
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-power.dtsi
+@@ -75,6 +75,34 @@
+ 				 * bootloader 打开"，避免 core 的 late cleanup
+ 				 * 在多消费者场景下误关（当前单消费者，不影响）。
+ 				 */
++				/*
++				 * DSH 2026-10-21 音频 Phase 2:
++				 *   LDO16 = VCC_1.8V_CODEC_PMIC  (AVDD/DBVDD/
++				 *           CPVDD/SPKVDD/MICVDD)
++				 *   LDO26 = VDD_1.2V_CODEC      (DCVDD)
++				 * 现场 clk/regulator 读数：LDO16 已 enabled，
++				 * LDO26 disabled —— 所以这里必须由内核上电。
++				 * 两个都给 regulator-always-on：codec 的 DAPM
++				 * regulator widget 是 late probe 才注册的，不能
++				 * 依赖消费者引用计数；而且 LDO16 本来就 feeds
++				 * 板上的 1.8V 编解码器电源域。
++				 */
++				ldo16_reg: LDO16 {
++					regulator-name = "VCC_1.8V_CODEC_PMIC";
++					regulator-min-microvolt = <1800000>;
++					regulator-max-microvolt = <1800000>;
++					regulator-always-on;
++					regulator-boot-on;
++				};
++
++				ldo26_reg: LDO26 {
++					regulator-name = "VDD_1.2V_CODEC";
++					regulator-min-microvolt = <1200000>;
++					regulator-max-microvolt = <1200000>;
++					regulator-always-on;
++					regulator-boot-on;
++				};
++
+ 				touchkey_ldo21: LDO21 {
+ 					regulator-name = "vtouch_3.3v";
+ 					regulator-min-microvolt = <3300000>;
