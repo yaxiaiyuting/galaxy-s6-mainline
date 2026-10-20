@@ -595,10 +595,10 @@ index 000000000..e112fb2a2
 +};
 diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
 new file mode 100644
-index 000000000..13b659d8f
+index 000000000..f222bc0fa
 --- /dev/null
 +++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
-@@ -0,0 +1,1392 @@
+@@ -0,0 +1,1411 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Samsung Galaxy S6 (SM-G9209, zeroflte, Exynos 7420) — mainline Linux 6.6
@@ -1808,7 +1808,26 @@ index 000000000..13b659d8f
 +	fout_aud_pll: clock-aud-pll {
 +		compatible = "fixed-clock";
 +		#clock-cells = <0>;
-+		clock-frequency = <48000000>;
++		/*
++		 * DSH 2026-10-20: 468 MHz，不是随便选的。
++		 *
++		 * 关键证据来自 vendor DTS（ctc_stock.dts:4303-4319）：
++		 *   uart@11460000 {
++		 *       uart-sclk-frequency = <0x6f94740>;   // = 116,999,488 Hz
++		 *   }
++		 * 即 BT UART 的 SCLK 真实值是 ~117 MHz。
++		 *
++		 * 而 CMU_AUD 的分频链是：
++		 *   fout_aud_pll → /2 → dout_aud_cdclk → /2 → dout_sclk_uart
++		 * 所以 fout_aud_pll 要设成 117MHz × 2 × 2 = 468 MHz，
++		 * sclk_uart 才会算出 117 MHz。
++		 *
++		 * 原先填 48 MHz（AUD PLL 的典型音频值）导致内核按 12 MHz 算
++		 * 串口分频：117e6/(6.51×16) ≈ 1.1 Mbaud ≠ 115200，
++		 * BCM4358 收到的全是乱码 → "hci0: command 0x0c03 tx timeout"
++		 * → "BCM: Reset failed (-110)"。改完分频立刻正确。
++		 */
++		clock-frequency = <468000000>;
 +		clock-output-names = "fout_aud_pll";
 +	};
 +};
