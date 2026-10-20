@@ -63,6 +63,13 @@ rm -f /root/.config/autostart/ibus.desktop 2>/dev/null || true
 pkill -f "ibus-daemon -drx" 2>/dev/null || true
 # 需要登录后 GNOME 会话内执行：
 #   gsettings set org.gnome.desktop.input-sources sources "[('ibus','libpinyin'),('xkb','us')]"
+#
+# 另外把这些 libpinyin 选项关掉（否则在拼音模式下打英文会"自动提交+补空格"）：
+#   S=com.github.libpinyin.ibus-libpinyin.libpinyin
+#   gsettings set $S english-input-mode false    # 拼音模式下不再直接打英文
+#   gsettings set $S english-candidate false     # 不显示英文候选
+#   gsettings set $S auto-commit false
+# 打英文时用 Super+Space 切到 xkb-us 输入源。
 
 echo "=== 6. 屏幕键盘 ==="
 # 不要用 onboard！实测在 Wayland + IBus 下会**吞字**（按键注入与输入法抢事件）。
