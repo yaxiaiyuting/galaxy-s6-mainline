@@ -1,0 +1,19 @@
+[Unit]
+Description=G9209 BCM4358 UART Bluetooth initialization
+After=dev-ttySAC0.device systemd-modules-load.service bluetooth.service
+Wants=bluetooth.service
+StartLimitIntervalSec=180
+StartLimitBurst=3
+
+[Service]
+# bash 版流程，不用 Type=notify（避免子进程 READY 被拒）
+Type=simple
+ExecStart=/usr/local/libexec/g9209-bluetooth.sh
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=120
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
