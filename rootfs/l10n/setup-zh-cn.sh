@@ -62,8 +62,14 @@ AUTO
 # 需要登录后 GNOME 会话内执行：
 #   gsettings set org.gnome.desktop.input-sources sources "[('ibus','libpinyin'),('xkb','us')]"
 
-echo "=== 6. 屏幕键盘（手机必备） ==="
-apt-get install -y --no-install-recommends onboard
+echo "=== 6. 屏幕键盘 ==="
+# 不要用 onboard！实测在 Wayland + IBus 下会**吞字**（按键注入与输入法抢事件）。
+# GNOME 43 自带屏幕键盘（gnome-shell 的 js/ui/keyboard.js），
+# Wayland 原生、与 IBus 集成，按下面的 gsettings 打开即可。
+gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true
+# 如果之前装过 onboard，卸掉避免两个键盘打架：
+apt-get remove -y onboard onboard-common 2>/dev/null || true
+rm -f /etc/xdg/autostart/onboard-autostart.desktop 2>/dev/null || true
 
 echo "=== 7. GNOME 插件（GNOME 不装插件基本没法用） ==="
 apt-get install -y --no-install-recommends \
