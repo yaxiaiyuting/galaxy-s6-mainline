@@ -18,9 +18,16 @@ cat > /etc/environment << 'ENV'
 #       "Gsk-WARNING: Unrecognized renderer \"ngl\"" 并退回 cairo。
 GSK_RENDERER=gl
 
-# noafbc 会关掉 AFBC 带宽压缩，性能损失明显；nocrc 只跳过 CRC 校验，
-# 保留压缩的前提下降低一部分开销。先只留 nocrc，观察稳定性。
-PAN_MESA_DEBUG=nocrc
+# PAN_MESA_DEBUG 取舍（2026-10-20 实测，详见
+# 文档/05-专项/panfrost-AFBC深度研究-20261020.md）：
+#   * AFBC 在本机（Mali-T760 r0p1 + Mesa 22.3.6）没有可测收益：
+#     glmark2 12 个场景 × 3 配置 × 720x1280，开/关 AFBC 的 FPS 差异在噪声内
+#     （多数场景 AFBC 关闭反而更快），且 mainline 内核没有实现 T760 r0p1 的
+#     AFBC errata（HW_ISSUE_T76X_3542）。→ 用 noafbc。
+#   * nocrc 关掉 transaction elimination。去掉了在部分场景快 0~9%，但需要长
+#     时间验证（历史上出现过花屏/毛刺），暂保留。想 A/B 时把下面这行改成
+#     PAN_MESA_DEBUG=noafbc  即可，出问题改回来不用重启（重登会话生效）。
+PAN_MESA_DEBUG=noafbc,nocrc
 ENV
 cat /etc/environment
 
@@ -28,8 +35,10 @@ echo "=== 2. GDM 会话环境 ==="
 mkdir -p /etc/systemd/system/gdm.service.d
 cat > /etc/systemd/system/gdm.service.d/50-g9209-render.conf << 'DROP'
 [Service]
+# 必须与 /etc/environment 保持一致：两处都写 noafbc,nocrc。
+# （pam_env 会覆盖 systemd 的 Environment=，两处不一致时排查会非常迷惑）
 Environment=GSK_RENDERER=gl
-Environment=PAN_MESA_DEBUG=nocrc
+Environment=PAN_MESA_DEBUG=noafbc,nocrc
 DROP
 
 echo "=== 3. usb0 不再抢默认路由 ==="
