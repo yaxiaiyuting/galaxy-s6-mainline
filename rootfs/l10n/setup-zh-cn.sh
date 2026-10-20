@@ -51,14 +51,16 @@ localectl set-locale LANG=zh_CN.UTF-8 LANGUAGE=zh_CN:zh
 
 echo "=== 5. 中文输入法（ibus + libpinyin） ==="
 apt-get install -y --no-install-recommends ibus ibus-libpinyin
-mkdir -p /root/.config/autostart
-cat > /root/.config/autostart/ibus.desktop << 'AUTO'
-[Desktop Entry]
-Type=Application
-Name=IBus
-Exec=/usr/bin/ibus-daemon -drx
-X-GNOME-Autostart-enabled=true
-AUTO
+# ⚠️ 不要自己加 ibus 的 autostart！GNOME Shell 自己会启动
+#    `/usr/bin/ibus-daemon --panel disable`（见 gnome-shell 的
+#    org.gnome.Shell 启动逻辑）。如果再加一个 `ibus-daemon -drx`，
+#    就会有两个 daemon 抢同一套 D-Bus 输入法通道 —— 表现就是
+#    **屏幕键盘按键被吞、拼音组合丢字**。
+#    实测：出现两个 daemon 时 GNOME OSK + 拼音完全不可用；
+#    杀掉重复的那个后立刻正常。
+#    （曾经加过 /root/.config/autostart/ibus.desktop，已删除）
+rm -f /root/.config/autostart/ibus.desktop 2>/dev/null || true
+pkill -f "ibus-daemon -drx" 2>/dev/null || true
 # 需要登录后 GNOME 会话内执行：
 #   gsettings set org.gnome.desktop.input-sources sources "[('ibus','libpinyin'),('xkb','us')]"
 
