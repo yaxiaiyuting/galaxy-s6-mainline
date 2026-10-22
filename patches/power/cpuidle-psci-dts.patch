@@ -1,0 +1,131 @@
+--- a/arch/arm64/boot/dts/exynos/exynos7.dtsi
++++ b/arch/arm64/boot/dts/exynos/exynos7.dtsi
+@@ -67,6 +67,46 @@
+ 		};
+ 
+ 		/*
++		 * DSH 2026-10-23: CPU 深度睡眠（cpuidle）。
++		 *
++		 * 状态 0 由 drivers/cpuidle/cpuidle-psci.c 自动补成 WFI，
++		 * 这里只声明状态 1 = CPU 掉电。
++		 *
++		 * arm,psci-suspend-param 的取值是本次移植最关键的一处，
++		 * 绝对不要照抄 vendor 的 <0x0>：
++		 *
++		 *   0x00000000 = id 0 / type=STANDBY(bit16=0) / affl 0
++		 *      -> mainline psci_power_state_loses_context() 判定"不丢上下文"
++		 *      -> 不保存 CPU 上下文，且 psci_ops.cpu_suspend(state, 0)
++		 *         的 entry_point 直接传 0
++		 *      -> 三星 S-Boot 在 power_state=0 时是真的把核掉电的
++		 *         （vendor 只在 C2 路径发这条 SMC 就是为了掉电），
++		 *         醒来要跳 entry_point=0 -> 跑飞 / 挂死
++		 *
++		 *   0x00010000 = id 0 / type=POWERDOWN(bit16=1) / affl 0
++		 *      -> mainline 走完整 cpu_suspend()：保存上下文 +
++		 *         传真实 cpu_resume 物理地址
++		 *      -> 与 vendor 运行时行为一致（vendor 也是存上下文 +
++		 *         传 virt_to_phys(cpu_resume)），无论 S-Boot 是否
++		 *         解析 type 位都能正确恢复
++		 *
++		 * 延迟/驻留参数参考 vendor exynos7420.dtsi 的 C2：
++		 * ATLAS exit-latency 100us / min-residency 2000us；
++		 * APOLLO min-residency 750us —— 这里取两者较大值保守处理。
++		 */
++		idle-states {
++			entry-method = "psci";
++
++			CPU_SLEEP_0: cpu-sleep-0 {
++				compatible = "arm,idle-state";
++				arm,psci-suspend-param = <0x00010000>;
++				entry-latency-us = <2>;
++				exit-latency-us = <100>;
++				min-residency-us = <2000>;
++			};
++		};
++
++		/*
+ 		 * Cortex-A57 (atlas) cluster.  Power-up is handled by
+ 		 * exynos7420_pmu_cpu_power_up() in psci.c.
+ 		 */
+@@ -75,6 +115,7 @@
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x0>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&CPU_SLEEP_0>;
+ 			next-level-cache = <&atlas_l2>;
+ 			/*
+ 			 * DSH 2026-10-22: Cortex-A57 的 DMIPS/MHz ≈ 4.5。
+@@ -90,6 +131,7 @@
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x1>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&CPU_SLEEP_0>;
+ 			next-level-cache = <&atlas_l2>;
+ 			/*
+ 			 * DSH 2026-10-22: Cortex-A57 的 DMIPS/MHz ≈ 4.5。
+@@ -105,6 +147,7 @@
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x2>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&CPU_SLEEP_0>;
+ 			next-level-cache = <&atlas_l2>;
+ 			/*
+ 			 * DSH 2026-10-22: Cortex-A57 的 DMIPS/MHz ≈ 4.5。
+@@ -120,6 +163,7 @@
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x3>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&CPU_SLEEP_0>;
+ 			next-level-cache = <&atlas_l2>;
+ 			/*
+ 			 * DSH 2026-10-22: Cortex-A57 的 DMIPS/MHz ≈ 4.5。
+@@ -144,6 +188,7 @@
+ 			compatible = "arm,cortex-a53";
+ 			reg = <0x100>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&CPU_SLEEP_0>;
+ 			next-level-cache = <&apollo_l2>;
+ 			/*
+ 			 * DSH 2026-10-22: Cortex-A53 的 DMIPS/MHz ≈ 2.3。
+@@ -159,6 +204,7 @@
+ 			compatible = "arm,cortex-a53";
+ 			reg = <0x101>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&CPU_SLEEP_0>;
+ 			next-level-cache = <&apollo_l2>;
+ 			/*
+ 			 * DSH 2026-10-22: Cortex-A53 的 DMIPS/MHz ≈ 2.3。
+@@ -174,6 +220,7 @@
+ 			compatible = "arm,cortex-a53";
+ 			reg = <0x102>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&CPU_SLEEP_0>;
+ 			next-level-cache = <&apollo_l2>;
+ 			/*
+ 			 * DSH 2026-10-22: Cortex-A53 的 DMIPS/MHz ≈ 2.3。
+@@ -189,6 +236,7 @@
+ 			compatible = "arm,cortex-a53";
+ 			reg = <0x103>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&CPU_SLEEP_0>;
+ 			next-level-cache = <&apollo_l2>;
+ 			/*
+ 			 * DSH 2026-10-22: Cortex-A53 的 DMIPS/MHz ≈ 2.3。
+@@ -213,6 +261,17 @@
+ 	psci {
+ 		compatible = "arm,psci";
+ 		method = "smc";
++		/*
++		 * DSH 2026-10-23: S-Boot 的 PSCI 虽然只能按 v0.1 绑定描述
++		 * （函数号从 DT 读，没有 FEATURES 调用），但 CPU_SUSPEND 是
++		 * 实打实实现的。vendor 内核（LOS20, exynos7420.dtsi:333）
++		 * 就是用 <0xC4000001> 走 CPU_SUSPEND 做 C2/LPM 的。
++		 *
++		 * 不写这一条时 psci_ops.cpu_suspend == NULL，于是
++		 * cpuidle-psci 在 psci_cpu_init_idle() 里第一行就
++		 * return -EOPNOTSUPP —— 内核日志表现为 "cpuidle 驱动: none"。
++		 */
++		cpu_suspend = <0xc4000001>;
+ 		cpu_off = <0x84000002>;
+ 		cpu_on = <0xc4000003>;
+ 	};
