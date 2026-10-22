@@ -1,0 +1,196 @@
+diff --git a/drivers/gpu/drm/exynos/exynos_drm_crtc.c b/drivers/gpu/drm/exynos/exynos_drm_crtc.c
+index d19e796c2..5c6f4e8cd 100644
+--- a/drivers/gpu/drm/exynos/exynos_drm_crtc.c
++++ b/drivers/gpu/drm/exynos/exynos_drm_crtc.c
+@@ -23,6 +23,11 @@ static void exynos_drm_crtc_atomic_enable(struct drm_crtc *crtc,
+ {
+ 	struct exynos_drm_crtc *exynos_crtc = to_exynos_crtc(crtc);
+ 
++	/* DSH 2026-10-21: 唤醒路径诊断，配合 atomic_disable 的日志 */
++	pr_err("DSH-DPMS: atomic_enable CRTC%d active=%d enabled=%d\n",
++	       crtc->base.id, crtc->state->active,
++	       crtc->state->enable);
++
+ 	if (exynos_crtc->ops->atomic_enable)
+ 		exynos_crtc->ops->atomic_enable(exynos_crtc);
+ 
+@@ -34,6 +39,15 @@ static void exynos_drm_crtc_atomic_disable(struct drm_crtc *crtc,
+ {
+ 	struct exynos_drm_crtc *exynos_crtc = to_exynos_crtc(crtc);
+ 
++	/*
++	 * DSH 2026-10-21: 调试「锁屏后屏幕黑了但唤不醒」的问题。
++	 * GNOME 走 DPMS off → 调到这里 → decon_atomic_disable()。
++	 * 唤醒时应该走 atomic_enable。加日志确认两边的调用和顺序。
++	 */
++	pr_err("DSH-DPMS: atomic_disable CRTC%d active=%d enabled=%d\n",
++	       crtc->base.id, crtc->state->active,
++	       crtc->state->enable);
++
+ 	drm_crtc_vblank_off(crtc);
+ 
+ 	if (exynos_crtc->ops->atomic_disable)
+diff --git a/drivers/gpu/drm/exynos/exynos_drm_dma.c b/drivers/gpu/drm/exynos/exynos_drm_dma.c
+index a971590b8..8d7750996 100644
+--- a/drivers/gpu/drm/exynos/exynos_drm_dma.c
++++ b/drivers/gpu/drm/exynos/exynos_drm_dma.c
+@@ -6,6 +6,7 @@
+ 
+ #include <linux/dma-map-ops.h>
+ #include <linux/iommu.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ 
+ #include <drm/drm_print.h>
+@@ -96,11 +97,13 @@ int exynos_drm_register_dma(struct drm_device *drm, struct device *dev,
+ 			    void **dma_priv)
+ {
+ 	struct exynos_drm_private *priv = drm->dev_private;
++	int ret;
+ 
+ 	if (!priv->dma_dev) {
+ 		priv->dma_dev = dev;
+ 		DRM_INFO("Exynos DRM: using %s device for DMA mapping operations\n",
+ 			 dev_name(dev));
++		pr_err("DSH-DISP dma: dma_dev=%s\n", dev_name(dev));
+ 	}
+ 
+ 	if (!IS_ENABLED(CONFIG_EXYNOS_IOMMU))
+@@ -112,17 +115,34 @@ int exynos_drm_register_dma(struct drm_device *drm, struct device *dev,
+ 		if (IS_ENABLED(CONFIG_ARM_DMA_USE_IOMMU))
+ 			mapping = arm_iommu_create_mapping(&platform_bus_type,
+ 				EXYNOS_DEV_ADDR_START, EXYNOS_DEV_ADDR_SIZE);
+-		else if (IS_ENABLED(CONFIG_IOMMU_DMA))
++		else if (IS_ENABLED(CONFIG_IOMMU_DMA)) {
+ 			mapping = iommu_get_domain_for_dev(priv->dma_dev);
+-		else
++
++			/*
++			 * The device is wired to a SYSMMU in DT but the IOMMU
++			 * provider has not attached a domain yet. Returning 0
++			 * here would permanently cache an IOMMU-less mapping
++			 * and the DECON would keep rejecting non-contiguous
++			 * dma-bufs, so defer until the IOMMU is really up.
++			 */
++			if (!mapping &&
++			    (of_property_present(dev->of_node, "iommus") ||
++			     of_property_present(priv->dma_dev->of_node,
++						 "iommus")))
++				return -EPROBE_DEFER;
++		} else
+ 			mapping = ERR_PTR(-ENODEV);
+ 
+ 		if (IS_ERR(mapping))
+ 			return PTR_ERR(mapping);
+ 		priv->mapping = mapping;
++		pr_err("DSH-DISP dma: mapping=%px (domain) from %s\n",
++		       mapping, dev_name(priv->dma_dev));
+ 	}
+ 
+-	return drm_iommu_attach_device(drm, dev, dma_priv);
++	ret = drm_iommu_attach_device(drm, dev, dma_priv);
++	pr_err("DSH-DISP dma: attach %s ret=%d\n", dev_name(dev), ret);
++	return ret;
+ }
+ 
+ void exynos_drm_unregister_dma(struct drm_device *drm, struct device *dev,
+diff --git a/drivers/gpu/drm/exynos/exynos_drm_drv.c b/drivers/gpu/drm/exynos/exynos_drm_drv.c
+index 8399256cb..9d977ddd5 100644
+--- a/drivers/gpu/drm/exynos/exynos_drm_drv.c
++++ b/drivers/gpu/drm/exynos/exynos_drm_drv.c
+@@ -9,12 +9,14 @@
+ 
+ #include <linux/component.h>
+ #include <linux/dma-mapping.h>
++#include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/uaccess.h>
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
++#include <drm/drm_aperture.h>
+ #include <drm/drm_drv.h>
+ #include <drm/drm_file.h>
+ #include <drm/drm_fourcc.h>
+@@ -36,6 +38,22 @@
+ #define DRIVER_DESC	"Samsung SoC DRM"
+ #define DRIVER_DATE	"20180330"
+ 
++/*
++ * DSH 2026-10-20: DECON bring-up kill switches for staged validation.
++ * Defaults are the zenlte/upstream behaviour.
++ *
++ *   aperture=0 : keep simpledrm (do not remove the bootloader framebuffer)
++ *   fbdev=0    : skip exynos_drm_fbdev_setup() so the first atomic modeset
++ *                (and thus decon_atomic_enable) only happens when a userspace
++ *                client explicitly does one.
++ */
++bool dsh_disp_aperture = true;
++module_param_named(aperture, dsh_disp_aperture, bool, 0644);
++bool dsh_disp_fbdev = true;
++module_param_named(fbdev, dsh_disp_fbdev, bool, 0644);
++
++#define DSH_DISP_TAG "DSH-DISP"
++
+ /*
+  * Interface history:
+  *
+@@ -241,6 +259,25 @@ static int exynos_drm_bind(struct device *dev)
+ 	unsigned int clone_mask;
+ 	int ret;
+ 
++	pr_err(DSH_DISP_TAG " bind: enter (%s), aperture=%d fbdev=%d\n",
++	       dev_name(dev), dsh_disp_aperture, dsh_disp_fbdev);
++
++	/*
++	 * Remove the bootloader's simple-framebuffer (simpledrm) before taking
++	 * over.  Otherwise userspace ends up with two DRM devices/connectors
++	 * (simpledrm + exynos) driving the same panel, which confuses touch
++	 * input mapping and per-monitor scaling.
++	 */
++	if (dsh_disp_aperture) {
++		pr_err(DSH_DISP_TAG " bind: drm_aperture_remove_framebuffers()\n");
++		ret = drm_aperture_remove_framebuffers(&exynos_drm_driver);
++		if (ret)
++			return ret;
++		pr_err(DSH_DISP_TAG " bind: simpledrm removed\n");
++	} else {
++		pr_err(DSH_DISP_TAG " bind: keep simpledrm (aperture=0)\n");
++	}
++
+ 	drm = drm_dev_alloc(&exynos_drm_driver, dev);
+ 	if (IS_ERR(drm))
+ 		return PTR_ERR(drm);
+@@ -270,7 +307,9 @@ static int exynos_drm_bind(struct device *dev)
+ 		encoder->possible_clones = clone_mask;
+ 
+ 	/* Try to bind all sub drivers. */
++	pr_err(DSH_DISP_TAG " bind: component_bind_all()...\n");
+ 	ret = component_bind_all(drm->dev, drm);
++	pr_err(DSH_DISP_TAG " bind: component_bind_all ret=%d\n", ret);
+ 	if (ret)
+ 		goto err_mode_config_cleanup;
+ 
+@@ -284,12 +323,20 @@ static int exynos_drm_bind(struct device *dev)
+ 	drm_kms_helper_poll_init(drm);
+ 
+ 	/* register the DRM device */
++	pr_err(DSH_DISP_TAG " bind: drm_dev_register()...\n");
+ 	ret = drm_dev_register(drm, 0);
++	pr_err(DSH_DISP_TAG " bind: drm_dev_register ret=%d\n", ret);
+ 	if (ret < 0)
+ 		goto err_cleanup_poll;
+ 
+-	exynos_drm_fbdev_setup(drm);
++	if (dsh_disp_fbdev) {
++		pr_err(DSH_DISP_TAG " bind: exynos_drm_fbdev_setup()...\n");
++		exynos_drm_fbdev_setup(drm);
++	} else {
++		pr_err(DSH_DISP_TAG " bind: fbdev setup SKIPPED (fbdev=0)\n");
++	}
+ 
++	pr_err(DSH_DISP_TAG " bind: done\n");
+ 	return 0;
+ 
+ err_cleanup_poll:

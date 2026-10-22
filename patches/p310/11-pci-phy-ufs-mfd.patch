@@ -1,0 +1,1384 @@
+diff --git a/drivers/mfd/madera-core.c b/drivers/mfd/madera-core.c
+index bdbd5bfc9..bc1e7bb6a 100644
+--- a/drivers/mfd/madera-core.c
++++ b/drivers/mfd/madera-core.c
+@@ -713,20 +713,57 @@ int madera_dev_init(struct madera *madera)
+ 		}
+ 	}
+ 
+-	/* Init 32k clock sourced from MCLK2 */
+-	ret = clk_prepare_enable(madera->mclk[MADERA_MCLK2].clk);
+-	if (ret) {
+-		dev_err(madera->dev, "Failed to enable 32k clock: %d\n", ret);
+-		goto err_reset;
+-	}
++	/*
++	 * DSH 2026-10-21: 处理「本板没有 MCLK2 (32.768kHz)」的情况。
++	 *
++	 * S6 (zeroflte) 的硬件设计里，WM1840/CS47L85 的 MCLK2 引脚**没有
++	 * 接任何 32.768kHz 时钟源**（vendor DTS 的 wm1840 节点根本没有
++	 * clocks 属性，只有 wlf,reset / wlf,ldoena 两个 GPIO）。
++	 *
++	 * 原驱动无条件 clk_prepare_enable(mclk[MCLK2].clk) —— 当它是一个
++	 * 空 clock 时返回错误，然后 goto err_reset，导致：
++	 *   "Polling BOOT_DONE_STS timed out" → probe 失败 -110
++	 * 实测 dmesg:
++	 *   madera spi1.0: Missing MCLK2, requires 32kHz clock
++	 *   madera spi1.0: Polling BOOT_DONE_STS timed out
++	 *   madera: probe of spi1.0 failed with error -110
++	 *
++	 * 修法：MCLK2 不存在时把 CLK_32K_SRC 设成 2 (NONE) —— 这正是
++	 * mainline arizona-core.c 对 ARIZONA_32KZ_NONE 的做法
++	 * （arizona-core.c:1302-1305），说明硬件本身支持无 32k 运行。
++	 */
++	if (!madera->mclk[MADERA_MCLK2].clk) {
++		dev_info(madera->dev,
++			 "no MCLK2 32k clock, using CLK_32K_SRC=NONE\n");
++		ret = regmap_update_bits(madera->regmap,
++				MADERA_CLOCK_32K_1,
++				MADERA_CLK_32K_ENA_MASK |
++				MADERA_CLK_32K_SRC_MASK,
++				0 /* ENA=0, SRC=2 (NONE) */ | 2);
++		if (ret) {
++			dev_err(madera->dev,
++				"Failed to init 32k clock: %d\n", ret);
++			goto err_reset;
++		}
++	} else {
++		/* Init 32k clock sourced from MCLK2 */
++		ret = clk_prepare_enable(madera->mclk[MADERA_MCLK2].clk);
++		if (ret) {
++			dev_err(madera->dev,
++				"Failed to enable 32k clock: %d\n", ret);
++			goto err_reset;
++		}
+ 
+-	ret = regmap_update_bits(madera->regmap,
+-			MADERA_CLOCK_32K_1,
+-			MADERA_CLK_32K_ENA_MASK | MADERA_CLK_32K_SRC_MASK,
+-			MADERA_CLK_32K_ENA | MADERA_32KZ_MCLK2);
+-	if (ret) {
+-		dev_err(madera->dev, "Failed to init 32k clock: %d\n", ret);
+-		goto err_clock;
++		ret = regmap_update_bits(madera->regmap,
++				MADERA_CLOCK_32K_1,
++				MADERA_CLK_32K_ENA_MASK |
++				MADERA_CLK_32K_SRC_MASK,
++				MADERA_CLK_32K_ENA | MADERA_32KZ_MCLK2);
++		if (ret) {
++			dev_err(madera->dev,
++				"Failed to init 32k clock: %d\n", ret);
++			goto err_clock;
++		}
+ 	}
+ 
+ 	pm_runtime_set_active(madera->dev);
+diff --git a/drivers/pci/controller/dwc/Kconfig b/drivers/pci/controller/dwc/Kconfig
+index ab96da43e..9d450bcb7 100644
+--- a/drivers/pci/controller/dwc/Kconfig
++++ b/drivers/pci/controller/dwc/Kconfig
+@@ -308,6 +308,19 @@ config PCI_EXYNOS
+ 	  hardware and therefore the driver re-uses the DesignWare core
+ 	  functions to implement the driver.
+ 
++config PCI_EXYNOS7420
++	tristate "Samsung Exynos7420 PCIe controller"
++	depends on ARCH_EXYNOS || COMPILE_TEST
++	depends on PCI_MSI
++	select PCIE_DW_HOST
++	help
++	  Enables support for the PCIe host controller found on the Samsung
++	  Exynos7420 SoC (used for the BCM4358 WiFi chip on Galaxy S6 class
++	  devices and for the external modem on some variants). The
++	  controller is based on a Synopsys DesignWare core but uses an
++	  integrated combo PHY, SoC specific clock gates and a special DBI
++	  access sequence, so it does not share the Exynos5433 implementation.
++
+ config PCIE_FU740
+ 	bool "SiFive FU740 PCIe controller"
+ 	depends on PCI_MSI
+diff --git a/drivers/pci/controller/dwc/Makefile b/drivers/pci/controller/dwc/Makefile
+index bf5c31187..d5633513b 100644
+--- a/drivers/pci/controller/dwc/Makefile
++++ b/drivers/pci/controller/dwc/Makefile
+@@ -6,6 +6,7 @@ obj-$(CONFIG_PCIE_DW_PLAT) += pcie-designware-plat.o
+ obj-$(CONFIG_PCIE_BT1) += pcie-bt1.o
+ obj-$(CONFIG_PCI_DRA7XX) += pci-dra7xx.o
+ obj-$(CONFIG_PCI_EXYNOS) += pci-exynos.o
++obj-$(CONFIG_PCI_EXYNOS7420) += pci-exynos7420.o
+ obj-$(CONFIG_PCIE_FU740) += pcie-fu740.o
+ obj-$(CONFIG_PCI_IMX6) += pci-imx6.o
+ obj-$(CONFIG_PCIE_SPEAR13XX) += pcie-spear13xx.o
+diff --git a/drivers/pci/controller/dwc/pci-exynos7420.c b/drivers/pci/controller/dwc/pci-exynos7420.c
+new file mode 100644
+index 000000000..6890ad152
+--- /dev/null
++++ b/drivers/pci/controller/dwc/pci-exynos7420.c
+@@ -0,0 +1,701 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * PCIe host controller driver for Samsung Exynos7420
++ *
++ * The Exynos7420 PCIe root complex is built around a Synopsys DesignWare
++ * core, but it differs from the Exynos5433 variant in several ways:
++ *
++ *  - the PHY is a "combo" PHY programmed with a fixed register sequence
++ *    (taken from the Samsung 3.10 BSP, pci-exynos7420_cal.c); the PHY
++ *    reference clock/reset controls live in a SYSREG block and in the
++ *    ELBI register space,
++ *  - all PCIe clock gates live in CMU_FSYS1 (there is no per-clock CCF
++ *    binding for them in mainline yet),
++ *  - the DBI register space must be accessed while APP_REQ_EXIT_L1 is
++ *    forced and APP_REQ_EXIT_L1_MODE is switched to software mode.
++ *
++ * The controller is used for the WiFi channel (pcie1, bus address
++ * 0x157b0000) on SM-G9209/G920F/G925F class boards; the same IP is also
++ * used for the external modem channel (pcie0) on some variants.
++ *
++ * Register layout and sequences are derived from the Samsung universal7420
++ * 3.10 BSP (drivers/pci/host/pci-exynos.c, pci-exynos7420.c,
++ * pci-exynos7420_cal.c) and from the zenlte mainline 6.6 port.
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/interrupt.h>
++#include <linux/irqreturn.h>
++#include <linux/kernel.h>
++#include <linux/mod_devicetable.h>
++#include <linux/of.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++
++#include "pcie-designware.h"
++
++/* PCIe ELBI registers */
++#define EXYNOS7420_PCIE_IRQ_PULSE		0x000
++#define EXYNOS7420_PCIE_IRQ_LEVEL		0x004
++#define EXYNOS7420_PCIE_IRQ_SPECIAL		0x008
++#define EXYNOS7420_PCIE_IRQ_EN_PULSE		0x00c
++#define EXYNOS7420_PCIE_IRQ_EN_LEVEL		0x010
++#define EXYNOS7420_PCIE_IRQ_EN_SPECIAL		0x014
++#define EXYNOS7420_PCIE_SW_WAKE			0x018
++#define EXYNOS7420_PCIE_BUS_EN			BIT(1)
++#define EXYNOS7420_PCIE_APP_LTSSM_ENABLE	0x02c
++#define EXYNOS7420_PCIE_L1_BUG_FIX_ENABLE	0x038
++#define EXYNOS7420_PCIE_APP_REQ_EXIT_L1		0x040
++#define EXYNOS7420_PCIE_ELBI_RDLH_LINKUP	0x074
++#define EXYNOS7420_PCIE_ELBI_XMLH_LINKUP	BIT(4)
++#define EXYNOS7420_PCIE_CORE_RESETN_DISABLE	0x0f0
++#define EXYNOS7420_PCIE_APP_REQ_EXIT_L1_MODE	0x0f4
++#define EXYNOS7420_PCIE_ELBI_SLV_AWMISC		0x11c
++#define EXYNOS7420_PCIE_ELBI_SLV_ARMISC		0x120
++#define EXYNOS7420_PCIE_ELBI_SLV_DBI_ENABLE	BIT(21)
++
++/* PHY PCS/PMA reset registers, accessed through the ELBI window */
++#define EXYNOS7420_PCIE_PCS_G_RST		0x130
++#define EXYNOS7420_PCIE_PMA_INIT_RST		0x134
++
++/* ELBI interrupt bits */
++#define EXYNOS7420_PCIE_IRQ_INTA_ASSERT		BIT(0)
++#define EXYNOS7420_PCIE_IRQ_INTB_ASSERT		BIT(2)
++#define EXYNOS7420_PCIE_IRQ_INTC_ASSERT		BIT(4)
++#define EXYNOS7420_PCIE_IRQ_INTD_ASSERT		BIT(6)
++#define EXYNOS7420_PCIE_IRQ_MSI_ENABLE		BIT(1)
++#define EXYNOS7420_PCIE_IRQ_LINKDOWN_ENABLE	BIT(4)
++#define EXYNOS7420_PCIE_IRQ_LINK_DOWN		BIT(2)
++
++#define EXYNOS7420_PCIE_ELBI_LTSSM_ENABLE	0x1
++
++/* SYSREG PCIe PHY controls (offset inside the mapped "block" register) */
++#define EXYNOS7420_PCIE_SYSREG_REFCLK_MASK	(0x3 << 4)
++#define EXYNOS7420_PCIE_SYSREG_PHY_CTRL_MASK	(0x3 << 2)
++#define EXYNOS7420_PCIE_SYSREG_PHY_CTRL_VAL	BIT(2)
++#define EXYNOS7420_PCIE_SYSREG_CMN_RST		BIT(7)
++#define EXYNOS7420_PCIE_SYSREG_CMN_RST_TIME_US	20
++
++/* CMU_FSYS1 register offsets (all PCIe gates live in this block) */
++#define EXYNOS7420_FSYS1_ENABLE_ACLK		0x0800
++#define EXYNOS7420_FSYS1_ENABLE_PCLK		0x0900
++#define EXYNOS7420_FSYS1_ENABLE_SCLK11		0x0a04
++#define EXYNOS7420_FSYS1_ENABLE_SCLK12		0x0a08
++#define EXYNOS7420_FSYS1_ENABLE_SCLK13		0x0a0c
++
++/* PCIe WiFi1/ch1 gates, see the Samsung 3.10 clk-exynos7420.c tables */
++#define EXYNOS7420_FSYS1_PCIE_ACLK_GATES	(BIT(9) | BIT(10) | BIT(11) | \
++						 BIT(12) | BIT(13) | BIT(17) | \
++						 BIT(18) | BIT(20) | BIT(21) | \
++						 BIT(24))
++#define EXYNOS7420_FSYS1_PCIE_PCLK_GATES	(BIT(22) | BIT(26) | BIT(27) | \
++						 BIT(28) | BIT(29) | BIT(31))
++#define EXYNOS7420_FSYS1_PCIE_SCLK11_GATES	(BIT(0) | BIT(8) | BIT(12) | \
++						 BIT(16))
++#define EXYNOS7420_FSYS1_PCIE_SCLK12_GATES	(BIT(8) | BIT(12))
++#define EXYNOS7420_FSYS1_PCIE_SCLK13_GATES	BIT(28)
++
++/* CMU Q-channel force-on register (CMU_FSYS1 + 0xf00), bit 0 */
++#define EXYNOS7420_PCIE_QCH_FORCE_ON		BIT(0)
++
++/* PMU PCIE PHY power control register, bit 0 */
++#define EXYNOS7420_PCIE_PMU_PHY_CONTROL		BIT(0)
++
++/* PHY register offsets (word index) used by the power up/down sequences */
++#define EXYNOS7420_PCIE_PHY_PWR_CTRL		(0x15 * 4)
++#define EXYNOS7420_PCIE_PHY_ALL_PWR_DOWN	(0xf << 3)
++#define EXYNOS7420_PCIE_PHY_PMA_CTRL0		(0x4e * 4)
++#define EXYNOS7420_PCIE_PHY_PMA_CTRL1		(0x4f * 4)
++
++#define EXYNOS7420_PCIE_LINKUP_TIMEOUT_US	100000
++#define EXYNOS7420_PCIE_PERST_DELAY_US		20000
++#define EXYNOS7420_PCIE_PWR_ON_DELAY_MS		100
++
++/**
++ * struct exynos7420_pcie - Exynos7420 PCIe RC private data
++ * @pci: DesignWare PCIe core
++ * @elbi_base: ELBI (link/interrupt) registers
++ * @phy_base: combo PHY registers
++ * @block_base: SYSREG block holding PHY refclk/reset controls
++ * @pmu_base: PMU PCIE_PHY_CONTROL register
++ * @cmu_base: CMU Q-channel force-on register
++ * @phy_pcs_base: PHY PCS control register
++ * @gates_base: CMU_FSYS1 gate registers
++ * @perst_gpio: PERST# (active low)
++ * @wl_en_gpio: WL_REG_ON / WLAN_EN
++ * @dbi_lock: serializes the DBI access dance
++ * @skip_phy_sysreg: board workaround, do not touch the SYSREG block
++ * @skip_phy_pcs: board workaround, do not touch the PHY PCS register
++ */
++struct exynos7420_pcie {
++	struct dw_pcie pci;
++	void __iomem *elbi_base;
++	void __iomem *phy_base;
++	void __iomem *block_base;
++	void __iomem *pmu_base;
++	void __iomem *cmu_base;
++	void __iomem *phy_pcs_base;
++	void __iomem *gates_base;
++	struct gpio_desc *perst_gpio;
++	struct gpio_desc *wl_en_gpio;
++	raw_spinlock_t dbi_lock;
++	bool skip_phy_sysreg;
++	bool skip_phy_pcs;
++};
++
++static inline struct exynos7420_pcie *to_exynos7420_pcie(struct dw_pcie *pci)
++{
++	return container_of(pci, struct exynos7420_pcie, pci);
++}
++
++/* ------------------------------------------------------------------ */
++/* DBI access                                                          */
++/* ------------------------------------------------------------------ */
++
++/*
++ * The DBI register space is only reachable while the L1 exit request is
++ * forced and the L1 exit mode is switched to software.  The Samsung BSP
++ * does this around every single DBI access for this SoC; mirror that.
++ */
++static void exynos7420_pcie_dbi_prepare(struct exynos7420_pcie *ep, bool on)
++{
++	if (on) {
++		writel(1, ep->elbi_base + EXYNOS7420_PCIE_APP_REQ_EXIT_L1);
++		writel(0, ep->elbi_base +
++		       EXYNOS7420_PCIE_APP_REQ_EXIT_L1_MODE);
++	} else {
++		writel(1, ep->elbi_base +
++		       EXYNOS7420_PCIE_APP_REQ_EXIT_L1_MODE);
++		writel(0, ep->elbi_base + EXYNOS7420_PCIE_APP_REQ_EXIT_L1);
++	}
++}
++
++static u32 exynos7420_pcie_read_dbi(struct dw_pcie *pci, void __iomem *base,
++				    u32 reg, size_t size)
++{
++	struct exynos7420_pcie *ep = to_exynos7420_pcie(pci);
++	unsigned long flags;
++	u32 val = 0;
++
++	raw_spin_lock_irqsave(&ep->dbi_lock, flags);
++	exynos7420_pcie_dbi_prepare(ep, true);
++	dw_pcie_read(base + reg, size, &val);
++	exynos7420_pcie_dbi_prepare(ep, false);
++	raw_spin_unlock_irqrestore(&ep->dbi_lock, flags);
++
++	return val;
++}
++
++static void exynos7420_pcie_write_dbi(struct dw_pcie *pci, void __iomem *base,
++				      u32 reg, size_t size, u32 val)
++{
++	struct exynos7420_pcie *ep = to_exynos7420_pcie(pci);
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&ep->dbi_lock, flags);
++	exynos7420_pcie_dbi_prepare(ep, true);
++	dw_pcie_write(base + reg, size, val);
++	exynos7420_pcie_dbi_prepare(ep, false);
++	raw_spin_unlock_irqrestore(&ep->dbi_lock, flags);
++}
++
++static int exynos7420_pcie_rd_own_conf(struct pci_bus *bus, unsigned int devfn,
++				       int where, int size, u32 *val)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(bus->sysdata);
++
++	if (PCI_SLOT(devfn))
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	*val = dw_pcie_read_dbi(pci, where, size);
++
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static int exynos7420_pcie_wr_own_conf(struct pci_bus *bus, unsigned int devfn,
++				       int where, int size, u32 val)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(bus->sysdata);
++
++	if (PCI_SLOT(devfn))
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	dw_pcie_write_dbi(pci, where, size, val);
++
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static struct pci_ops exynos7420_pci_ops = {
++	.read = exynos7420_pcie_rd_own_conf,
++	.write = exynos7420_pcie_wr_own_conf,
++};
++
++/* ------------------------------------------------------------------ */
++/* Link handling                                                       */
++/* ------------------------------------------------------------------ */
++
++static int exynos7420_pcie_link_up(struct dw_pcie *pci)
++{
++	struct exynos7420_pcie *ep = to_exynos7420_pcie(pci);
++	u32 val;
++
++	val = readl(ep->elbi_base + EXYNOS7420_PCIE_ELBI_RDLH_LINKUP) & 0x1f;
++
++	return val >= 0x0d && val <= 0x15;
++}
++
++static int exynos7420_pcie_start_link(struct dw_pcie *pci)
++{
++	struct exynos7420_pcie *ep = to_exynos7420_pcie(pci);
++
++	dev_info(pci->dev, "starting LTSSM\n");
++	writel(EXYNOS7420_PCIE_ELBI_LTSSM_ENABLE,
++	       ep->elbi_base + EXYNOS7420_PCIE_APP_LTSSM_ENABLE);
++
++	return 0;
++}
++
++static void exynos7420_pcie_stop_link(struct dw_pcie *pci)
++{
++	struct exynos7420_pcie *ep = to_exynos7420_pcie(pci);
++
++	writel(0, ep->elbi_base + EXYNOS7420_PCIE_APP_LTSSM_ENABLE);
++}
++
++/* ------------------------------------------------------------------ */
++/* Clock gates / power                                                 */
++/* ------------------------------------------------------------------ */
++
++static void exynos7420_pcie_gates_set(struct exynos7420_pcie *ep, bool on)
++{
++	void __iomem *g = ep->gates_base;
++	u32 val;
++
++	if (!g)
++		return;
++
++	/* aclk gates */
++	val = readl(g + EXYNOS7420_FSYS1_ENABLE_ACLK);
++	if (on)
++		val |= EXYNOS7420_FSYS1_PCIE_ACLK_GATES;
++	else
++		val &= ~EXYNOS7420_FSYS1_PCIE_ACLK_GATES;
++	writel(val, g + EXYNOS7420_FSYS1_ENABLE_ACLK);
++
++	/* pclk gates */
++	val = readl(g + EXYNOS7420_FSYS1_ENABLE_PCLK);
++	if (on)
++		val |= EXYNOS7420_FSYS1_PCIE_PCLK_GATES;
++	else
++		val &= ~EXYNOS7420_FSYS1_PCIE_PCLK_GATES;
++	writel(val, g + EXYNOS7420_FSYS1_ENABLE_PCLK);
++
++	/* sclk gates: PHY refclk, PCIe link, TLX400 */
++	val = readl(g + EXYNOS7420_FSYS1_ENABLE_SCLK11);
++	if (on)
++		val |= EXYNOS7420_FSYS1_PCIE_SCLK11_GATES;
++	else
++		val &= ~EXYNOS7420_FSYS1_PCIE_SCLK11_GATES;
++	writel(val, g + EXYNOS7420_FSYS1_ENABLE_SCLK11);
++
++	/* sclk gates: PHY TX0/RX0 symbol clocks */
++	val = readl(g + EXYNOS7420_FSYS1_ENABLE_SCLK12);
++	if (on)
++		val |= EXYNOS7420_FSYS1_PCIE_SCLK12_GATES;
++	else
++		val &= ~EXYNOS7420_FSYS1_PCIE_SCLK12_GATES;
++	writel(val, g + EXYNOS7420_FSYS1_ENABLE_SCLK12);
++
++	/* sclk gates: combo PHY 26 MHz */
++	val = readl(g + EXYNOS7420_FSYS1_ENABLE_SCLK13);
++	if (on)
++		val |= EXYNOS7420_FSYS1_PCIE_SCLK13_GATES;
++	else
++		val &= ~EXYNOS7420_FSYS1_PCIE_SCLK13_GATES;
++	writel(val, g + EXYNOS7420_FSYS1_ENABLE_SCLK13);
++
++	dev_info(ep->pci.dev, "PCIe clock gates %s\n", on ? "enabled" : "disabled");
++}
++
++static void exynos7420_pcie_pmu_power(struct exynos7420_pcie *ep, bool on)
++{
++	u32 val;
++
++	if (!ep->pmu_base)
++		return;
++
++	val = readl(ep->pmu_base);
++	if (on)
++		val |= EXYNOS7420_PCIE_PMU_PHY_CONTROL;
++	else
++		val &= ~EXYNOS7420_PCIE_PMU_PHY_CONTROL;
++	writel(val, ep->pmu_base);
++}
++
++static void exynos7420_pcie_phy_all_power_down(struct exynos7420_pcie *ep,
++					       bool enable)
++{
++	u32 val;
++
++	/* PHY all power down: PWR_CTRL bits 3..6 and the PMA control words */
++	val = readl(ep->phy_base + EXYNOS7420_PCIE_PHY_PWR_CTRL);
++	if (enable)
++		val |= EXYNOS7420_PCIE_PHY_ALL_PWR_DOWN;
++	else
++		val &= ~EXYNOS7420_PCIE_PHY_ALL_PWR_DOWN;
++	writel(val, ep->phy_base + EXYNOS7420_PCIE_PHY_PWR_CTRL);
++
++	writel(enable ? 0xff : 0x00, ep->phy_base + EXYNOS7420_PCIE_PHY_PMA_CTRL0);
++	writel(enable ? 0x3f : 0x00, ep->phy_base + EXYNOS7420_PCIE_PHY_PMA_CTRL1);
++}
++
++/* ------------------------------------------------------------------ */
++/* Combo PHY configuration (Samsung CAL sequence, 26 MHz reference)    */
++/* ------------------------------------------------------------------ */
++
++static const u32 exynos7420_pcie_phy_cmn_cfg[26] = {
++	0x01, 0x0f, 0xa6, 0x71, 0x90, 0x62, 0x20, 0x00, 0x00, 0xa7, 0x0a,
++	0x37, 0x20, 0x08, 0xef, 0xfc, 0x96, 0x14, 0x00, 0x10, 0x68, 0x01,
++	0x00, 0x00, 0x04, 0x20,
++};
++
++static const u32 exynos7420_pcie_phy_trsv_cfg[41] = {
++	0x31, 0xf4, 0xf4, 0x80, 0x25, 0x40, 0xc0, 0x03, 0x35, 0x55, 0x4c,
++	0xc3, 0x10, 0x54, 0x70, 0xc5, 0x00, 0x2f, 0x44, 0xa4, 0x00, 0x3b,
++	0x34, 0xa7, 0x64, 0x00, 0x1f, 0x83, 0x1b, 0x01, 0xe0, 0x00, 0x00,
++	0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x00,
++};
++
++static void exynos7420_pcie_phy_config(struct exynos7420_pcie *ep)
++{
++	void __iomem *phy = ep->phy_base;
++	void __iomem *block = ep->block_base;
++	unsigned int i;
++	u32 val;
++
++	if (block && !ep->skip_phy_sysreg) {
++		/* select the proper PHY reference clock source */
++		val = readl(block);
++		writel(val & ~EXYNOS7420_PCIE_SYSREG_REFCLK_MASK, block);
++		val = readl(block);
++		writel((val & ~EXYNOS7420_PCIE_SYSREG_PHY_CTRL_MASK) |
++		       EXYNOS7420_PCIE_SYSREG_PHY_CTRL_VAL, block);
++	}
++
++	/* PCS/PMA initialisation resets, via the ELBI window */
++	writel(1, ep->elbi_base + EXYNOS7420_PCIE_PCS_G_RST);
++	udelay(10);
++	writel(0, ep->elbi_base + EXYNOS7420_PCIE_PCS_G_RST);
++	udelay(10);
++
++	writel(1, ep->elbi_base + EXYNOS7420_PCIE_PMA_INIT_RST);
++	udelay(10);
++	writel(0, ep->elbi_base + EXYNOS7420_PCIE_PMA_INIT_RST);
++	udelay(10);
++
++	/* PHY common block */
++	for (i = 0; i < ARRAY_SIZE(exynos7420_pcie_phy_cmn_cfg); i++)
++		writel(exynos7420_pcie_phy_cmn_cfg[i], phy + i * 4);
++
++	/* PHY transceiver/receiver block */
++	for (i = 0; i < ARRAY_SIZE(exynos7420_pcie_phy_trsv_cfg); i++)
++		writel(exynos7420_pcie_phy_trsv_cfg[i], phy + (0x30 + i) * 4);
++
++	if (ep->phy_pcs_base && !ep->skip_phy_pcs)
++		writel(0x2, ep->phy_pcs_base);
++
++	if (block && !ep->skip_phy_sysreg) {
++		/* PHY common block reset pulse */
++		val = readl(block);
++		writel(val & ~EXYNOS7420_PCIE_SYSREG_CMN_RST, block);
++		val = readl(block);
++		writel(val | EXYNOS7420_PCIE_SYSREG_CMN_RST, block);
++		udelay(EXYNOS7420_PCIE_SYSREG_CMN_RST_TIME_US);
++		val = readl(block);
++		writel(val & ~EXYNOS7420_PCIE_SYSREG_CMN_RST, block);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* Interrupts (legacy INTx pulse + DesignWare MSI)                     */
++/* ------------------------------------------------------------------ */
++
++static irqreturn_t exynos7420_pcie_irq_handler(int irq, void *arg)
++{
++	struct exynos7420_pcie *ep = arg;
++	struct dw_pcie_rp *pp = &ep->pci.pp;
++	u32 val;
++
++	val = readl(ep->elbi_base + EXYNOS7420_PCIE_IRQ_PULSE);
++	writel(val, ep->elbi_base + EXYNOS7420_PCIE_IRQ_PULSE);
++
++	val = readl(ep->elbi_base + EXYNOS7420_PCIE_IRQ_LEVEL);
++	writel(val, ep->elbi_base + EXYNOS7420_PCIE_IRQ_LEVEL);
++
++	val = readl(ep->elbi_base + EXYNOS7420_PCIE_IRQ_SPECIAL);
++	if (val & EXYNOS7420_PCIE_IRQ_LINK_DOWN)
++		dev_info_ratelimited(ep->pci.dev, "PCIe link down event\n");
++	writel(val, ep->elbi_base + EXYNOS7420_PCIE_IRQ_SPECIAL);
++
++#ifdef CONFIG_PCI_MSI
++	if (pp->has_msi_ctrl && pp->irq_domain)
++		dw_handle_msi_irq(pp);
++#endif
++
++	return IRQ_HANDLED;
++}
++
++/* ------------------------------------------------------------------ */
++/* Host init                                                           */
++/* ------------------------------------------------------------------ */
++
++static int exynos7420_pcie_host_init(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct exynos7420_pcie *ep = to_exynos7420_pcie(pci);
++	u32 val;
++
++	dev_info(pci->dev, "host init: releasing PERST\n");
++	gpiod_set_value_cansleep(ep->perst_gpio, 0); /* deassert (active low) */
++	usleep_range(EXYNOS7420_PCIE_PERST_DELAY_US,
++		     EXYNOS7420_PCIE_PERST_DELAY_US + 2000);
++
++	/* APP_REQ_EXIT_L1_MODE = HW mode, core resetn disable, Q-channel on */
++	writel(1, ep->elbi_base + EXYNOS7420_PCIE_APP_REQ_EXIT_L1_MODE);
++	writel(1, ep->elbi_base + EXYNOS7420_PCIE_CORE_RESETN_DISABLE);
++	if (ep->cmu_base)
++		writel(readl(ep->cmu_base) | EXYNOS7420_PCIE_QCH_FORCE_ON,
++		       ep->cmu_base);
++
++	dev_info(pci->dev, "host init: configuring combo PHY\n");
++	exynos7420_pcie_phy_config(ep);
++	dev_info(pci->dev, "host init: combo PHY configured\n");
++
++	writel(1, ep->elbi_base + EXYNOS7420_PCIE_L1_BUG_FIX_ENABLE);
++
++	/* bus number enable (clear BUS_EN) */
++	val = readl(ep->elbi_base + EXYNOS7420_PCIE_SW_WAKE);
++	writel(val & ~EXYNOS7420_PCIE_BUS_EN,
++	       ep->elbi_base + EXYNOS7420_PCIE_SW_WAKE);
++
++	/* quiesce legacy INTx, enable the MSI interrupt source */
++	writel(0, ep->elbi_base + EXYNOS7420_PCIE_IRQ_EN_PULSE);
++	writel(EXYNOS7420_PCIE_IRQ_MSI_ENABLE,
++	       ep->elbi_base + EXYNOS7420_PCIE_IRQ_EN_LEVEL);
++	writel(0, ep->elbi_base + EXYNOS7420_PCIE_IRQ_EN_SPECIAL);
++
++	/* hand over the root bus config access to the DBI dance helpers */
++	pp->bridge->ops = &exynos7420_pci_ops;
++
++	return 0;
++}
++
++static const struct dw_pcie_host_ops exynos7420_pcie_host_ops = {
++	.host_init = exynos7420_pcie_host_init,
++};
++
++static const struct dw_pcie_ops exynos7420_dw_pcie_ops = {
++	.read_dbi = exynos7420_pcie_read_dbi,
++	.write_dbi = exynos7420_pcie_write_dbi,
++	.link_up = exynos7420_pcie_link_up,
++	.start_link = exynos7420_pcie_start_link,
++	.stop_link = exynos7420_pcie_stop_link,
++};
++
++/* ------------------------------------------------------------------ */
++/* Probe / remove                                                      */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Map a register block without reserving the memory region.  Some of the
++ * PCIe registers (e.g. the PMU PHY control word) live inside blocks that
++ * are already claimed by another device (the Exynos PMU syscon), so
++ * devm_ioremap_resource() would fail with -EBUSY.
++ */
++static void __iomem *exynos7420_pcie_ioremap_optional(struct platform_device *pdev,
++						      const char *name)
++{
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!res)
++		return NULL;
++
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res));
++}
++
++static int exynos7420_pcie_get_resources(struct exynos7420_pcie *ep,
++					 struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++
++	ep->elbi_base = exynos7420_pcie_ioremap_optional(pdev, "elbi");
++	if (!ep->elbi_base)
++		return -ENODEV;
++	if (IS_ERR(ep->elbi_base))
++		return PTR_ERR(ep->elbi_base);
++
++	ep->phy_base = exynos7420_pcie_ioremap_optional(pdev, "phy");
++	if (!ep->phy_base)
++		return -ENODEV;
++	if (IS_ERR(ep->phy_base))
++		return PTR_ERR(ep->phy_base);
++
++	ep->block_base = exynos7420_pcie_ioremap_optional(pdev, "block");
++	if (IS_ERR(ep->block_base))
++		return PTR_ERR(ep->block_base);
++
++	ep->cmu_base = exynos7420_pcie_ioremap_optional(pdev, "cmu");
++	if (IS_ERR(ep->cmu_base))
++		return PTR_ERR(ep->cmu_base);
++
++	ep->phy_pcs_base = exynos7420_pcie_ioremap_optional(pdev, "phy_pcs");
++	if (IS_ERR(ep->phy_pcs_base))
++		return PTR_ERR(ep->phy_pcs_base);
++
++	ep->pmu_base = exynos7420_pcie_ioremap_optional(pdev, "pmu");
++	if (IS_ERR(ep->pmu_base))
++		return PTR_ERR(ep->pmu_base);
++
++	ep->gates_base = exynos7420_pcie_ioremap_optional(pdev, "gates");
++	if (IS_ERR(ep->gates_base))
++		return PTR_ERR(ep->gates_base);
++
++	dev_dbg(dev, "all Exynos7420 PCIe register blocks mapped\n");
++
++	return 0;
++}
++
++static int exynos7420_pcie_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct exynos7420_pcie *ep;
++	struct dw_pcie *pci;
++	struct dw_pcie_rp *pp;
++	int irq;
++	int ret;
++
++	ep = devm_kzalloc(dev, sizeof(*ep), GFP_KERNEL);
++	if (!ep)
++		return -ENOMEM;
++
++	pci = &ep->pci;
++	pci->dev = dev;
++	pci->ops = &exynos7420_dw_pcie_ops;
++	pp = &pci->pp;
++	pp->ops = &exynos7420_pcie_host_ops;
++	raw_spin_lock_init(&ep->dbi_lock);
++
++	ep->skip_phy_sysreg = of_property_read_bool(dev->of_node,
++						    "samsung,skip-phy-sysreg");
++	ep->skip_phy_pcs = of_property_read_bool(dev->of_node,
++						 "samsung,skip-phy-pcs");
++
++	ret = exynos7420_pcie_get_resources(ep, pdev);
++	if (ret)
++		return ret;
++
++	ep->perst_gpio = devm_gpiod_get_optional(dev, "perst", GPIOD_OUT_HIGH);
++	if (IS_ERR(ep->perst_gpio))
++		return dev_err_probe(dev, PTR_ERR(ep->perst_gpio),
++				     "failed to get PERST gpio\n");
++
++	ep->wl_en_gpio = devm_gpiod_get_optional(dev, "wl-en", GPIOD_OUT_LOW);
++	if (IS_ERR(ep->wl_en_gpio))
++		return dev_err_probe(dev, PTR_ERR(ep->wl_en_gpio),
++				     "failed to get WL_EN gpio\n");
++
++	/* External interrupt shared by MSI and the legacy INTx lines */
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	/*
++	 * Order matters: the controller/PHY blocks only answer on the bus once
++	 * their CMU_FSYS1 gates are running and the PHY is powered, so enable
++	 * those before touching any PCIe register.  The Samsung BSP does the
++	 * same in exynos_pcie_poweron().
++	 */
++	dev_info(dev, "powering on WiFi module\n");
++	exynos7420_pcie_gates_set(ep, true);
++	if (ep->wl_en_gpio) {
++		gpiod_set_value_cansleep(ep->wl_en_gpio, 1);
++		msleep(EXYNOS7420_PCIE_PWR_ON_DELAY_MS);
++	}
++	exynos7420_pcie_pmu_power(ep, true);
++	exynos7420_pcie_phy_all_power_down(ep, false);
++
++	/* Make sure no stale interrupt condition is pending */
++	writel(readl(ep->elbi_base + EXYNOS7420_PCIE_IRQ_PULSE),
++	       ep->elbi_base + EXYNOS7420_PCIE_IRQ_PULSE);
++	writel(readl(ep->elbi_base + EXYNOS7420_PCIE_IRQ_LEVEL),
++	       ep->elbi_base + EXYNOS7420_PCIE_IRQ_LEVEL);
++	writel(readl(ep->elbi_base + EXYNOS7420_PCIE_IRQ_SPECIAL),
++	       ep->elbi_base + EXYNOS7420_PCIE_IRQ_SPECIAL);
++	writel(0, ep->elbi_base + EXYNOS7420_PCIE_IRQ_EN_PULSE);
++	writel(0, ep->elbi_base + EXYNOS7420_PCIE_IRQ_EN_LEVEL);
++	writel(0, ep->elbi_base + EXYNOS7420_PCIE_IRQ_EN_SPECIAL);
++
++	ret = devm_request_irq(dev, irq, exynos7420_pcie_irq_handler,
++			       IRQF_SHARED, "exynos7420-pcie", ep);
++	if (ret)
++		goto err_power_off;
++
++	/* No chained MSI handler: the ELBI IRQ handler dispatches MSI itself */
++	pp->msi_irq[0] = -ENODEV;
++
++	ret = dw_pcie_host_init(pp);
++	if (ret) {
++		dev_err(dev, "failed to initialize PCIe host (%d)\n", ret);
++		goto err_power_off;
++	}
++
++	platform_set_drvdata(pdev, ep);
++	dev_info(dev, "exynos7420 PCIe host ready\n");
++
++	return 0;
++
++err_power_off:
++	exynos7420_pcie_phy_all_power_down(ep, true);
++	exynos7420_pcie_pmu_power(ep, false);
++	if (ep->wl_en_gpio)
++		gpiod_set_value_cansleep(ep->wl_en_gpio, 0);
++	exynos7420_pcie_gates_set(ep, false);
++	return ret;
++}
++
++static int exynos7420_pcie_remove(struct platform_device *pdev)
++{
++	struct exynos7420_pcie *ep = platform_get_drvdata(pdev);
++
++	dw_pcie_host_deinit(&ep->pci.pp);
++	gpiod_set_value_cansleep(ep->perst_gpio, 1); /* assert reset */
++	exynos7420_pcie_phy_all_power_down(ep, true);
++	exynos7420_pcie_pmu_power(ep, false);
++	if (ep->wl_en_gpio)
++		gpiod_set_value_cansleep(ep->wl_en_gpio, 0);
++	exynos7420_pcie_gates_set(ep, false);
++
++	return 0;
++}
++
++static const struct of_device_id exynos7420_pcie_of_match[] = {
++	{ .compatible = "samsung,exynos7420-pcie" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, exynos7420_pcie_of_match);
++
++static struct platform_driver exynos7420_pcie_driver = {
++	.probe = exynos7420_pcie_probe,
++	.remove = exynos7420_pcie_remove,
++	.driver = {
++		.name = "exynos7420-pcie",
++		.of_match_table = exynos7420_pcie_of_match,
++	},
++};
++module_platform_driver(exynos7420_pcie_driver);
++
++MODULE_DESCRIPTION("Samsung Exynos7420 PCIe host controller driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/phy/samsung/phy-exynos7-ufs.c b/drivers/phy/samsung/phy-exynos7-ufs.c
+index a982e7c12..07a884a87 100644
+--- a/drivers/phy/samsung/phy-exynos7-ufs.c
++++ b/drivers/phy/samsung/phy-exynos7-ufs.c
+@@ -68,6 +68,14 @@ static const struct samsung_ufs_phy_cfg *exynos7_ufs_phy_cfgs[CFG_TAG_MAX] = {
+ 	[CFG_POST_PWR_HS]	= exynos7_post_pwr_hs_cfg,
+ };
+ 
++/*
++ * DSH 时钟二分测试：7420 上只保留 ref_clk。
++ * 原厂 exynos7 要 4 个时钟，实测挂死在 clk_bulk_prepare_enable，
++ * 而 devm_clk_bulk_get 要求 4 个全在（少一个就 probe 失败），
++ * 所以只能在 drvdata 里减少数量来二分。
++ *   - 如果能启动 => 挂死在那 3 个 symbol clock 的某一个
++ *   - 如果还挂   => 就是 ref_clk 本身
++ */
+ static const char * const exynos7_ufs_phy_clks[] = {
+ 	"tx0_symbol_clk", "rx0_symbol_clk", "rx1_symbol_clk", "ref_clk",
+ };
+diff --git a/drivers/phy/samsung/phy-samsung-ufs.c b/drivers/phy/samsung/phy-samsung-ufs.c
+index 183c88e3d..7774247b4 100644
+--- a/drivers/phy/samsung/phy-samsung-ufs.c
++++ b/drivers/phy/samsung/phy-samsung-ufs.c
+@@ -150,6 +150,7 @@ static int samsung_ufs_phy_clks_init(struct samsung_ufs_phy *phy)
+ 
+ static int samsung_ufs_phy_init(struct phy *phy)
+ {
++	pr_emerg("DSHPHY: phy_init enter\n");
+ 	struct samsung_ufs_phy *ss_phy = get_samsung_ufs_phy(phy);
+ 
+ 	ss_phy->lane_cnt = phy->attrs.bus_width;
+@@ -163,16 +164,27 @@ static int samsung_ufs_phy_power_on(struct phy *phy)
+ 	struct samsung_ufs_phy *ss_phy = get_samsung_ufs_phy(phy);
+ 	int ret;
+ 
++	pr_emerg("DSHPHY: power_on: >>> ctrl_isol(false)\n");
+ 	samsung_ufs_phy_ctrl_isol(ss_phy, false);
++	pr_emerg("DSHPHY: power_on: ctrl_isol done\n");
+ 
++	pr_emerg("DSHPHY: power_on: >>> clk_bulk_prepare_enable\n");
+ 	ret = clk_bulk_prepare_enable(ss_phy->drvdata->num_clks, ss_phy->clks);
++	pr_emerg("DSHPHY: power_on: clk_bulk ret=%d\n", ret);
+ 	if (ret) {
+ 		dev_err(ss_phy->dev, "failed to enable ufs phy clocks\n");
+ 		return ret;
+ 	}
+ 
++	/*
++	 * DSH 二分测试：临时跳过 calibrate。
++	 * 如果跳过能启动 => samsung_ufs_phy_calibrate 是挂死原因
++	 * 如果照样挂  => clk_bulk_prepare_enable 或 ctrl_isol 是原因
++	 */
+ 	if (ss_phy->ufs_phy_state == CFG_PRE_INIT) {
++		pr_emerg("DSHPHY: power_on: >>> calibrate\n");
+ 		ret = samsung_ufs_phy_calibrate(phy);
++		pr_emerg("DSHPHY: power_on: calibrate ret=%d\n", ret);
+ 		if (ret)
+ 			dev_err(ss_phy->dev, "ufs phy calibration failed\n");
+ 	}
+@@ -228,6 +240,7 @@ static const struct of_device_id samsung_ufs_phy_match[];
+ static int samsung_ufs_phy_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
++	pr_emerg("DSHPHY: phy probe enter\n");
+ 	const struct of_device_id *match;
+ 	struct samsung_ufs_phy *phy;
+ 	struct phy *gen_phy;
+@@ -282,7 +295,9 @@ static int samsung_ufs_phy_probe(struct platform_device *pdev)
+ 
+ 	phy->lane_cnt = PHY_DEF_LANE_CNT;
+ 
++	pr_emerg("DSHPHY: before clks_init\n");
+ 	err = samsung_ufs_phy_clks_init(phy);
++	pr_emerg("DSHPHY: clks_init ret=%d\n", err);
+ 	if (err) {
+ 		dev_err(dev, "failed to get phy clocks\n");
+ 		goto out;
+diff --git a/drivers/ufs/core/ufshcd.c b/drivers/ufs/core/ufshcd.c
+index 8382e8cfa..9c806c79d 100644
+--- a/drivers/ufs/core/ufshcd.c
++++ b/drivers/ufs/core/ufshcd.c
+@@ -4694,7 +4694,9 @@ static int ufshcd_hba_execute_hce(struct ufs_hba *hba)
+ 	ufshcd_vops_hce_enable_notify(hba, PRE_CHANGE);
+ 
+ 	/* start controller initialization sequence */
++	pr_emerg("DSHUFS-CORE: hba_start (writing HCE)\n");
+ 	ufshcd_hba_start(hba);
++	pr_emerg("DSHUFS-CORE: hba_start done, polling HCE\n");
+ 
+ 	/*
+ 	 * To initialize a UFS host controller HCE bit must be set to 1.
+@@ -4735,6 +4737,7 @@ static int ufshcd_hba_execute_hce(struct ufs_hba *hba)
+ 
+ int ufshcd_hba_enable(struct ufs_hba *hba)
+ {
++	pr_emerg("DSHUFS-CORE: hba_enable enter\n");
+ 	int ret;
+ 
+ 	if (hba->quirks & UFSHCI_QUIRK_BROKEN_HCE) {
+@@ -4838,9 +4841,13 @@ static int ufshcd_link_startup(struct ufs_hba *hba)
+ 
+ link_startup:
+ 	do {
+-		ufshcd_vops_link_startup_notify(hba, PRE_CHANGE);
++		ret = ufshcd_vops_link_startup_notify(hba, PRE_CHANGE);
++		if (ret)
++			goto out;
+ 
++		dev_info(hba->dev, "link startup: issuing DME_LINKSTARTUP\n");
+ 		ret = ufshcd_dme_link_startup(hba);
++		dev_info(hba->dev, "link startup: DME_LINKSTARTUP ret=%d\n", ret);
+ 
+ 		/* check if device is detected by inter-connect layer */
+ 		if (!ret && !ufshcd_is_device_present(hba)) {
+@@ -8620,7 +8627,9 @@ static int ufshcd_device_init(struct ufs_hba *hba, bool init_dev_params)
+ 
+ 	hba->ufshcd_state = UFSHCD_STATE_RESET;
+ 
++	pr_emerg("DSHUFS-INIT: calling link_startup\n");
+ 	ret = ufshcd_link_startup(hba);
++	pr_emerg("DSHUFS-INIT: link_startup ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -8638,12 +8647,16 @@ static int ufshcd_device_init(struct ufs_hba *hba, bool init_dev_params)
+ 		ufshcd_config_mcq(hba);
+ 
+ 	/* Verify device initialization by sending NOP OUT UPIU */
++	pr_emerg("DSHUFS-INIT: calling verify_dev_init\n");
+ 	ret = ufshcd_verify_dev_init(hba);
++	pr_emerg("DSHUFS-INIT: verify_dev_init ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* Initiate UFS initialization, and waiting until completion */
++	pr_emerg("DSHUFS-INIT: calling complete_dev_init\n");
+ 	ret = ufshcd_complete_dev_init(hba);
++	pr_emerg("DSHUFS-INIT: complete_dev_init ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -8784,16 +8797,22 @@ static void ufshcd_async_scan(void *data, async_cookie_t cookie)
+ 	struct ufs_hba *hba = (struct ufs_hba *)data;
+ 	int ret;
+ 
++	pr_emerg("DSHUFS-SCAN: async_scan enter\n");
+ 	down(&hba->host_sem);
+ 	/* Initialize hba, detect and initialize UFS device */
++	pr_emerg("DSHUFS-SCAN: calling probe_hba\n");
+ 	ret = ufshcd_probe_hba(hba, true);
++	pr_emerg("DSHUFS-SCAN: probe_hba ret=%d\n", ret);
+ 	up(&hba->host_sem);
+ 	if (ret)
+ 		goto out;
+ 
+ 	/* Probe and add UFS logical units  */
++	pr_emerg("DSHUFS-SCAN: calling add_lus\n");
+ 	ret = ufshcd_add_lus(hba);
++	pr_emerg("DSHUFS-SCAN: add_lus ret=%d\n", ret);
+ out:
++	pr_emerg("DSHUFS-SCAN: async_scan done ret=%d\n", ret);
+ 	/*
+ 	 * If we failed to initialize the device or the device is not
+ 	 * present, turn off the power/clocks etc.
+@@ -9085,8 +9104,10 @@ static int ufshcd_setup_clocks(struct ufs_hba *hba, bool on)
+ out:
+ 	if (ret) {
+ 		list_for_each_entry(clki, head, list) {
+-			if (!IS_ERR_OR_NULL(clki->clk) && clki->enabled)
++			if (!IS_ERR_OR_NULL(clki->clk) && clki->enabled) {
+ 				clk_disable_unprepare(clki->clk);
++				clki->enabled = false;
++			}
+ 		}
+ 	} else if (!ret && on) {
+ 		spin_lock_irqsave(hba->host->host_lock, flags);
+@@ -10244,6 +10265,7 @@ static const struct blk_mq_ops ufshcd_tmf_ops = {
+  */
+ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
+ {
++	pr_emerg("DSHUFS-CORE: ufshcd_init enter irq=%u\n", irq);
+ 	int err;
+ 	struct Scsi_Host *host = hba->host;
+ 	struct device *dev = hba->dev;
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+index 3396e0388..fbad755e5 100644
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -8,6 +8,8 @@
+  *
+  */
+ 
++#include <linux/arm-smccc.h>
++#include <linux/dsh_diag.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/module.h>
+@@ -42,7 +44,9 @@
+ #define UFS_SW_RST_MASK		(UFS_UNIPRO_SW_RST | UFS_LINK_SW_RST)
+ #define HCI_DATA_REORDER	0x60
+ #define HCI_UNIPRO_APB_CLK_CTRL	0x68
+-#define UNIPRO_APB_CLK(v, x)	(((v) & ~0xF) | ((x) & 0xF))
++#define UNIPRO_APB_CLK_MASK	0xF
++#define UNIPRO_APB_CLK(v, x)	\
++	(((v) & ~UNIPRO_APB_CLK_MASK) | ((x) & UNIPRO_APB_CLK_MASK))
+ #define HCI_AXIDMA_RWDATA_BURST_LEN	0x6C
+ #define HCI_GPIO_OUT		0x70
+ #define HCI_ERR_EN_PA_LAYER	0x78
+@@ -150,6 +154,12 @@ enum {
+ #define UFSPSLUN0	0x208
+ #define UFSPSCTRL0	0x20C
+ 
++/* Exynos7420 firmware interface, matching the vendor FMP/SMU calls. */
++#define EXYNOS7420_SMC_FMP	0xC2001810
++#define EXYNOS7420_SMC_SMU	0xC2001820
++#define EXYNOS7420_FMP_SECURITY	0x8
++#define EXYNOS7420_UFS_FMP	0x15572000
++
+ #define CNTR_DIV_VAL 40
+ 
+ static void exynos_ufs_auto_ctrl_hcc(struct exynos_ufs *ufs, bool en);
+@@ -415,13 +425,16 @@ static int exynos_ufs_get_clk_info(struct exynos_ufs *ufs)
+ 	struct ufs_hba *hba = ufs->hba;
+ 	struct list_head *head = &hba->clk_list_head;
+ 	struct ufs_clk_info *clki;
+-	unsigned long pclk_rate;
++	unsigned long pclk_rate, core_clk_rate;
+ 	u32 f_min, f_max;
+ 	u8 div = 0;
+ 	int ret = 0;
+ 
+-	if (list_empty(head))
++	if (list_empty(head)) {
++		dev_err(hba->dev, "no clock info\n");
++		ret = -EINVAL;
+ 		goto out;
++	}
+ 
+ 	list_for_each_entry(clki, head, list) {
+ 		if (!IS_ERR(clki->clk)) {
+@@ -439,18 +452,22 @@ static int exynos_ufs_get_clk_info(struct exynos_ufs *ufs)
+ 	}
+ 
+ 	ufs->mclk_rate = clk_get_rate(ufs->clk_unipro_main);
+-	pclk_rate = clk_get_rate(ufs->clk_hci_core);
++	core_clk_rate = clk_get_rate(ufs->clk_hci_core);
++	if (!ufs->mclk_rate || !core_clk_rate) {
++		dev_err(hba->dev, "invalid clock rates: mclk %lu, core %lu\n",
++			ufs->mclk_rate, core_clk_rate);
++		ret = -EINVAL;
++		goto out;
++	}
++	pclk_rate = core_clk_rate;
+ 	f_min = ufs->pclk_avail_min;
+ 	f_max = ufs->pclk_avail_max;
+ 
+ 	if (ufs->opts & EXYNOS_UFS_OPT_HAS_APB_CLK_CTRL) {
+-		do {
+-			pclk_rate /= (div + 1);
+-
+-			if (pclk_rate <= f_max)
+-				break;
++		while (pclk_rate > f_max && div < UNIPRO_APB_CLK_MASK) {
+ 			div++;
+-		} while (pclk_rate >= f_min);
++			pclk_rate = core_clk_rate / (div + 1);
++		}
+ 	}
+ 
+ 	if (unlikely(pclk_rate < f_min || pclk_rate > f_max)) {
+@@ -708,14 +725,41 @@ static void exynos_ufs_establish_connt(struct exynos_ufs *ufs)
+ 	ufshcd_dme_set(hba, UIC_ARG_MIB(T_CONNECTIONSTATE), CPORT_CONNECTED);
+ }
+ 
+-static void exynos_ufs_config_smu(struct exynos_ufs *ufs)
++static int exynos_ufs_config_smu(struct exynos_ufs *ufs)
+ {
+ 	u32 reg, val;
+ 
++	dsh_diag_note(0x80, "ufs:smu:hci");
++
++	/*
++	 * Exynos7420 firmware owns UFSP. Use the vendor firmware interface
++	 * with encryption disabled instead of accessing UFSP registers.
++	 */
++	if (of_device_is_compatible(ufs->hba->dev->of_node, "samsung,exynos7420-ufs")) {
++		struct arm_smccc_res res;
++
++		pr_emerg("DSHUFS: config_smu: 7420 -> SMC FMP\n");
++		arm_smccc_smc(EXYNOS7420_SMC_FMP, EXYNOS7420_FMP_SECURITY,
++			      EXYNOS7420_UFS_FMP, 0,
++			      0, 0, 0, 0, &res);
++		pr_emerg("DSHUFS: config_smu: FMP ret=%ld\n", (long)res.a0);
++		if (res.a0)
++			return -EIO;
++
++		pr_emerg("DSHUFS: config_smu: 7420 -> SMC SMU\n");
++		arm_smccc_smc(EXYNOS7420_SMC_SMU, 0, 0, 0,
++			      0, 0, 0, 0, &res);
++		pr_emerg("DSHUFS: config_smu: SMU ret=%ld\n", (long)res.a0);
++
++		return res.a0 ? -EIO : 0;
++	}
++
+ 	exynos_ufs_disable_auto_ctrl_hcc_save(ufs, &val);
+ 
+ 	/* make encryption disabled by default */
++	pr_emerg("DSHUFS: config_smu: reading UFSPRSECURITY\n");
+ 	reg = ufsp_readl(ufs, UFSPRSECURITY);
++	pr_emerg("DSHUFS: config_smu: UFSPRSECURITY=0x%x\n", reg);
+ 	ufsp_writel(ufs, reg | NSSMU, UFSPRSECURITY);
+ 	ufsp_writel(ufs, 0x0, UFSPSBEGIN0);
+ 	ufsp_writel(ufs, 0xffffffff, UFSPSEND0);
+@@ -723,6 +767,8 @@ static void exynos_ufs_config_smu(struct exynos_ufs *ufs)
+ 	ufsp_writel(ufs, 0xf1, UFSPSCTRL0);
+ 
+ 	exynos_ufs_auto_ctrl_hcc_restore(ufs, &val);
++
++	return 0;
+ }
+ 
+ static void exynos_ufs_config_sync_pattern_mask(struct exynos_ufs *ufs,
+@@ -953,19 +999,37 @@ static void exynos_ufs_config_intr(struct exynos_ufs *ufs, u32 errs, u8 index)
+ 	}
+ }
+ 
++static bool exynos_ufs_core_clk_enabled(struct ufs_hba *hba)
++{
++	struct ufs_clk_info *clki;
++
++	list_for_each_entry(clki, &hba->clk_list_head, list) {
++		if (!strcmp(clki->name, "core_clk"))
++			return clki->enabled;
++	}
++
++	return false;
++}
++
+ static int exynos_ufs_setup_clocks(struct ufs_hba *hba, bool on,
+ 				   enum ufs_notify_change_status status)
+ {
+ 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+ 
+-	if (!ufs)
++	/* Error cleanup can request clocks off after runtime suspend did so. */
++	if (!ufs || !exynos_ufs_core_clk_enabled(hba))
+ 		return 0;
+ 
+-	if (on && status == PRE_CHANGE) {
++	/* HCI registers are accessible only while the external clock is on. */
++	if (on && status == POST_CHANGE) {
+ 		if (ufs->opts & EXYNOS_UFS_OPT_BROKEN_AUTO_CLK_CTRL)
+ 			exynos_ufs_disable_auto_ctrl_hcc(ufs);
+ 		exynos_ufs_ungate_clks(ufs);
+-	} else if (!on && status == POST_CHANGE) {
++	} else if (!on && status == PRE_CHANGE) {
++		/*
++		 * Stop the internal clocks before the core disables the external
++		 * clock. POST_CHANGE would access an unclocked HCI register bank.
++		 */
+ 		exynos_ufs_gate_clks(ufs);
+ 		if (ufs->opts & EXYNOS_UFS_OPT_BROKEN_AUTO_CLK_CTRL)
+ 			exynos_ufs_enable_auto_ctrl_hcc(ufs);
+@@ -977,6 +1041,7 @@ static int exynos_ufs_setup_clocks(struct ufs_hba *hba, bool on,
+ static int exynos_ufs_pre_link(struct ufs_hba *hba)
+ {
+ 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
++	int ret;
+ 
+ 	/* hci */
+ 	exynos_ufs_config_intr(ufs, DFES_DEF_L2_ERRS, UNIPRO_L2);
+@@ -988,16 +1053,18 @@ static int exynos_ufs_pre_link(struct ufs_hba *hba)
+ 	exynos_ufs_config_unipro(ufs);
+ 
+ 	/* m-phy */
+-	exynos_ufs_phy_init(ufs);
++	ret = exynos_ufs_phy_init(ufs);
++	if (ret)
++		return ret;
+ 	if (!(ufs->opts & EXYNOS_UFS_OPT_SKIP_CONFIG_PHY_ATTR)) {
+ 		exynos_ufs_config_phy_time_attr(ufs);
+ 		exynos_ufs_config_phy_cap_attr(ufs);
+ 	}
+ 
+-	exynos_ufs_setup_clocks(hba, true, PRE_CHANGE);
++	exynos_ufs_setup_clocks(hba, true, POST_CHANGE);
+ 
+ 	if (ufs->drv_data->pre_link)
+-		ufs->drv_data->pre_link(ufs);
++		return ufs->drv_data->pre_link(ufs);
+ 
+ 	return 0;
+ }
+@@ -1130,6 +1197,8 @@ static inline void exynos_ufs_priv_init(struct ufs_hba *hba,
+ 
+ static int exynos_ufs_init(struct ufs_hba *hba)
+ {
++	dsh_diag_note(0x60, "ufs:init:enter");
++	pr_emerg("DSHUFS: init enter\n");
+ 	struct device *dev = hba->dev;
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct exynos_ufs *ufs;
+@@ -1153,6 +1222,8 @@ static int exynos_ufs_init(struct ufs_hba *hba)
+ 		return PTR_ERR(ufs->reg_unipro);
+ 	}
+ 
++	pr_emerg("DSHUFS: ioremap done\n");
++
+ 	/* ufs protector */
+ 	ufs->reg_ufsp = devm_platform_ioremap_resource_byname(pdev, "ufsp");
+ 	if (IS_ERR(ufs->reg_ufsp)) {
+@@ -1160,12 +1231,14 @@ static int exynos_ufs_init(struct ufs_hba *hba)
+ 		return PTR_ERR(ufs->reg_ufsp);
+ 	}
+ 
++	pr_emerg("DSHUFS: before parse_dt\n");
+ 	ret = exynos_ufs_parse_dt(dev, ufs);
+ 	if (ret) {
+ 		dev_err(dev, "failed to get dt info.\n");
+ 		goto out;
+ 	}
+ 
++	pr_emerg("DSHUFS: parse_dt ok, getting phy\n");
+ 	ufs->phy = devm_phy_get(dev, "ufs-phy");
+ 	if (IS_ERR(ufs->phy)) {
+ 		ret = PTR_ERR(ufs->phy);
+@@ -1173,6 +1246,7 @@ static int exynos_ufs_init(struct ufs_hba *hba)
+ 		goto out;
+ 	}
+ 
++	pr_emerg("DSHUFS: phy got, priv_init\n");
+ 	exynos_ufs_priv_init(hba, ufs);
+ 
+ 	if (ufs->drv_data->drv_init) {
+@@ -1183,11 +1257,18 @@ static int exynos_ufs_init(struct ufs_hba *hba)
+ 		}
+ 	}
+ 
++	pr_emerg("DSHUFS: before get_clk_info\n");
+ 	ret = exynos_ufs_get_clk_info(ufs);
++	pr_emerg("DSHUFS: get_clk_info ret=%d\n", ret);
+ 	if (ret)
+ 		goto out;
++	pr_emerg("DSHUFS: specify_phy_time_attr\n");
+ 	exynos_ufs_specify_phy_time_attr(ufs);
+-	exynos_ufs_config_smu(ufs);
++	pr_emerg("DSHUFS: >>> before config_smu\n");
++	ret = exynos_ufs_config_smu(ufs);
++	if (ret)
++		goto out;
++	pr_emerg("DSHUFS: <<< after config_smu OK\n");
+ 	return 0;
+ 
+ out:
+@@ -1293,8 +1374,11 @@ static void exynos_ufs_post_hibern8(struct ufs_hba *hba, u8 enter)
+ }
+ 
+ static int exynos_ufs_hce_enable_notify(struct ufs_hba *hba,
++
+ 					enum ufs_notify_change_status status)
+ {
++	pr_emerg("DSHUFS: hce_enable_notify status=%d\n", status);
++
+ 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+ 	int ret = 0;
+ 
+@@ -1401,13 +1485,15 @@ static int exynos_ufs_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op,
+ static int exynos_ufs_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
+ {
+ 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
++	int ret;
+ 
+-	if (!ufshcd_is_link_active(hba))
+-		phy_power_on(ufs->phy);
+-
+-	exynos_ufs_config_smu(ufs);
++	if (!ufshcd_is_link_active(hba)) {
++		ret = phy_power_on(ufs->phy);
++		if (ret)
++			return ret;
++	}
+ 
+-	return 0;
++	return exynos_ufs_config_smu(ufs);
+ }
+ 
+ static int exynosauto_ufs_vh_link_startup_notify(struct ufs_hba *hba,
+@@ -1589,6 +1675,7 @@ static struct ufs_hba_variant_ops ufs_hba_exynosauto_vh_ops = {
+ 
+ static int exynos_ufs_probe(struct platform_device *pdev)
+ {
++	dsh_diag_note(0x50, "ufs:probe:enter");
+ 	int err;
+ 	struct device *dev = &pdev->dev;
+ 	const struct ufs_hba_variant_ops *vops = &ufs_hba_exynos_ops;
+@@ -1763,7 +1850,19 @@ static struct platform_driver exynos_ufs_pltform = {
+ 		.of_match_table = exynos_ufs_of_match,
+ 	},
+ };
+-module_platform_driver(exynos_ufs_pltform);
++/*
++ * DSH: 改成 late_initcall，让 UFS 在 framebuffer(simplefb) 起来之后才 probe。
++ *
++ * 原因：console=tty0 在 simplefb 出现之前没有任何显示后端，早期输出全部丢失。
++ * 而 UFS probe 挂死时我们唯一的信息来源就是屏幕，所以必须把 UFS 挪到
++ * 显示后端就绪之后再 probe，这样 pr_emerg 的每一行都能看到。
++ * 正式提交前应改回 module_platform_driver。
++ */
++static int __init exynos_ufs_late_init(void)
++{
++	return platform_driver_register(&exynos_ufs_pltform);
++}
++late_initcall(exynos_ufs_late_init);
+ 
+ MODULE_AUTHOR("Alim Akhtar <alim.akhtar@samsung.com>");
+ MODULE_AUTHOR("Seungwon Jeon  <essuuj@gmail.com>");
+diff --git a/drivers/ufs/host/ufshcd-pltfrm.c b/drivers/ufs/host/ufshcd-pltfrm.c
+index 797a4dfe4..887d5e751 100644
+--- a/drivers/ufs/host/ufshcd-pltfrm.c
++++ b/drivers/ufs/host/ufshcd-pltfrm.c
+@@ -338,19 +338,25 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
+ 	int irq, err;
+ 	struct device *dev = &pdev->dev;
+ 
++	pr_emerg("DSHUFS-PLT: probe enter\n");
++
+ 	mmio_base = devm_platform_ioremap_resource(pdev, 0);
++	pr_emerg("DSHUFS-PLT: ioremap %s\n", IS_ERR(mmio_base) ? "FAILED" : "ok");
+ 	if (IS_ERR(mmio_base)) {
+ 		err = PTR_ERR(mmio_base);
+ 		goto out;
+ 	}
+ 
+ 	irq = platform_get_irq(pdev, 0);
++	pr_emerg("DSHUFS-PLT: irq=%d\n", irq);
+ 	if (irq < 0) {
+ 		err = irq;
+ 		goto out;
+ 	}
+ 
++	pr_emerg("DSHUFS-PLT: alloc_host ...\n");
+ 	err = ufshcd_alloc_host(dev, &hba);
++	pr_emerg("DSHUFS-PLT: alloc_host ret=%d\n", err);
+ 	if (err) {
+ 		dev_err(dev, "Allocation failed\n");
+ 		goto out;
+@@ -358,7 +364,9 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
+ 
+ 	hba->vops = vops;
+ 
++	pr_emerg("DSHUFS-PLT: parse_clock_info ...\n");
+ 	err = ufshcd_parse_clock_info(hba);
++	pr_emerg("DSHUFS-PLT: parse_clock_info ret=%d\n", err);
+ 	if (err) {
+ 		dev_err(dev, "%s: clock parse failed %d\n",
+ 				__func__, err);
+@@ -373,7 +381,9 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
+ 
+ 	ufshcd_init_lanes_per_dir(hba);
+ 
++	pr_emerg("DSHUFS-PLT: >>> calling ufshcd_init\n");
+ 	err = ufshcd_init(hba, mmio_base, irq);
++	pr_emerg("DSHUFS-PLT: <<< ufshcd_init ret=%d\n", err);
+ 	if (err) {
+ 		dev_err_probe(dev, err, "Initialization failed with error %d\n",
+ 			      err);

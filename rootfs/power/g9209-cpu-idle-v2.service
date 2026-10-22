@@ -1,0 +1,15 @@
+[Unit]
+Description=G9209 CPU power policy v2 (cpuidle interlock + tiered hotplug)
+After=gdm.service
+Wants=gdm.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/g9209-cpu-idle-v2.sh
+Restart=always
+RestartSec=10
+# 退出时兜底恢复（脚本内 trap 之外的第二层保险）
+ExecStopPost=/bin/sh -c 'for c in /sys/devices/system/cpu/cpu[1-9]*/online; do [ "$(cat $c 2>/dev/null)" = "0" ] && echo 1 > $c; done; true'
+
+[Install]
+WantedBy=multi-user.target

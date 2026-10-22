@@ -1,0 +1,134 @@
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 4d8b315c4..7f3dfc049 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -31,6 +31,8 @@
+ #include <linux/swiotlb.h>
+ #include <linux/sysfs.h>
+ #include <linux/dma-map-ops.h> /* for dma_default_coherent */
++#include <linux/dsh_diag.h>
++#include <linux/major.h>
+ 
+ #include "base.h"
+ #include "physical_location.h"
+@@ -3476,6 +3478,16 @@ static int device_private_init(struct device *dev)
+ 	return 0;
+ }
+ 
++extern unsigned long dsh_diag_test_mode;
++
++static void dsh_trace_vt_device(const struct device *dev, unsigned int phase)
++{
++	if (READ_ONCE(dsh_diag_test_mode) == 1 &&
++	    MAJOR(dev->devt) == TTY_MAJOR &&
++	    MINOR(dev->devt) >= 1 && MINOR(dev->devt) <= 63)
++		dsh_mark(0x470000UL | (MINOR(dev->devt) << 8) | phase);
++}
++
+ /**
+  * device_add - add device to device hierarchy.
+  * @dev: device.
+@@ -3564,6 +3576,7 @@ int device_add(struct device *dev)
+ 		glue_dir = kobj;
+ 		goto Error;
+ 	}
++	dsh_trace_vt_device(dev, 1);
+ 
+ 	/* notify platform of device entry */
+ 	device_platform_notify(dev);
+@@ -3578,6 +3591,7 @@ int device_add(struct device *dev)
+ 	error = device_add_attrs(dev);
+ 	if (error)
+ 		goto AttrsError;
++	dsh_trace_vt_device(dev, 2);
+ 	error = bus_add_device(dev);
+ 	if (error)
+ 		goto BusError;
+@@ -3595,7 +3609,9 @@ int device_add(struct device *dev)
+ 		if (error)
+ 			goto SysEntryError;
+ 
++		dsh_trace_vt_device(dev, 3);
+ 		devtmpfs_create_node(dev);
++		dsh_trace_vt_device(dev, 4);
+ 	}
+ 
+ 	/* Notify clients of device addition.  This call must come
+@@ -3637,6 +3653,7 @@ int device_add(struct device *dev)
+ 
+ 	sp = class_to_subsys(dev->class);
+ 	if (sp) {
++		dsh_trace_vt_device(dev, 5);
+ 		mutex_lock(&sp->mutex);
+ 		/* tie the class to the device */
+ 		klist_add_tail(&dev->p->knode_class, &sp->klist_devices);
+@@ -3646,6 +3663,7 @@ int device_add(struct device *dev)
+ 			if (class_intf->add_dev)
+ 				class_intf->add_dev(dev);
+ 		mutex_unlock(&sp->mutex);
++		dsh_trace_vt_device(dev, 6);
+ 		subsys_put(sp);
+ 	}
+ done:
+diff --git a/drivers/base/devtmpfs.c b/drivers/base/devtmpfs.c
+index b848764ef..cdba2c857 100644
+--- a/drivers/base/devtmpfs.c
++++ b/drivers/base/devtmpfs.c
+@@ -28,6 +28,8 @@
+ #include <linux/slab.h>
+ #include <linux/kthread.h>
+ #include <linux/init_syscalls.h>
++#include <linux/dsh_diag.h>
++#include <linux/major.h>
+ #include <uapi/linux/mount.h>
+ #include "base.h"
+ 
+@@ -62,6 +64,15 @@ static int __init mount_param(char *str)
+ __setup("devtmpfs.mount=", mount_param);
+ 
+ static struct vfsmount *mnt;
++extern unsigned long dsh_diag_test_mode;
++
++static void dsh_trace_vt_request(const struct device *dev, unsigned int phase)
++{
++	if (READ_ONCE(dsh_diag_test_mode) == 1 &&
++	    MAJOR(dev->devt) == TTY_MAJOR &&
++	    MINOR(dev->devt) >= 1 && MINOR(dev->devt) <= 63)
++		dsh_mark(0x480000UL | (MINOR(dev->devt) << 8) | phase);
++}
+ 
+ static struct dentry *public_dev_mount(struct file_system_type *fs_type, int flags,
+ 		      const char *dev_name, void *data)
+@@ -96,6 +107,7 @@ static struct file_system_type dev_fs_type = {
+ 
+ static int devtmpfs_submit_req(struct req *req, const char *tmp)
+ {
++	dsh_trace_vt_request(req->dev, 1);
+ 	init_completion(&req->done);
+ 
+ 	spin_lock(&req_lock);
+@@ -104,7 +116,9 @@ static int devtmpfs_submit_req(struct req *req, const char *tmp)
+ 	spin_unlock(&req_lock);
+ 
+ 	wake_up_process(thread);
++	dsh_trace_vt_request(req->dev, 2);
+ 	wait_for_completion(&req->done);
++	dsh_trace_vt_request(req->dev, 3);
+ 
+ 	kfree(tmp);
+ 
+diff --git a/drivers/char/mem.c b/drivers/char/mem.c
+index 1052b0f2d..6e0fef278 100644
+--- a/drivers/char/mem.c
++++ b/drivers/char/mem.c
+@@ -755,6 +755,10 @@ static int __init chr_dev_init(void)
+ {
+ 	int retval;
+ 	int minor;
++	extern void dsh_mark(unsigned long);
++	extern void dsh_diag_tick_test(void);
++	dsh_mark(0x4401);
++	dsh_diag_tick_test();
+ 
+ 	if (register_chrdev(MEM_MAJOR, "mem", &memory_fops))
+ 		printk("unable to get major %d for memory devs\n", MEM_MAJOR);

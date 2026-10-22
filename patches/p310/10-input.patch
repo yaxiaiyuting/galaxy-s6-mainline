@@ -1,0 +1,427 @@
+diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
+index 1d0c5f4c0..cac4ab120 100644
+--- a/drivers/input/keyboard/Kconfig
++++ b/drivers/input/keyboard/Kconfig
+@@ -809,4 +809,15 @@ config KEYBOARD_CYPRESS_SF
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called cypress-sf.
+ 
++config KEYBOARD_CYPRESS_MBR_TOUCHKEY
++	tristate "Cypress CY8CMBR31x5 touchkey support"
++	depends on I2C
++	help
++	  Say Y here to enable support for the Cypress CY8CMBR31x5
++	  capacitive touch key controller, used for the BACK and RECENT
++	  keys on Samsung Galaxy S6 (zeroflte) and similar Exynos boards.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called cypress-mbr-touchkey.
++
+ endif
+diff --git a/drivers/input/keyboard/Makefile b/drivers/input/keyboard/Makefile
+index aecef00c5..2ca663bf5 100644
+--- a/drivers/input/keyboard/Makefile
++++ b/drivers/input/keyboard/Makefile
+@@ -18,6 +18,7 @@ obj-$(CONFIG_KEYBOARD_CAP11XX)		+= cap11xx.o
+ obj-$(CONFIG_KEYBOARD_CLPS711X)		+= clps711x-keypad.o
+ obj-$(CONFIG_KEYBOARD_CROS_EC)		+= cros_ec_keyb.o
+ obj-$(CONFIG_KEYBOARD_CYPRESS_SF)	+= cypress-sf.o
++obj-$(CONFIG_KEYBOARD_CYPRESS_MBR_TOUCHKEY)	+= cypress-mbr-touchkey.o
+ obj-$(CONFIG_KEYBOARD_DLINK_DIR685)	+= dlink-dir685-touchkeys.o
+ obj-$(CONFIG_KEYBOARD_EP93XX)		+= ep93xx_keypad.o
+ obj-$(CONFIG_KEYBOARD_GOLDFISH_EVENTS)	+= goldfish_events.o
+diff --git a/drivers/input/keyboard/cypress-mbr-touchkey.c b/drivers/input/keyboard/cypress-mbr-touchkey.c
+new file mode 100644
+index 000000000..9513d850d
+--- /dev/null
++++ b/drivers/input/keyboard/cypress-mbr-touchkey.c
+@@ -0,0 +1,254 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Cypress CY8CMBR31x5 (MBR) capacitive touch key controller
++ *
++ * The CY8CMBR31x5 is a CapSense "MBR" controller used on several Samsung
++ * Exynos boards (e.g. Galaxy S6 "zeroflte") to report the capacitive BACK
++ * and RECENT keys.  It is a separate I2C device from the touchscreen
++ * controller and keeps its firmware in internal flash, so the host only
++ * has to read the key status register.
++ *
++ * Register 0x03 contains one two-bit field per key:
++ *
++ *   0b00 - no event
++ *   0b01 - key pressed
++ *   0b10 - key released
++ *
++ * The controller asserts its (active low) interrupt line whenever a key
++ * changes state; the register is read from the threaded interrupt handler.
++ * The bit layout matches the Samsung 3.10 driver this was ported from
++ * (drivers/input/keyboard/cypress_20075/cypress-touchkey.c).
++ */
++
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/i2c.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/property.h>
++#include <linux/regulator/consumer.h>
++#include <linux/slab.h>
++
++#define MBR_TOUCHKEY_KEYCODE_REG	0x03
++#define MBR_TOUCHKEY_FW_VER_REG		0x04
++#define MBR_TOUCHKEY_KEY_MASK		GENMASK(1, 0)
++#define MBR_TOUCHKEY_KEY_PRESS		0x01
++#define MBR_TOUCHKEY_MAX_KEYS		4
++#define MBR_TOUCHKEY_DEV_NAME		"mbr-touchkey"
++
++struct mbr_touchkey_data {
++	struct i2c_client *client;
++	struct input_dev *input;
++	u32 keycodes[MBR_TOUCHKEY_MAX_KEYS];
++	bool pressed[MBR_TOUCHKEY_MAX_KEYS];
++	int num_keycodes;
++};
++
++static irqreturn_t mbr_touchkey_irq_handler(int irq, void *dev_id)
++{
++	struct mbr_touchkey_data *touchkey = dev_id;
++	int val;
++	int i;
++
++	val = i2c_smbus_read_byte_data(touchkey->client,
++				       MBR_TOUCHKEY_KEYCODE_REG);
++	if (val < 0) {
++		dev_err_ratelimited(&touchkey->client->dev,
++				    "failed to read key status: %d\n", val);
++		return IRQ_HANDLED;
++	}
++
++	for (i = 0; i < touchkey->num_keycodes; i++) {
++		unsigned int state = (val >> (2 * i)) & MBR_TOUCHKEY_KEY_MASK;
++		bool press = state & MBR_TOUCHKEY_KEY_PRESS;
++
++		/*
++		 * 0b00 means "no event" and must not be reported as a
++		 * release: the controller only writes 0b10 on release.
++		 * 0b01 (and the unexpected 0b11) mean the key is down.
++		 */
++		if (!state)
++			continue;
++
++		if (press) {
++			if (touchkey->pressed[i])
++				continue;
++			touchkey->pressed[i] = true;
++			input_report_key(touchkey->input,
++					 touchkey->keycodes[i], 1);
++		} else {
++			touchkey->pressed[i] = false;
++			input_report_key(touchkey->input,
++					 touchkey->keycodes[i], 0);
++		}
++	}
++
++	input_sync(touchkey->input);
++
++	return IRQ_HANDLED;
++}
++
++static int mbr_touchkey_probe(struct i2c_client *client)
++{
++	struct mbr_touchkey_data *touchkey;
++	struct input_dev *input;
++	int val;
++	int error;
++	int i;
++
++	if (!i2c_check_functionality(client->adapter,
++				     I2C_FUNC_SMBUS_BYTE_DATA))
++		return dev_err_probe(&client->dev, -EOPNOTSUPP,
++				     "I2C adapter lacks SMBus byte data support\n");
++
++	if (client->irq <= 0)
++		return dev_err_probe(&client->dev, -ENODEV,
++				     "missing interrupt\n");
++
++	/*
++	 * The CY8CMBR31x5 core rail (vtouch_3.3v = S2MPS15 LDO21 on
++	 * zeroflte) is not enabled by the bootloader: reading PMIC
++	 * register 0x48 after boot shows bit[7:6] = 00 (off) and the
++	 * controller then NAKs its address.  Enable it explicitly here
++	 * so probe ordering is handled by the regulator core's deferred
++	 * probe rather than by initcall order.
++	 *
++	 * devm_regulator_get_enable() also disables the rail again when
++	 * the device goes away; a missing supply is not fatal (dummy
++	 * regulator), which keeps the driver usable on boards where the
++	 * rail is always on.
++	 */
++	error = devm_regulator_get_enable(&client->dev, "vdd");
++	if (error)
++		return dev_err_probe(&client->dev, error,
++				     "failed to enable VDD supply\n");
++
++	/* Datasheet/vendor ic-stabilizing-time: let the IC boot. */
++	msleep(150);
++
++	touchkey = devm_kzalloc(&client->dev, sizeof(*touchkey), GFP_KERNEL);
++	if (!touchkey)
++		return -ENOMEM;
++
++	touchkey->client = client;
++
++	touchkey->num_keycodes =
++		device_property_read_u32_array(&client->dev, "linux,keycodes",
++					       touchkey->keycodes,
++					       MBR_TOUCHKEY_MAX_KEYS);
++	if (touchkey->num_keycodes <= 0) {
++		touchkey->keycodes[0] = KEY_MENU;
++		touchkey->keycodes[1] = KEY_BACK;
++		touchkey->num_keycodes = 2;
++	}
++
++	/* Sanity check: the controller must answer before we register input. */
++	val = i2c_smbus_read_byte_data(client, MBR_TOUCHKEY_KEYCODE_REG);
++	if (val < 0)
++		return dev_err_probe(&client->dev, val,
++				     "touchkey controller does not respond\n");
++
++	val = i2c_smbus_read_byte_data(client, MBR_TOUCHKEY_FW_VER_REG);
++	if (val >= 0)
++		dev_info(&client->dev, "Cypress MBR touchkey, firmware 0x%02x\n",
++			 val);
++	else
++		dev_warn(&client->dev, "cannot read firmware version: %d\n",
++			 val);
++
++	input = devm_input_allocate_device(&client->dev);
++	if (!input)
++		return -ENOMEM;
++
++	input->name = MBR_TOUCHKEY_DEV_NAME;
++	input->id.bustype = BUS_I2C;
++	input->dev.parent = &client->dev;
++
++	for (i = 0; i < touchkey->num_keycodes; i++)
++		input_set_capability(input, EV_KEY, touchkey->keycodes[i]);
++
++	touchkey->input = input;
++	i2c_set_clientdata(client, touchkey);
++
++	/*
++	 * Register the input device before hooking up the interrupt: the
++	 * ATTN line may already be asserted when we request the IRQ, and
++	 * the threaded handler must not report keys on an unregistered
++	 * input device.
++	 */
++	error = input_register_device(input);
++	if (error)
++		return dev_err_probe(&client->dev, error,
++				     "failed to register input device\n");
++
++	error = devm_request_threaded_irq(&client->dev, client->irq, NULL,
++					  mbr_touchkey_irq_handler,
++					  IRQF_ONESHOT,
++					  MBR_TOUCHKEY_DEV_NAME, touchkey);
++	if (error)
++		return dev_err_probe(&client->dev, error,
++				     "failed to request IRQ %d\n", client->irq);
++
++	return 0;
++}
++
++static int mbr_touchkey_suspend(struct device *dev)
++{
++	struct mbr_touchkey_data *touchkey = dev_get_drvdata(dev);
++	int i;
++
++	disable_irq(touchkey->client->irq);
++
++	for (i = 0; i < touchkey->num_keycodes; i++) {
++		if (touchkey->pressed[i]) {
++			touchkey->pressed[i] = false;
++			input_report_key(touchkey->input,
++					 touchkey->keycodes[i], 0);
++		}
++	}
++	input_sync(touchkey->input);
++
++	return 0;
++}
++
++static int mbr_touchkey_resume(struct device *dev)
++{
++	struct mbr_touchkey_data *touchkey = dev_get_drvdata(dev);
++
++	enable_irq(touchkey->client->irq);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(mbr_touchkey_pm_ops, mbr_touchkey_suspend,
++				mbr_touchkey_resume);
++
++static const struct of_device_id mbr_touchkey_of_match[] = {
++	{ .compatible = "cypress,mbr31x5-touchkey" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mbr_touchkey_of_match);
++
++static const struct i2c_device_id mbr_touchkey_id_table[] = {
++	{ MBR_TOUCHKEY_DEV_NAME, 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, mbr_touchkey_id_table);
++
++static struct i2c_driver mbr_touchkey_driver = {
++	.driver = {
++		.name = MBR_TOUCHKEY_DEV_NAME,
++		.of_match_table = mbr_touchkey_of_match,
++		.pm = pm_sleep_ptr(&mbr_touchkey_pm_ops),
++	},
++	.probe = mbr_touchkey_probe,
++	.id_table = mbr_touchkey_id_table,
++};
++module_i2c_driver(mbr_touchkey_driver);
++
++MODULE_AUTHOR("DSH");
++MODULE_DESCRIPTION("Cypress CY8CMBR31x5 touch key controller driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/input/touchscreen/stmfts.c b/drivers/input/touchscreen/stmfts.c
+index 56e371fd8..bb88f3d38 100644
+--- a/drivers/input/touchscreen/stmfts.c
++++ b/drivers/input/touchscreen/stmfts.c
+@@ -4,6 +4,7 @@
+ // Copyright (c) 2017 Samsung Electronics Co., Ltd.
+ // Copyright (c) 2017 Andi Shyti <andi@etezian.org>
+ 
++#include <linux/dsh_diag.h>
+ #include <linux/delay.h>
+ #include <linux/i2c.h>
+ #include <linux/input/mt.h>
+@@ -104,6 +105,7 @@ struct stmfts_data {
+ 	bool led_status;
+ 	bool hover_enabled;
+ 	bool running;
++	bool powered;
+ };
+ 
+ static int stmfts_brightness_set(struct led_classdev *led_cdev,
+@@ -454,8 +456,10 @@ static ssize_t stmfts_sysfs_read_status(struct device *dev,
+ 
+ 	err = i2c_smbus_read_i2c_block_data(sdata->client, STMFTS_READ_STATUS,
+ 					    sizeof(status), status);
+-	if (err)
++	if (err < 0)
+ 		return err;
++	if (err != sizeof(status))
++		return -EIO;
+ 
+ 	return sprintf(buf, "%#02x\n", status[0]);
+ }
+@@ -541,9 +545,11 @@ static int stmfts_power_on(struct stmfts_data *sdata)
+ 	err = i2c_smbus_read_i2c_block_data(sdata->client, STMFTS_READ_INFO,
+ 					    sizeof(reg), reg);
+ 	if (err < 0)
+-		return err;
+-	if (err != sizeof(reg))
+-		return -EIO;
++		goto err_disable_regulators;
++	if (err != sizeof(reg)) {
++		err = -EIO;
++		goto err_disable_regulators;
++	}
+ 
+ 	sdata->chip_id = be16_to_cpup((__be16 *)&reg[6]);
+ 	sdata->chip_ver = reg[0];
+@@ -557,11 +563,11 @@ static int stmfts_power_on(struct stmfts_data *sdata)
+ 
+ 	err = stmfts_command(sdata, STMFTS_SYSTEM_RESET);
+ 	if (err)
+-		return err;
++		goto err_disable_irq;
+ 
+ 	err = stmfts_command(sdata, STMFTS_SLEEP_OUT);
+ 	if (err)
+-		return err;
++		goto err_disable_irq;
+ 
+ 	/* optional tuning */
+ 	err = stmfts_command(sdata, STMFTS_MS_CX_TUNING);
+@@ -577,7 +583,7 @@ static int stmfts_power_on(struct stmfts_data *sdata)
+ 
+ 	err = stmfts_command(sdata, STMFTS_FULL_FORCE_CALIBRATION);
+ 	if (err)
+-		return err;
++		goto err_disable_irq;
+ 
+ 	/*
+ 	 * At this point no one is using the touchscreen
+@@ -585,16 +591,29 @@ static int stmfts_power_on(struct stmfts_data *sdata)
+ 	 */
+ 	(void) i2c_smbus_write_byte(sdata->client, STMFTS_SLEEP_IN);
+ 
++	sdata->powered = true;
+ 	return 0;
++
++err_disable_irq:
++	disable_irq(sdata->client->irq);
++err_disable_regulators:
++	regulator_bulk_disable(ARRAY_SIZE(sdata->regulators),
++			       sdata->regulators);
++	return err;
+ }
+ 
+ static void stmfts_power_off(void *data)
+ {
+ 	struct stmfts_data *sdata = data;
+ 
++	/* A failed resume has already rolled back its power-on sequence. */
++	if (!sdata->powered)
++		return;
++
+ 	disable_irq(sdata->client->irq);
+ 	regulator_bulk_disable(ARRAY_SIZE(sdata->regulators),
+ 						sdata->regulators);
++	sdata->powered = false;
+ }
+ 
+ /* This function is void because I don't want to prevent using the touch key
+@@ -629,6 +648,8 @@ static int stmfts_probe(struct i2c_client *client)
+ 	int err;
+ 	struct stmfts_data *sdata;
+ 
++	dsh_diag_note(0x80, "stmfts:enter");   /* DSH 探针 */
++
+ 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C |
+ 						I2C_FUNC_SMBUS_BYTE_DATA |
+ 						I2C_FUNC_SMBUS_I2C_BLOCK))
+@@ -651,6 +672,7 @@ static int stmfts_probe(struct i2c_client *client)
+ 				      sdata->regulators);
+ 	if (err)
+ 		return err;
++	dsh_diag_note(0x81, "stmfts:regulators_ok");
+ 
+ 	sdata->input = devm_input_allocate_device(&client->dev);
+ 	if (!sdata->input)
+@@ -692,6 +714,7 @@ static int stmfts_probe(struct i2c_client *client)
+ 	 * interrupts. To be on the safe side it's better to not enable
+ 	 * the interrupts during their request.
+ 	 */
++	dsh_diag_note(0x82, "stmfts:request_irq");
+ 	err = devm_request_threaded_irq(&client->dev, client->irq,
+ 					NULL, stmfts_irq_handler,
+ 					IRQF_ONESHOT | IRQF_NO_AUTOEN,
+@@ -701,7 +724,9 @@ static int stmfts_probe(struct i2c_client *client)
+ 
+ 	dev_dbg(&client->dev, "initializing ST-Microelectronics FTS...\n");
+ 
++	dsh_diag_note(0x83, "stmfts:power_on_begin");
+ 	err = stmfts_power_on(sdata);
++	dsh_diag_note(err ? 0x84 : 0x85, err ? "stmfts:power_on_fail" : "stmfts:power_on_ok");
+ 	if (err)
+ 		return err;
+ 

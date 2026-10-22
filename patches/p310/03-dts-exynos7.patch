@@ -1,0 +1,511 @@
+diff --git a/arch/arm64/boot/dts/exynos/exynos7.dtsi b/arch/arm64/boot/dts/exynos/exynos7.dtsi
+index 54ed5167d..63f7a5be3 100644
+--- a/arch/arm64/boot/dts/exynos/exynos7.dtsi
++++ b/arch/arm64/boot/dts/exynos/exynos7.dtsi
+@@ -25,18 +25,15 @@ aliases {
+ 		pinctrl6 = &pinctrl_fsys0;
+ 		pinctrl7 = &pinctrl_fsys1;
+ 		pinctrl8 = &pinctrl_bus1;
++		pinctrl9 = &pinctrl_aud;
++		spi0 = &spi_0;
+ 		tmuctrl0 = &tmuctrl_0;
+ 	};
+ 
+-	arm-pmu {
+-		compatible = "arm,cortex-a57-pmu";
+-		interrupts = <GIC_SPI 56 IRQ_TYPE_LEVEL_HIGH>,
+-			     <GIC_SPI 57 IRQ_TYPE_LEVEL_HIGH>,
+-			     <GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>,
+-			     <GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>;
+-		interrupt-affinity = <&cpu_atlas0>, <&cpu_atlas1>,
+-				     <&cpu_atlas2>, <&cpu_atlas3>;
+-	};
++	/*
++	 * Only the Cortex-A53 cluster is described for now; the A57 PMU
++	 * interrupts do not apply, so leave the PMU out.
++	 */
+ 
+ 	fin_pll: clock {
+ 		/* XXTI */
+@@ -49,18 +46,44 @@ cpus {
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+ 
++		/*
++		 * DSH 2026-10-22: 显式声明 CPU 拓扑。
++		 * 没有 cpu-map 时，多 cluster 的 sched_domain 构建不完整，
++		 * 负载均衡只看 MC 域、不知道两簇之间的层级关系。
++		 */
++		cpu-map {
++			cluster0 {
++				core0 { cpu = <&cpu_atlas0>; };
++				core1 { cpu = <&cpu_atlas1>; };
++				core2 { cpu = <&cpu_atlas2>; };
++				core3 { cpu = <&cpu_atlas3>; };
++			};
++			cluster1 {
++				core0 { cpu = <&cpu_apollo0>; };
++				core1 { cpu = <&cpu_apollo1>; };
++				core2 { cpu = <&cpu_apollo2>; };
++				core3 { cpu = <&cpu_apollo3>; };
++			};
++		};
++
++
++		/*
++		 * Cortex-A57 (atlas) cluster.  Power-up is handled by
++		 * exynos7420_pmu_cpu_power_up() in psci.c.
++		 */
+ 		cpu_atlas0: cpu@0 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x0>;
+ 			enable-method = "psci";
+-			i-cache-size = <0xc000>;
+-			i-cache-line-size = <64>;
+-			i-cache-sets = <256>;
+-			d-cache-size = <0x8000>;
+-			d-cache-line-size = <64>;
+-			d-cache-sets = <256>;
+ 			next-level-cache = <&atlas_l2>;
++			/*
++			 * DSH 2026-10-22: Cortex-A57 的 DMIPS/MHz ≈ 4.5。
++			 * 归一化到 1024（大核基准）。
++			 * 不加这个属性时 arch_topology 会给所有 CPU 默认 1024，
++			 * 调度器无法区分大小核 → 重负载可能跑到 A53 上。
++			 */
++			capacity-dmips-mhz = <1024>;
+ 		};
+ 
+ 		cpu_atlas1: cpu@1 {
+@@ -68,13 +91,14 @@ cpu_atlas1: cpu@1 {
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x1>;
+ 			enable-method = "psci";
+-			i-cache-size = <0xc000>;
+-			i-cache-line-size = <64>;
+-			i-cache-sets = <256>;
+-			d-cache-size = <0x8000>;
+-			d-cache-line-size = <64>;
+-			d-cache-sets = <256>;
+ 			next-level-cache = <&atlas_l2>;
++			/*
++			 * DSH 2026-10-22: Cortex-A57 的 DMIPS/MHz ≈ 4.5。
++			 * 归一化到 1024（大核基准）。
++			 * 不加这个属性时 arch_topology 会给所有 CPU 默认 1024，
++			 * 调度器无法区分大小核 → 重负载可能跑到 A53 上。
++			 */
++			capacity-dmips-mhz = <1024>;
+ 		};
+ 
+ 		cpu_atlas2: cpu@2 {
+@@ -82,13 +106,14 @@ cpu_atlas2: cpu@2 {
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x2>;
+ 			enable-method = "psci";
+-			i-cache-size = <0xc000>;
+-			i-cache-line-size = <64>;
+-			i-cache-sets = <256>;
+-			d-cache-size = <0x8000>;
+-			d-cache-line-size = <64>;
+-			d-cache-sets = <256>;
+ 			next-level-cache = <&atlas_l2>;
++			/*
++			 * DSH 2026-10-22: Cortex-A57 的 DMIPS/MHz ≈ 4.5。
++			 * 归一化到 1024（大核基准）。
++			 * 不加这个属性时 arch_topology 会给所有 CPU 默认 1024，
++			 * 调度器无法区分大小核 → 重负载可能跑到 A53 上。
++			 */
++			capacity-dmips-mhz = <1024>;
+ 		};
+ 
+ 		cpu_atlas3: cpu@3 {
+@@ -96,13 +121,14 @@ cpu_atlas3: cpu@3 {
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x3>;
+ 			enable-method = "psci";
+-			i-cache-size = <0xc000>;
+-			i-cache-line-size = <64>;
+-			i-cache-sets = <256>;
+-			d-cache-size = <0x8000>;
+-			d-cache-line-size = <64>;
+-			d-cache-sets = <256>;
+ 			next-level-cache = <&atlas_l2>;
++			/*
++			 * DSH 2026-10-22: Cortex-A57 的 DMIPS/MHz ≈ 4.5。
++			 * 归一化到 1024（大核基准）。
++			 * 不加这个属性时 arch_topology 会给所有 CPU 默认 1024，
++			 * 调度器无法区分大小核 → 重负载可能跑到 A53 上。
++			 */
++			capacity-dmips-mhz = <1024>;
+ 		};
+ 
+ 		atlas_l2: l2-cache0 {
+@@ -113,6 +139,76 @@ atlas_l2: l2-cache0 {
+ 			cache-line-size = <64>;
+ 			cache-sets = <2048>;
+ 		};
++
++		cpu_apollo0: cpu@100 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a53";
++			reg = <0x100>;
++			enable-method = "psci";
++			next-level-cache = <&apollo_l2>;
++			/*
++			 * DSH 2026-10-22: Cortex-A53 的 DMIPS/MHz ≈ 2.3。
++			 * 归一化 = 1024 * 2.3/4.5 ≈ 523，取 512（2:1）。
++			 * 不加这个属性时 arch_topology 给所有 CPU 默认 1024，
++			 * 调度器无法区分大小核。
++			 */
++			capacity-dmips-mhz = <512>;
++		};
++
++		cpu_apollo1: cpu@101 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a53";
++			reg = <0x101>;
++			enable-method = "psci";
++			next-level-cache = <&apollo_l2>;
++			/*
++			 * DSH 2026-10-22: Cortex-A53 的 DMIPS/MHz ≈ 2.3。
++			 * 归一化 = 1024 * 2.3/4.5 ≈ 523，取 512（2:1）。
++			 * 不加这个属性时 arch_topology 给所有 CPU 默认 1024，
++			 * 调度器无法区分大小核。
++			 */
++			capacity-dmips-mhz = <512>;
++		};
++
++		cpu_apollo2: cpu@102 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a53";
++			reg = <0x102>;
++			enable-method = "psci";
++			next-level-cache = <&apollo_l2>;
++			/*
++			 * DSH 2026-10-22: Cortex-A53 的 DMIPS/MHz ≈ 2.3。
++			 * 归一化 = 1024 * 2.3/4.5 ≈ 523，取 512（2:1）。
++			 * 不加这个属性时 arch_topology 给所有 CPU 默认 1024，
++			 * 调度器无法区分大小核。
++			 */
++			capacity-dmips-mhz = <512>;
++		};
++
++		cpu_apollo3: cpu@103 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a53";
++			reg = <0x103>;
++			enable-method = "psci";
++			next-level-cache = <&apollo_l2>;
++			/*
++			 * DSH 2026-10-22: Cortex-A53 的 DMIPS/MHz ≈ 2.3。
++			 * 归一化 = 1024 * 2.3/4.5 ≈ 523，取 512（2:1）。
++			 * 不加这个属性时 arch_topology 给所有 CPU 默认 1024，
++			 * 调度器无法区分大小核。
++			 */
++			capacity-dmips-mhz = <512>;
++		};
++
++		/* DSH: A53 簇的 L2（Exynos 7420 每簇 2MB） */
++		apollo_l2: l2-cache1 {
++			compatible = "cache";
++			cache-level = <2>;
++			cache-unified;
++			cache-size = <0x200000>;
++			cache-line-size = <64>;
++			cache-sets = <2048>;
++		};
+ 	};
+ 
+ 	psci {
+@@ -133,6 +229,29 @@ chipid@10000000 {
+ 			reg = <0x10000000 0x100>;
+ 		};
+ 
++		timer@101c0000 {
++			compatible = "samsung,exynos4210-mct";
++			reg = <0x101c0000 0x800>;
++			interrupts = <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 113 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 114 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 115 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 116 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 117 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 118 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 119 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 120 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 121 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 122 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 123 IRQ_TYPE_LEVEL_HIGH>;
++			samsung,local-timers = <0 1 2 3 4 5 6 7>;
++			clocks = <&fin_pll>, <&clock_peris PCLK_MCT>;
++			clock-names = "fin_pll", "mct";
++			/* Boards must supply fin_pll and a live PERIS parent before
++			 * enabling this timer. CNTFRQ does not enable the counter. */
++			status = "disabled";
++		};
++
+ 		gic: interrupt-controller@11001000 {
+ 			compatible = "arm,gic-400";
+ 			#interrupt-cells = <3>;
+@@ -319,6 +438,16 @@ serial_3: serial@14c40000 {
+ 			status = "disabled";
+ 		};
+ 
++		serial_4: serial@11460000 {
++			compatible = "samsung,exynos4210-uart";
++			reg = <0x11460000 0x100>;
++			interrupts = <GIC_SPI 91 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_aud PCLK_UART>,
++				 <&cmu_aud SCLK_UART>;
++			clock-names = "uart", "clk_uart_baud0";
++			status = "disabled";
++		};
++
+ 		pinctrl_alive: pinctrl@10580000 {
+ 			compatible = "samsung,exynos7-pinctrl";
+ 			reg = <0x10580000 0x1000>;
+@@ -378,6 +507,12 @@ pinctrl_bus1: pinctrl@14870000 {
+ 			interrupts = <GIC_SPI 384 IRQ_TYPE_LEVEL_HIGH>;
+ 		};
+ 
++		pinctrl_aud: pinctrl@114b0000 {
++			compatible = "samsung,exynos7-pinctrl";
++			reg = <0x114b0000 0x1000>;
++			interrupts = <GIC_SPI 92 IRQ_TYPE_LEVEL_HIGH>;
++		};
++
+ 		hsi2c_0: i2c@13640000 {
+ 			compatible = "samsung,exynos7-hsi2c";
+ 			reg = <0x13640000 0x1000>;
+@@ -430,6 +565,22 @@ hsi2c_3: i2c@14e70000 {
+ 			status = "disabled";
+ 		};
+ 
++		spi_0: spi@14d20000 {
++			compatible = "samsung,exynos7-spi";
++			reg = <0x14d20000 0x100>;
++			interrupts = <GIC_SPI 464 IRQ_TYPE_LEVEL_HIGH>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			samsung,spi-src-clk = <0>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&spi0_bus>;
++			clocks = <&clock_peric1 PCLK_SPI0>,
++				 <&clock_peric1 SCLK_SPI0>;
++			clock-names = "spi", "spi_busclk0";
++			num-cs = <1>;
++			status = "disabled";
++		};
++
+ 		hsi2c_4: i2c@13660000 {
+ 			compatible = "samsung,exynos7-hsi2c";
+ 			reg = <0x13660000 0x1000>;
+@@ -539,6 +690,35 @@ pmu_system_controller: system-controller@105c0000 {
+ 			reg = <0x105c0000 0x5000>;
+ 		};
+ 
++		pd_g3d: power-domain@105c4100 {
++			/* DSH: 地址修正。
++			 * 主线原来写 0x105c4060，但按原厂 ctc_stock.dts:5771 那是 pd-cam1；
++			 * vendor 的 G3D 域是 pd-g3d@105c4100（pd-option=0x1101）。
++			 * 见 文档/05-专项/IOMMU修复-20261018.md 的 GPU 纠正一节。 */
++			/*
++			 * DSH GPU: 专用 compatible 让 exynos-pm-domains 给这个域加
++			 * GENPD_FLAG_ALWAYS_ON —— 厂商 G3D 上电序列需要 RMW
++			 * CMU_TOP0/TOPC1（本板读即挂），无法安全实现；保持 bootloader
++			 * 的上电状态、永不断电是当前唯一低风险解。见
++			 * 文档/05-专项/GPU加速-20261020.md。
++			 * 第一个 compatible 必须在前：OF 匹配按 compatible 位置打分，
++			 * 这样不会被 exynos5433-pd fallback 抢走。
++			 */
++			compatible = "samsung,exynos7420-g3d-pd",
++				     "samsung,exynos5433-pd";
++			reg = <0x105c4100 0x20>;
++			#power-domain-cells = <0>;
++			label = "G3D";
++		};
++
++		pd_disp: power-domain@105c4080 {
++			compatible = "samsung,exynos7420-pd";
++			reg = <0x105c4080 0x20>;
++			#power-domain-cells = <0>;
++			label = "DISP";
++			status = "okay";
++		};
++
+ 		rtc: rtc@10590000 {
+ 			compatible = "samsung,s3c6410-rtc";
+ 			reg = <0x10590000 0x100>;
+@@ -559,6 +739,110 @@ watchdog: watchdog@101d0000 {
+ 			status = "disabled";
+ 		};
+ 
++		cmu_g3d: clock-controller@14aa0000 {
++			compatible = "samsung,exynos7-clock-g3d";
++			reg = <0x14aa0000 0x1000>;
++			#clock-cells = <1>;
++		};
++
++		cmu_aud: clock-controller@114c0000 {
++			compatible = "samsung,exynos7-clock-aud";
++			reg = <0x114c0000 0x1000>;
++			#clock-cells = <1>;
++		};
++
++		adma: dma-controller@11420000 {
++			compatible = "arm,pl330", "arm,primecell";
++			reg = <0x11420000 0x1000>;
++			interrupts = <GIC_SPI 97 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_aud ACLK_ADMA>;
++			clock-names = "apb_pclk";
++			#dma-cells = <1>;
++		};
++
++		i2s0: i2s@11440000 {
++			compatible = "samsung,exynos7-i2s";
++			reg = <0x11440000 0x100>;
++			dmas = <&adma 0>, <&adma 2>;
++			dma-names = "tx", "rx";
++			interrupts = <GIC_SPI 70 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_aud PCLK_I2S>,
++				 <&cmu_aud SCLK_I2S>,
++				 <&cmu_aud SCLK_I2S>;
++			clock-names = "iis", "i2s_opclk0", "i2s_opclk1";
++			#clock-cells = <1>;
++			#sound-dai-cells = <1>;
++			status = "disabled";
++		};
++
++		cmu_disp: clock-controller@13ad0000 {
++			compatible = "samsung,exynos7-clock-disp";
++			reg = <0x13ad0000 0x1000>;
++			#clock-cells = <1>;
++		};
++
++		/*
++		 * Exynos7420 System MMU (SysMMU v6, 0x13A00000 / SPI 176).
++		 *
++		 * The "samsung,exynos7420-sysmmu" compatible is required: it
++		 * tells the mainline exynos-iommu driver to assume v6.0/v5
++		 * register layout from a static table instead of reading
++		 * REG_MMU_VERSION (0x34) from ->probe().
++		 *
++		 * Why that read must be avoided: the SYSMMU block lives in the
++		 * DISP power/clock domain and probe runs long before DECON is
++		 * powered.  On the 7420 an MMIO access to a powered-down block
++		 * never completes on the AXI bus, so mainline's probe-time
++		 * version read silently hangs the CPU.  The vendor v6 driver
++		 * only clk_prepare()s at probe and defers register access until
++		 * the master is up; the mainline driver follows the same model
++		 * (see IOMMU修复-20261018.md).
++		 *
++		 * "master" = DECON's aclk.  Vendor v6 wraps every SYSMMU
++		 * register access in the master clock (__master_clk_enable());
++		 * without it enabling the pclk gate wedges CCF.
++		 */
++		sysmmu_disp_ro: sysmmu@13a00000 {
++			compatible = "samsung,exynos7420-sysmmu",
++				     "samsung,exynos-sysmmu";
++			reg = <0x13a00000 0x1000>;
++			interrupts = <GIC_SPI 176 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_disp CLK_ACLK_DISP_RO_SYSMMU>,
++				 <&cmu_disp CLK_PCLK_DISP_RO_SYSMMU>,
++				 <&cmu_disp CLK_ACLK_DECON0>;
++			clock-names = "aclk", "pclk", "master";
++			#iommu-cells = <0>;
++		};
++
++		/* Exynos7420 System MMU (SysMMU v6, 0x13A10000 / SPI 179) */
++		sysmmu_disp_rw: sysmmu@13a10000 {
++			compatible = "samsung,exynos7420-sysmmu",
++				     "samsung,exynos-sysmmu";
++			reg = <0x13a10000 0x1000>;
++			interrupts = <GIC_SPI 179 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_disp CLK_ACLK_DISP_RW_SYSMMU>,
++				 <&cmu_disp CLK_PCLK_DISP_RW_SYSMMU>,
++				 <&cmu_disp CLK_ACLK_DECON0>;
++			clock-names = "aclk", "pclk", "master";
++			#iommu-cells = <0>;
++		};
++
++		decon: decon@13930000 {
++			compatible = "samsung,exynos7-decon";
++			reg = <0x13930000 0x10000>;
++			clocks = <&cmu_disp CLK_PCLK_DECON0>,
++				 <&cmu_disp CLK_ACLK_DECON0>,
++				 <&cmu_disp CLK_SCLK_DECON0_ECLK>,
++				 <&cmu_disp CLK_SCLK_DECON0_VCLK>;
++			clock-names = "pclk_decon0", "aclk_decon0",
++				      "decon0_eclk", "decon0_vclk";
++			iommus = <&sysmmu_disp_ro>, <&sysmmu_disp_rw>;
++			interrupts = <GIC_SPI 190 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 188 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "vsync", "lcd_sys";
++			status = "disabled";
++		};
++
+ 		gpu: gpu@14ac0000 {
+ 			compatible = "samsung,exynos5433-mali", "arm,mali-t760";
+ 			reg = <0x14ac0000 0x5000>;
+@@ -566,8 +850,11 @@ gpu: gpu@14ac0000 {
+ 				     <GIC_SPI 242 IRQ_TYPE_LEVEL_HIGH>,
+ 				     <GIC_SPI 240 IRQ_TYPE_LEVEL_HIGH>;
+ 			interrupt-names = "job", "mmu", "gpu";
++			clocks = <&cmu_g3d CLK_ACLK_G3D>,
++				 <&cmu_g3d CLK_PCLK_SYSREG_G3D>;
++			clock-names = "core", "bus";
++			power-domains = <&pd_g3d>;
+ 			status = "disabled";
+-			/* TODO: operating points for DVFS, cooling device */
+ 		};
+ 
+ 		mmc_0: mmc@15740000 {
+@@ -655,10 +942,31 @@ ufs: ufs@15570000 {
+ 				<&clock_fsys1 SCLK_UFSUNIPRO20_USER>;
+ 			clock-names = "core_clk", "sclk_unipro_main";
+ 			freq-table-hz = <0 0>, <0 0>;
+-			pinctrl-names = "default";
+-			pinctrl-0 = <&ufs_rst_n &ufs_refclk_out>;
++			/* DSH: 删掉 pinctrl-0。
++			 * 它在 really_probe() → pinctrl_bind_pins() 阶段就会写
++			 * GPH1(0x14870120) / GPG2(0x14870100)，而这个 GPIO 块
++			 * 从未被 mainline 任何已 probe 设备写过 —— 是 UFS 挂死的
++			 * 头号嫌疑。UFS_RST_N 由 S-Boot 已经 mux 好，运行时用
++			 * HCI_GPIO_OUT(0x15570170) 控制，不需要 pinctrl 介入。
++			 * 等控制器跑起来后再单独验证 pinctrl。*/
+ 			phys = <&ufs_phy>;
+ 			phy-names = "ufs-phy";
++			/* DSH: 暂时禁用 UFS 控制器。
++			 *
++			 * 实测（p81）：UFS PHY 本身 probe 成功（"probe of 15571800.ufs-phy
++			 * returned 0"），说明 fsys1 时钟树与 PMU 隔离都可用；但一旦启用
++			 * 控制器，内核就卡死在 exynos_ufs_probe() 里（屏幕停在某个
++			 * "returned 0 after 96 usecs" 的下一条）。
++			 *
++			 * 按子代理分析，控制器还缺三层：
++			 *   1) CMU_TOP1 里 FSYS1 的三个父门控（0x105E080C bit24 /
++			 *      0x105E0A28 bit16 / 0x105E0A2C bit24）没人打开 ——
++			 *      fixed-clock 只改软件速率，不写硬件；需由 uniLoader 预置。
++			 *   2) 7420 的 UFSP/FMP/SMU 在 vendor 里走 SMC，mainline 直接
++			 *      MMIO 写 0x15572010..20C，可能被 secure monitor 挡住。
++			 *   3) GPH1-4 (XBOOTLDO0) 电源开关未建模。
++			 *
++			 * 待这三项补齐后再打开。*/
+ 			status = "disabled";
+ 		};
+ 
+@@ -722,12 +1030,11 @@ atlas_thermal: cluster0-thermal {
+ 
+ 	timer {
+ 		compatible = "arm,armv8-timer";
++		interrupt-names = "sec-phys", "phys", "hyp-phys";
+ 		interrupts = <GIC_PPI 13
+ 				(GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+ 			     <GIC_PPI 14
+ 				(GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+-			     <GIC_PPI 11
+-				(GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+ 			     <GIC_PPI 10
+ 				(GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>;
+ 	};

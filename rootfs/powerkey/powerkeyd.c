@@ -1,15 +1,16 @@
-// G9209 电源键守护程序
+// G9209 电源键守护程序 v3：按 DPMS 状态判断（安卓式）
 //
-// 背景：GNOME 的 gsd-media-keys 会注册一个
-//   "handle-power-key" block inhibitor（systemd-inhibit --list 可见），
-// 把电源键完全独占，导致 systemd-logind 的 HandlePowerKey=lock 永远
-// 收不到事件 —— 按电源键毫无反应。
+// 逻辑：
+//   屏幕亮 (DPMS=On)  → 锁屏 + 灭屏
+//   屏幕灭 (DPMS=Off) → 唤醒（空密码时直接进桌面）
 //
-// 本程序直接读 /dev/input/event*（gpio-keys），按 Android 的逻辑：
-//   - 未锁屏时按电源键 → loginctl lock-session（GNOME 锁屏 + DPMS off）
-//   - 已锁屏时按电源键 → 唤醒（loginctl unlock-session 由 GNOME 处理）
+// v2 的 bug：用 ScreenSaver.GetActive（锁状态）判断，
+// 但屏幕可能"灭着但没锁"（GNOME 的 DPMS 超时和锁屏是两条独立路径），
+// 于是按键时误判成"未锁屏"→ 又调 Lock() → 屏幕保持黑 → 用户觉得没反应。
 //
-// evdev 允许多个读者同时打开（gsd 没有 EVIOCGRAB），所以不冲突。
+// v3 改成读 /sys/class/drm/card0-VGA-1/dpms，这是屏幕真实状态。
+//
+// 另外保留 v2 的设备自动重连（gpio-keys 被 rebind 后旧 fd 会失效）。
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,75 +19,119 @@
 #include <errno.h>
 #include <dirent.h>
 #include <linux/input.h>
-#include <sys/wait.h>
+#include <sys/ioctl.h>
 
 #define KEY_POWER_CODE 116
-#define LONG_PRESS_MS  3000
+#define MAX_READ_FAIL  5
+#define DPMS_PATH "/sys/class/drm/card0-VGA-1/dpms"
 
-static int find_gpio_keys(void)
+static char g_path[128];
+
+static int find_gpio_keys(char *path, size_t pathlen)
 {
     DIR *d = opendir("/dev/input");
     struct dirent *de;
-    int fd = -1;
+    int found = -1;
     if (!d) return -1;
     while ((de = readdir(d))) {
         if (strncmp(de->d_name, "event", 5) != 0) continue;
-        char path[128], name[64] = "";
-        snprintf(path, sizeof(path), "/dev/input/%s", de->d_name);
-        int f = open(path, O_RDONLY | O_NONBLOCK);
+        char p[128], name[64] = "";
+        int f;
+        snprintf(p, sizeof(p), "/dev/input/%s", de->d_name);
+        f = open(p, O_RDONLY | O_NONBLOCK);
         if (f < 0) continue;
         if (ioctl(f, EVIOCGNAME(sizeof(name)), name) < 0) { close(f); continue; }
         if (strcmp(name, "gpio-keys") == 0) {
-            fprintf(stderr, "powerkeyd: 找到 %s (%s)\n", path, name);
-            fd = f;
+            snprintf(path, pathlen, "%s", p);
+            found = f;
             break;
         }
         close(f);
     }
     closedir(d);
+    return found;
+}
+
+static int open_device(void)
+{
+    int fd = find_gpio_keys(g_path, sizeof(g_path));
+    if (fd < 0) {
+        fprintf(stderr, "powerkeyd: 找不到 gpio-keys\n");
+        g_path[0] = '\0';
+        return -1;
+    }
+    fprintf(stderr, "powerkeyd: 已打开 %s\n", g_path);
     return fd;
 }
 
-static int is_locked(void)
+/* 屏幕是否处于关闭状态：读 DPMS */
+static int screen_is_off(void)
 {
-    int st = system("loginctl show-session $(loginctl list-sessions --no-legend | awk '$3==\"0\"{print $1; exit}') -p LockedHint --value 2>/dev/null | grep -q yes");
-    return st == 0;
+    char buf[16] = {0};
+    int fd = open(DPMS_PATH, O_RDONLY);
+    if (fd < 0) return 0;                 /* 读不到就当亮着 */
+    if (read(fd, buf, sizeof(buf) - 1) <= 0) { close(fd); return 0; }
+    close(fd);
+    return (strstr(buf, "Off") != NULL);
 }
 
 static void do_lock(void)
 {
-    fprintf(stderr, "powerkeyd: 锁屏\n");
+    fprintf(stderr, "powerkeyd: 锁屏+灭屏\n");
+    system("gdbus call --session --dest org.gnome.ScreenSaver "
+           "--object-path /org/gnome/ScreenSaver "
+           "--method org.gnome.ScreenSaver.Lock >/dev/null 2>&1");
     system("loginctl lock-session 2>/dev/null");
-    /* 立刻灭屏（lock-delay=0 时 GNOME 也会做，但保险起见） */
-    system("gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.Lock 2>/dev/null");
 }
 
-static void do_unlock(void)
+static void do_wake(void)
 {
     fprintf(stderr, "powerkeyd: 唤醒\n");
+    /* 空密码 => 直接回桌面；如果设了密码，停在锁屏界面输密码 */
+    system("gdbus call --session --dest org.gnome.ScreenSaver "
+           "--object-path /org/gnome/ScreenSaver "
+           "--method org.gnome.ScreenSaver.SetActive false >/dev/null 2>&1");
     system("loginctl unlock-session 2>/dev/null");
-    system("gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.SetActive false 2>/dev/null");
 }
 
 int main(void)
 {
-    int fd = find_gpio_keys();
-    if (fd < 0) { fprintf(stderr, "powerkeyd: 找不到 gpio-keys\n"); return 1; }
+    int fd = open_device();
+    if (fd < 0) { sleep(2); fd = open_device(); if (fd < 0) return 1; }
 
     struct input_event ev;
+    int fails = 0;
+
     for (;;) {
         ssize_t n = read(fd, &ev, sizeof(ev));
-        if (n != sizeof(ev)) {
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { usleep(100000); continue; }
-            usleep(200000);
+
+        if (n == (ssize_t)sizeof(ev)) {
+            fails = 0;
+            if (ev.type != EV_KEY || ev.code != KEY_POWER_CODE || ev.value != 1)
+                continue;
+            /* 按 DPMS 真实状态判断 */
+            if (screen_is_off()) do_wake();
+            else                 do_lock();
             continue;
         }
-        if (ev.type != EV_KEY) continue;
-        if (ev.code != KEY_POWER_CODE) continue;
-        if (ev.value != 1) continue;   /* 只处理按下 */
 
-        if (is_locked()) do_unlock();
-        else            do_lock();
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            usleep(100000);
+            fails = 0;
+            continue;
+        }
+
+        fails++;
+        if (fails >= MAX_READ_FAIL) {
+            fprintf(stderr, "powerkeyd: 读失败 %d 次，重新扫描设备\n", fails);
+            close(fd);
+            sleep(1);
+            fd = open_device();
+            if (fd < 0) { sleep(3); continue; }
+            fails = 0;
+        } else {
+            usleep(200000);
+        }
     }
     return 0;
 }

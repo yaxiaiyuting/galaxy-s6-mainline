@@ -1,0 +1,112 @@
+diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
+index 5a57c3279..a8f137b29 100644
+--- a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
+@@ -1095,6 +1259,107 @@ &gpu {
+ 	 * 仅在 p211 出问题时回退用。回退方法：把下面一行取消注释。
+ 	 */
+ 	/delete-property/ power-domains;
++
++	/*
++	 * DSH 2026-10-23: GPU 变频所需的三个额外时钟句柄。
++	 *
++	 * CMU_G3D 的 GPU 核心时钟路径（vendor clk-exynos7420.c）：
++	 *   g3d_pll(PLL1452X) --\
++	 *                        mux(MUX_SEL_G3D.bit8) -> aclk_g3d(gate) -> GPU
++	 *   fin_pll(24MHz)    --/
++	 *
++	 * panfrost 只用 clocks[0] 当 "core"，但安全变频必须能自己动 mux：
++	 *   ① 把 mux 切到 fin_pll（ GPU 先跑 24MHz，拿到干净时钟）
++	 *   ② 改 fout_g3d_pll
++	 *   ③ 把 mux 切回 fout_g3d_pll
++	 * 这是 vendor gpu_set_clock() 的唯一验证过的序列
++	 * （los20/.../platform/exynos/gpu_exynos7420.c:302-352）。
++	 *
++	 * 注意：property 是整体覆盖，所以 core/bus 必须重写一遍。
++	 */
++	clocks = <&cmu_g3d CLK_ACLK_G3D>,
++		 <&cmu_g3d CLK_PCLK_SYSREG_G3D>,
++		 <&cmu_g3d CLK_MOUT_ACLK_G3D_400>,
++		 <&cmu_g3d CLK_FOUT_G3D_PLL>,
++		 <&fin_pll>;
++	clock-names = "core", "bus", "g3d-mux", "g3d-pll", "g3d-safe";
++
++	/* devfreq：频率表 + 电压（全档 900mV，见 gpu_opp_table 注释） */
++	operating-points-v2 = <&gpu_opp_table>;
++	mali-supply = <&reg_gpu_vdd>;
++
++	/*
++	 * 可选：probe 时用同一套安全序列把 PLL 一次性设到 700MHz。
++	 * 用来单独验证"700MHz 本身能不能跑"，不掺 devfreq 的动态切换。
++	 * 默认注释；验证流程见 文档/05-专项/GPU-DVFS实现方案-20261023.md 第 4 步。
++	 */
++	/* samsung,g3d-fixed-rate-hz = <700000000>; */
++};
++
++/*
++ * DSH 2026-10-23: Mali-T760 MP8 的 OPP 表。
++ *
++ * 频率来源：
++ *   vendor gpu_dvfs_table_default[]（los20/.../t7xx/r12p0/platform/exynos/
++ *   gpu_exynos7420.c:56-64）：772 / 700 / 600 / 544 / 420 / 350 / 266 MHz
++ *   vendor table_g3d[]（drivers/clk/samsung/clk-exynos7420.c:674-684）：
++ *     {772M, P6 M193 S0} {700M, P6 M175 S0} {600M, P3 M75 S0}
++ *     {544M, P3 M68 S0} {420M, P3 M105 S1} {350M, P6 M175 S1}
++ *     {266M, P6 M133 S1}
++ *
++ * 电压：vendor 表里**每个频点都是 900000µV**（GPU_DEFAULT_VOLTAGE = 900000，
++ * gpu_exynos7420.c:88），266MHz 与 700MHz 同压，所以升频失败不可能是"欠压"。
++ *
++ * 上限只到 700MHz：vendor GPU_MAX_CLOCK_LIMIT = 700（同文件:78）。
++ * 772MHz 档存在但被 vendor 自己限制掉，这里不放。
++ */
++/ {
++	gpu_opp_table: opp-table-gpu {
++		compatible = "operating-points-v2";
++
++		/*
++		 * 100MHz：本次新增的最低档，PLL 能精确整出来（M=100/P=6/S=2，
++		 * fout = 100*24/(6<<2) = 100MHz），但 **vendor 没有这一档**
++		 * （GPU_MIN_CLOCK = 266）。默认关闭：devfreq 的 simple_ondemand
++		 * 会把 freq_table[0] 当空闲档，一个没验证过的低档会在第一次
++		 * 空闲时就把 GPU 挂掉，把整个 DVFS 实验搅浑。
++		 * 要试就取消注释，并先把 min_freq 钉在 100MHz 单点验证。
++		 */
++		/* opp-100000000 { opp-hz = /bits/ 64 <100000000>; opp-microvolt = <900000>; }; */
++
++		opp-266000000 {
++			opp-hz = /bits/ 64 <266000000>;
++			opp-microvolt = <900000>;
++		};
++		opp-420000000 {
++			opp-hz = /bits/ 64 <420000000>;
++			opp-microvolt = <900000>;
++		};
++		opp-544000000 {
++			opp-hz = /bits/ 64 <544000000>;
++			opp-microvolt = <900000>;
++		};
++		opp-700000000 {
++			opp-hz = /bits/ 64 <700000000>;
++			opp-microvolt = <900000>;
++		};
++	};
++
++	/*
++	 * GPU 供电占位：vendor 用 regulator_get(NULL, "vdd_g3d")
++	 * （gpu_exynos7420.c:610），每个频点都 set 到 900mV。
++	 * mainline 没有可用的 s2mps15 regulator 驱动，所以用 fixed 表示
++	 * "恒 900mV、不可调"这一硬件事实——它同时也告诉 OPP core：
++	 * 不需要为变频做任何电压动作。
++	 */
++	reg_gpu_vdd: regulator-gpu-vdd {
++		compatible = "regulator-fixed";
++		regulator-name = "vdd_g3d";
++		regulator-min-microvolt = <900000>;
++		regulator-max-microvolt = <900000>;
++		regulator-always-on;
++		regulator-boot-on;
++	};
+ };
+ 
+ /*

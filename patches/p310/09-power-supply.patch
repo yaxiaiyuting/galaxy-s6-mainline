@@ -1,0 +1,1594 @@
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index a61bb1283..0cb11371c 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -402,6 +402,29 @@ config BATTERY_MAX17042
+ 
+ 	  Driver can be build as a module (max17042_battery).
+ 
++config FUEL_GAUGE_MAX77843
++	tristate "Maxim MAX77843 fuel gauge"
++	depends on I2C
++	help
++	  Fuel gauge support for the MAX77843 companion PMIC. The gauge
++	  block is a MAX17050 (ModelGauge m3) compatible device behind
++	  its own I2C slave address (0x36). Say Y here to expose battery
++	  capacity, voltage, current and temperature to the power supply
++	  class (and thus to upower / desktop shells).
++
++	  Driver can be built as a module (max77843_fuelgauge).
++
++config CHARGER_MAX77843
++	tristate "Maxim MAX77843 charger (read-only)"
++	depends on I2C
++	help
++	  Charger status support for the MAX77843 companion PMIC. This
++	  first stage driver is read-only: it reports charger presence and
++	  charge state but leaves the charging configuration programmed by
++	  the bootloader untouched.
++
++	  Driver can be built as a module (max77843-charger).
++
+ config BATTERY_MAX1721X
+ 	tristate "MAX17211/MAX17215 standalone gas-gauge"
+ 	depends on W1
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index a8a9fa6de..413aa2ce0 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -52,6 +52,8 @@ obj-$(CONFIG_CHARGER_DA9150)	+= da9150-charger.o
+ obj-$(CONFIG_BATTERY_DA9150)	+= da9150-fg.o
+ obj-$(CONFIG_BATTERY_MAX17040)	+= max17040_battery.o
+ obj-$(CONFIG_BATTERY_MAX17042)	+= max17042_battery.o
++obj-$(CONFIG_FUEL_GAUGE_MAX77843)	+= max77843_fuelgauge.o
++obj-$(CONFIG_CHARGER_MAX77843)	+= max77843-charger.o
+ obj-$(CONFIG_BATTERY_MAX1721X)	+= max1721x_battery.o
+ obj-$(CONFIG_BATTERY_RT5033)	+= rt5033_battery.o
+ obj-$(CONFIG_CHARGER_RT5033)	+= rt5033_charger.o
+diff --git a/drivers/power/supply/max77843-charger.c b/drivers/power/supply/max77843-charger.c
+new file mode 100644
+index 000000000..a03a573b9
+--- /dev/null
++++ b/drivers/power/supply/max77843-charger.c
+@@ -0,0 +1,1143 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Charger driver for the Maxim MAX77843 companion PMIC
++ *
++ * Default: read-only.  It exposes the charger state (input present, charge
++ * state, configured fast-charge / input current limits) to the power supply
++ * class so that upower and the desktop can show "charging / full /
++ * discharging".  A normal boot therefore leaves the configuration
++ * programmed by the Samsung bootloader completely untouched.
++ *
++ * DSH 2026-10-20 (stage 2, charging control, user report "does not charge"):
++ *   (a) probe-time register dump (safe, read-only): CHG_INT / CHG_INT_MASK /
++ *       CHG_INT_OK / CHG_DTLS_00..02 / CHG_CNFG_00..12 + decoded values +
++ *       MUIC charger type (0x25) + fuel-gauge current.  This alone tells
++ *       "not enabled" from "current limit too low" from "wrong/host USB
++ *       port" from "bus/hardware problem".
++ *   (b) opt-in charging control, DISABLED by default, with:
++ *       - CHG_CNFG_06 write-unlock (without it every config write is
++ *         silently ignored by the chip),
++ *       - watchdog handling (WDTEN cleared + WDTCLR kicked; otherwise the
++ *         MAX77843 suspends charging when its watchdog expires),
++ *       - safe bring-up: 500 mA input / 500 mA fast-charge first,
++ *       - write-readback verification after every single register write,
++ *       - MUIC charger-type aware caps (SDP/USB port => 500 mA only).
++ *
++ * Module parameters (all defaults keep the driver read-only):
++ *   charge_enable=0/1     apply CHG_CNFG_00/02/04/09 (default 0)
++ *   fast_chg_ma=2100      fast charge current          (CHG_CNFG_02)
++ *   float_mv=4350         float voltage                (CHG_CNFG_04)
++ *   input_limit_ma=1800   input current limit          (CHG_CNFG_09)
++ *   safe_bringup=1        cap fast/input at 500 mA unless "full" requested
++ *   dump=0/1              print the register dump now
++ * E.g.:
++ *   echo 1 > /sys/module/max77843_charger/parameters/dump
++ *   echo 1 > /sys/module/max77843_charger/parameters/charge_enable
++ *   echo 2 > /sys/module/max77843_charger/parameters/fast_chg_ma
++ *   echo 1 > /sys/module/max77843_charger/parameters/charge_enable
++ *
++ * Manual single-shot commands on the power supply device:
++ *   echo dump    > /sys/class/power_supply/max77843-charger/charge_ctrl
++ *   echo enable  > .../charge_ctrl     # safe config (<=500 mA) + enable
++ *   echo full    > .../charge_ctrl     # configured currents + enable
++ *   echo disable > .../charge_ctrl     # clear CHG_EN only
++ *   echo unlock  > .../charge_ctrl     # unlock and report write protection
++ *   echo kick    > .../charge_ctrl     # kick the charger watchdog
++ *
++ * The charger block sits behind its own I2C slave address (0x69) of the
++ * MAX77843; MUIC is at 0x25.  Both are on the i2c-gpio bus (GPD2[2:3]) -
++ * never touch hsi2c_1 (0x13650000: AXI hangs).
++ *
++ * Register semantics come from the Samsung universal7420 3.10 driver
++ * (drivers/battery/max77843_charger.c).
++ */
++
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/i2c.h>
++#include <linux/mfd/core.h>
++#include <linux/mfd/max77693-common.h>
++#include <linux/mfd/max77843-private.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++#define MAX77843_CHG_DRIVER_NAME	"max77843-charger"
++
++/* CHG_DTLS_00 (0xB3): charger input status */
++#define MAX77843_CHGIN_DTLS_MASK	0x60
++#define MAX77843_CHGIN_DTLS_SHIFT	5
++#define MAX77843_CHGIN_DTLS_VALID	0x03
++
++/* CHG_DTLS_01 (0xB4): charge state, low nibble; battery state, bits [6:4] */
++#define MAX77843_CHG_DTLS_MASK		0x0f
++#define MAX77843_DSH_BAT_DTLS_MASK	0x70
++#define MAX77843_DSH_BAT_DTLS_SHIFT	4
++
++/* CHG_CNFG_02 (0xB9): fast charge ichg, bits [5:0] */
++#define MAX77843_CHG_CC_MASK		0x3f
++/* CHG_CNFG_09 (0xC0): input current limit, bits [6:0] */
++#define MAX77843_CHG_CHGIN_LIM_MASK	0x7f
++
++/* CHG_CNFG_00 (0xB7) */
++#define MAX77843_CNFG00_CHG		BIT(0)	/* charging enabled */
++#define MAX77843_CNFG00_OTG		BIT(1)
++#define MAX77843_CNFG00_BUCK		BIT(2)
++#define MAX77843_CNFG00_BOOST		BIT(3)
++#define MAX77843_CNFG00_WDTEN		BIT(4)	/* charger watchdog enable */
++#define MAX77843_CNFG00_MODE_MASK	0x1f
++
++/* CHG_CNFG_06 (0xBD): write protection bits [3:2] == 0x3 means unlocked */
++#define MAX77843_CNFG06_PROT_MASK	(0x3 << 2)
++#define MAX77843_CNFG06_PROT_UNLOCK	(0x3 << 2)
++#define MAX77843_CNFG06_WDTCLR_MASK	(0x3 << 0)
++#define MAX77843_CNFG06_WDTCLR		BIT(0)
++
++/* MUIC (I2C 0x25) status registers */
++#define MAX77843_MUIC_ADDR		0x25
++#define MAX77843_MUIC_REG_STATUS1	0x04
++#define MAX77843_MUIC_REG_STATUS2	0x05
++#define MAX77843_MUIC_REG_STATUS3	0x06
++#define MAX77843_DSH_MUIC_ADC_MASK	0x1f
++#define MAX77843_DSH_MUIC_ADC1K		BIT(7)
++#define MAX77843_DSH_MUIC_CHGTYP_MASK	0x07
++
++enum max77843_muic_chg_type {
++	MAX77843_MUIC_CHG_NONE = 0,
++	MAX77843_MUIC_CHG_USB,		/* SDP: PC USB port, 500 mA max */
++	MAX77843_MUIC_CHG_DOWNSTREAM,	/* downstream port, 500 mA class */
++	MAX77843_MUIC_CHG_DEDICATED,	/* DCP: wall charger */
++	MAX77843_MUIC_CHG_SPECIAL_500MA,
++	MAX77843_MUIC_CHG_SPECIAL_1A,
++	MAX77843_MUIC_CHG_SPECIAL_BIAS,
++	MAX77843_MUIC_CHG_RESERVED,
++	MAX77843_MUIC_CHG_GND,
++	MAX77843_MUIC_CHG_DOCK,
++};
++
++static const char * const max77843_muic_chg_name[] = {
++	"NONE", "USB-SDP", "DOWNSTREAM", "DEDICATED-DCP",
++	"SPECIAL-500mA", "SPECIAL-1A", "SPECIAL-BIAS", "RESERVED",
++	"GND", "DOCK",
++};
++
++/* Safety limits used for the first bring-up */
++#define MAX77843_SAFE_FAST_UA		500000
++#define MAX77843_SAFE_INPUT_UA		500000
++#define MAX77843_SPECIAL_1A_FAST_UA	900000
++#define MAX77843_SPECIAL_1A_INPUT_UA	1000000
++
++struct max77843_charger {
++	struct device *dev;
++	struct regmap *regmap;
++	struct power_supply *psy;
++	/* optional MUIC client (I2C 0x25), read-only, for charger-type diag */
++	struct i2c_client *muic;
++	struct regmap *muic_regmap;
++};
++
++static int max77843_chg_read(struct max77843_charger *chg, u8 reg,
++			     unsigned int *val)
++{
++	int ret;
++
++	ret = regmap_read(chg->regmap, reg, val);
++	if (ret)
++		dev_err_ratelimited(chg->dev,
++				    "failed to read register 0x%02x: %d\n",
++				    reg, ret);
++
++	return ret;
++}
++
++static int max77843_chg_get_online(struct max77843_charger *chg, int *val)
++{
++	unsigned int reg;
++	int ret;
++
++	ret = max77843_chg_read(chg, MAX77843_CHG_REG_CHG_DTLS_00, &reg);
++	if (ret)
++		return ret;
++
++	reg = (reg & MAX77843_CHGIN_DTLS_MASK) >> MAX77843_CHGIN_DTLS_SHIFT;
++	*val = (reg == MAX77843_CHGIN_DTLS_VALID);
++
++	return 0;
++}
++
++static int max77843_chg_get_status(struct max77843_charger *chg, int *val)
++{
++	unsigned int reg;
++	int ret, online;
++
++	ret = max77843_chg_read(chg, MAX77843_CHG_REG_CHG_DTLS_01, &reg);
++	if (ret)
++		return ret;
++
++	reg &= MAX77843_CHG_DTLS_MASK;
++
++	switch (reg) {
++	case 0x00:	/* pre-qualification */
++	case 0x01:	/* constant current */
++	case 0x02:	/* constant voltage */
++		*val = POWER_SUPPLY_STATUS_CHARGING;
++		break;
++	case 0x03:	/* top-off */
++	case 0x04:	/* done */
++		*val = POWER_SUPPLY_STATUS_FULL;
++		break;
++	case 0x05:	/* high temperature fault */
++	case 0x06:	/* thermal shutdown */
++	case 0x07:	/* timer fault */
++		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		break;
++	case 0x08:	/* charger off */
++	case 0x0a:
++	case 0x0b:
++		*val = POWER_SUPPLY_STATUS_DISCHARGING;
++		break;
++	default:
++		*val = POWER_SUPPLY_STATUS_UNKNOWN;
++		break;
++	}
++
++	/* Without a valid input the battery can only be discharging */
++	if (*val != POWER_SUPPLY_STATUS_DISCHARGING) {
++		ret = max77843_chg_get_online(chg, &online);
++		if (ret)
++			return ret;
++		if (!online && *val == POWER_SUPPLY_STATUS_NOT_CHARGING)
++			*val = POWER_SUPPLY_STATUS_DISCHARGING;
++	}
++
++	return 0;
++}
++
++static int max77843_chg_get_fast_chg_current(struct max77843_charger *chg,
++					     int *val)
++{
++	unsigned int reg;
++	int ret, code;
++
++	ret = max77843_chg_read(chg, MAX77843_CHG_REG_CHG_CNFG_02, &reg);
++	if (ret)
++		return ret;
++
++	/* 100 mA minimum, 50 mA per step, in uA */
++	code = reg & MAX77843_CHG_CC_MASK;
++	*val = code <= 2 ? 100000 : code * 50000;
++
++	return 0;
++}
++
++static int max77843_chg_get_input_current(struct max77843_charger *chg,
++					  int *val)
++{
++	unsigned int reg;
++	int ret, code;
++
++	ret = max77843_chg_read(chg, MAX77843_CHG_REG_CHG_CNFG_09, &reg);
++	if (ret)
++		return ret;
++
++	code = reg & MAX77843_CHG_CHGIN_LIM_MASK;
++	if (code <= 3) {
++		*val = 100000;
++	} else if (code >= 0x78) {
++		*val = 4000000;
++	} else {
++		int quotient = code / 3;
++		int remainder = code % 3;
++
++		*val = quotient * 100000;
++		if (remainder == 1)
++			*val += 33000;
++		else if (remainder == 2)
++			*val += 67000;
++	}
++
++	return 0;
++}
++
++static int max77843_chg_get_charge_type(struct max77843_charger *chg,
++					int *val)
++{
++	int status, ret;
++
++	ret = max77843_chg_get_status(chg, &status);
++	if (ret)
++		return ret;
++
++	if (status == POWER_SUPPLY_STATUS_CHARGING)
++		*val = POWER_SUPPLY_CHARGE_TYPE_FAST;
++	else if (status == POWER_SUPPLY_STATUS_FULL)
++		*val = POWER_SUPPLY_CHARGE_TYPE_NONE;
++	else
++		*val = POWER_SUPPLY_CHARGE_TYPE_UNKNOWN;
++
++	return 0;
++}
++
++static int max77843_chg_get_property(struct power_supply *psy,
++				     enum power_supply_property psp,
++				     union power_supply_propval *val)
++{
++	struct max77843_charger *chg = power_supply_get_drvdata(psy);
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_STATUS:
++		return max77843_chg_get_status(chg, &val->intval);
++	case POWER_SUPPLY_PROP_ONLINE:
++		return max77843_chg_get_online(chg, &val->intval);
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = 1;
++		return 0;
++	case POWER_SUPPLY_PROP_CHARGE_TYPE:
++		return max77843_chg_get_charge_type(chg, &val->intval);
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
++		return max77843_chg_get_fast_chg_current(chg, &val->intval);
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		return max77843_chg_get_input_current(chg, &val->intval);
++	default:
++		return -EINVAL;
++	}
++}
++
++static enum power_supply_property max77843_chg_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_CHARGE_TYPE,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
++	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
++};
++
++/* ---------------------------------------------------------------------- */
++/* DSH: diagnostics + opt-in charging control                             */
++/* ---------------------------------------------------------------------- */
++
++static bool ignore_muic_cap;
++static bool charge_enable;
++static bool safe_bringup = true;
++static int fast_chg_ma = 2100;
++static int float_mv = 4350;
++static int input_limit_ma = 1800;
++static bool dump_requested;
++
++static struct max77843_charger *dsh_chg;
++
++/* ---- register codecs (Samsung universal7420 vendor formulas) ---------- */
++
++static int max77843_chg_fast_code(int ua)
++{
++	int code;
++
++	if (ua < 150000)
++		return 2;			/* 0..2 all mean 100 mA */
++	code = DIV_ROUND_CLOSEST(ua, 50000);
++	return clamp(code, 3, MAX77843_CHG_CC_MASK);
++}
++
++static int max77843_chg_input_code(int ua)
++{
++	int code;
++
++	if (ua <= 100000)
++		return 3;
++	code = DIV_ROUND_CLOSEST((s64)ua * 3, 100000);
++	return clamp(code, 3, MAX77843_CHG_CHGIN_LIM_MASK);
++}
++
++static int max77843_chg_float_code(int uv)
++{
++	int code = DIV_ROUND_CLOSEST(uv - 3650000, 25000);
++
++	return clamp(code, 0, MAX77843_CHG_CC_MASK);
++}
++
++static int max77843_chg_fast_ua(unsigned int code)
++{
++	code &= MAX77843_CHG_CC_MASK;
++	return code <= 2 ? 100000 : code * 50000;
++}
++
++static int max77843_chg_input_ua(unsigned int code)
++{
++	int q, rem;
++
++	code &= MAX77843_CHG_CHGIN_LIM_MASK;
++	if (code <= 3)
++		return 100000;
++	if (code >= 0x78)
++		return 4000000;
++	q = code / 3;
++	rem = code % 3;
++	return q * 100000 + (rem == 1 ? 33000 : (rem == 2 ? 67000 : 0));
++}
++
++static int max77843_chg_float_uv(unsigned int code)
++{
++	return 3650000 + (code & MAX77843_CHG_CC_MASK) * 25000;
++}
++
++static const char *max77843_chg_state_str(unsigned int dtls)
++{
++	switch (dtls & MAX77843_CHG_DTLS_MASK) {
++	case 0x0: return "pre-qual";
++	case 0x1: return "fast-charge CC";
++	case 0x2: return "fast-charge CV";
++	case 0x3: return "top-off";
++	case 0x4: return "done";
++	case 0x5: return "high-temp fault";
++	case 0x6: return "thermal shutdown";
++	case 0x7: return "timer fault";
++	case 0x8: return "charger off";
++	case 0xa: return "battery OVP";
++	case 0xb: return "unknown fault";
++	default:  return "reserved";
++	}
++}
++
++static const char *max77843_chg_bat_state_str(unsigned int dtls)
++{
++	switch ((dtls & MAX77843_DSH_BAT_DTLS_MASK) >>
++		MAX77843_DSH_BAT_DTLS_SHIFT) {
++	case 0x0: return "no battery / charger suspended";
++	case 0x1: return "battery normal";
++	default:  return "battery details reserved";
++	}
++}
++
++/* ---- MUIC (0x25) charger-type diagnostics (read-only) ----------------- */
++
++static void max77843_chg_muic_init(struct max77843_charger *chg,
++				   struct i2c_adapter *adapter)
++{
++	static const struct regmap_config muic_regmap_config = {
++		.reg_bits = 8,
++		.val_bits = 8,
++		.max_register = 0xff,
++	};
++	struct i2c_client *client;
++
++	if (!adapter)
++		return;
++
++	client = devm_i2c_new_dummy_device(chg->dev, adapter,
++					   MAX77843_MUIC_ADDR);
++	if (IS_ERR(client)) {
++		dev_info(chg->dev,
++			 "MUIC @0x25 unavailable (%ld): charger-type diag limited\n",
++			 PTR_ERR(client));
++		return;
++	}
++
++	chg->muic = client;
++	chg->muic_regmap = devm_regmap_init_i2c(client, &muic_regmap_config);
++	if (IS_ERR(chg->muic_regmap)) {
++		dev_info(chg->dev, "MUIC regmap init failed (%ld)\n",
++			 PTR_ERR(chg->muic_regmap));
++		chg->muic_regmap = NULL;
++	}
++}
++
++static int max77843_chg_muic_type(struct max77843_charger *chg)
++{
++	unsigned int v;
++	int ret;
++
++	if (!chg->muic_regmap)
++		return -ENODEV;
++
++	ret = regmap_read(chg->muic_regmap, MAX77843_MUIC_REG_STATUS2, &v);
++	if (ret)
++		return ret;
++
++	return v & MAX77843_DSH_MUIC_CHGTYP_MASK;
++}
++
++static void max77843_chg_dump_muic(struct max77843_charger *chg,
++				   const char *why)
++{
++	unsigned int s1 = 0, s2 = 0, s3 = 0;
++	int type;
++
++	if (!chg->muic_regmap) {
++		dev_info(chg->dev, "DSH-CHG %s: MUIC not available\n", why);
++		return;
++	}
++
++	if (regmap_read(chg->muic_regmap, MAX77843_MUIC_REG_STATUS1, &s1) ||
++	    regmap_read(chg->muic_regmap, MAX77843_MUIC_REG_STATUS2, &s2) ||
++	    regmap_read(chg->muic_regmap, MAX77843_MUIC_REG_STATUS3, &s3)) {
++		dev_err(chg->dev, "DSH-CHG %s: MUIC read failed\n", why);
++		return;
++	}
++
++	type = s2 & MAX77843_DSH_MUIC_CHGTYP_MASK;
++	dev_info(chg->dev,
++		 "DSH-CHG %s MUIC(0x25): STATUS1=0x%02x [ADC=%d ADC1K=%d] "
++		 "STATUS2=0x%02x [CHGTYP=%d(%s)] STATUS3=0x%02x\n",
++		 why, s1, s1 & MAX77843_DSH_MUIC_ADC_MASK,
++		 !!(s1 & MAX77843_DSH_MUIC_ADC1K), s2, type,
++		 type < ARRAY_SIZE(max77843_muic_chg_name) ?
++			max77843_muic_chg_name[type] : "?",
++		 s3);
++}
++
++/* ---- register dump / decoded summary ---------------------------------- */
++
++static void max77843_chg_dump_regs(struct max77843_charger *chg,
++				   const char *why)
++{
++	static const struct {
++		u8 reg;
++		const char *name;
++	} regs[] = {
++		{ MAX77843_CHG_REG_CHG_INT,	"CHG_INT" },
++		{ MAX77843_CHG_REG_CHG_INT_MASK, "CHG_INT_MASK" },
++		{ MAX77843_CHG_REG_CHG_INT_OK,	"CHG_INT_OK" },
++		{ MAX77843_CHG_REG_CHG_DTLS_00,	"CHG_DTLS_00" },
++		{ MAX77843_CHG_REG_CHG_DTLS_01,	"CHG_DTLS_01" },
++		{ MAX77843_CHG_REG_CHG_DTLS_02,	"CHG_DTLS_02" },
++		{ MAX77843_CHG_REG_CHG_CNFG_00,	"CHG_CNFG_00" },
++		{ MAX77843_CHG_REG_CHG_CNFG_01,	"CHG_CNFG_01" },
++		{ MAX77843_CHG_REG_CHG_CNFG_02,	"CHG_CNFG_02" },
++		{ MAX77843_CHG_REG_CHG_CNFG_03,	"CHG_CNFG_03" },
++		{ MAX77843_CHG_REG_CHG_CNFG_04,	"CHG_CNFG_04" },
++		{ MAX77843_CHG_REG_CHG_CNFG_06,	"CHG_CNFG_06" },
++		{ MAX77843_CHG_REG_CHG_CNFG_07,	"CHG_CNFG_07" },
++		{ MAX77843_CHG_REG_CHG_CNFG_09,	"CHG_CNFG_09" },
++		{ 0xc1,				"CHG_CNFG_10" },
++		{ 0xc3,				"CHG_CNFG_12" },
++	};
++	unsigned int v;
++	int i, ok = 0;
++
++	for (i = 0; i < ARRAY_SIZE(regs); i++) {
++		if (regmap_read(chg->regmap, regs[i].reg, &v)) {
++			dev_err(chg->dev, "DSH-CHG %s: read 0x%02x (%s) failed\n",
++				why, regs[i].reg, regs[i].name);
++			continue;
++		}
++		ok++;
++		dev_info(chg->dev, "DSH-CHG %s: 0x%02x %-12s = 0x%02x\n",
++			 why, regs[i].reg, regs[i].name, v);
++	}
++	if (!ok)
++		dev_err(chg->dev, "DSH-CHG %s: no register readable\n", why);
++}
++
++static void max77843_chg_dump_fg_current(void)
++{
++	struct power_supply *fg;
++	union power_supply_propval val;
++
++	fg = power_supply_get_by_name("max77843-fuelgauge");
++	if (!fg)
++		return;
++	if (!power_supply_get_property(fg, POWER_SUPPLY_PROP_CURRENT_NOW,
++				       &val))
++		pr_info("DSH-CHG fuel-gauge current = %d uA (%s)\n",
++			val.intval, val.intval < 0 ? "discharging" : "charging");
++	power_supply_put(fg);
++}
++
++static void max77843_chg_dump_decoded(struct max77843_charger *chg,
++				      const char *why)
++{
++	unsigned int c00 = 0, c02 = 0, c04 = 0, c06 = 0, c09 = 0;
++	unsigned int intok = 0, d00 = 0, d01 = 0;
++	int type;
++
++	if (regmap_read(chg->regmap, MAX77843_CHG_REG_CHG_CNFG_00, &c00) ||
++	    regmap_read(chg->regmap, MAX77843_CHG_REG_CHG_CNFG_02, &c02) ||
++	    regmap_read(chg->regmap, MAX77843_CHG_REG_CHG_CNFG_04, &c04) ||
++	    regmap_read(chg->regmap, MAX77843_CHG_REG_CHG_CNFG_06, &c06) ||
++	    regmap_read(chg->regmap, MAX77843_CHG_REG_CHG_CNFG_09, &c09) ||
++	    regmap_read(chg->regmap, MAX77843_CHG_REG_CHG_INT_OK, &intok))
++		return;
++
++	type = max77843_chg_muic_type(chg);
++
++	dev_info(chg->dev,
++		 "DSH-CHG %s decoded: CHG_EN=%d BUCK=%d OTG=%d BOOST=%d WDTEN=%d | "
++		 "fast=%d mA | float=%d mV | input_limit=%d mA | prot=%s | "
++		 "INT_OK=0x%02x [CHGIN_OK=%d WCIN=%d CHG=%d BAT=%d BATP=%d]\n",
++		 why, !!(c00 & MAX77843_CNFG00_CHG),
++		 !!(c00 & MAX77843_CNFG00_BUCK), !!(c00 & MAX77843_CNFG00_OTG),
++		 !!(c00 & MAX77843_CNFG00_BOOST), !!(c00 & MAX77843_CNFG00_WDTEN),
++		 max77843_chg_fast_ua(c02) / 1000,
++		 max77843_chg_float_uv(c04) / 1000,
++		 max77843_chg_input_ua(c09) / 1000,
++		 ((c06 & MAX77843_CNFG06_PROT_MASK) >> 2) == 0x3 ?
++			"unlocked" : "LOCKED",
++		 intok, !!(intok & 0x40), !!(intok & 0x20), !!(intok & 0x10),
++		 !!(intok & 0x08), !!(intok & 0x04));
++
++	if (regmap_read(chg->regmap, MAX77843_CHG_REG_CHG_DTLS_00, &d00) ||
++	    regmap_read(chg->regmap, MAX77843_CHG_REG_CHG_DTLS_01, &d01))
++		return;
++
++	dev_info(chg->dev,
++		 "DSH-CHG %s detail: VBUS=%s | charge_state=%s | battery=%s | "
++		 "MUIC_chg_type=%d(%s)\n",
++		 why,
++		 (((d00 & MAX77843_CHGIN_DTLS_MASK) >>
++		   MAX77843_CHGIN_DTLS_SHIFT) == MAX77843_CHGIN_DTLS_VALID) ?
++			"valid" : "absent/invalid",
++		 max77843_chg_state_str(d01),
++		 max77843_chg_bat_state_str(d01),
++		 type, (type >= 0 && type < ARRAY_SIZE(max77843_muic_chg_name)) ?
++			max77843_muic_chg_name[type] : "unknown");
++
++	max77843_chg_dump_fg_current();
++}
++
++/* ---- controlled writes ------------------------------------------------ */
++
++static int max77843_chg_unlock(struct max77843_charger *chg)
++{
++	unsigned int v;
++	int i, ret;
++
++	for (i = 0; i < 10; i++) {
++		ret = regmap_read(chg->regmap,
++				  MAX77843_CHG_REG_CHG_CNFG_06, &v);
++		if (ret)
++			return ret;
++		if (((v & MAX77843_CNFG06_PROT_MASK) >> 2) == 0x3) {
++			dev_info(chg->dev,
++				 "DSH-CHG write protection unlocked (CHG_CNFG_06=0x%02x)\n",
++				 v);
++			return 0;
++		}
++		dev_warn(chg->dev,
++			 "DSH-CHG CHG_CNFG_06=0x%02x is locked, writing unlock\n",
++			 v);
++		ret = regmap_write(chg->regmap,
++				   MAX77843_CHG_REG_CHG_CNFG_06,
++				   (v & ~MAX77843_CNFG06_PROT_MASK) |
++				   MAX77843_CNFG06_PROT_UNLOCK);
++		if (ret)
++			return ret;
++		msleep(20);
++	}
++
++	dev_err(chg->dev,
++		"DSH-CHG cannot unlock charger write protection (CHG_CNFG_06)\n");
++	return -EIO;
++}
++
++static int max77843_chg_kick_wdt(struct max77843_charger *chg)
++{
++	unsigned int v;
++	int ret;
++
++	ret = regmap_read(chg->regmap, MAX77843_CHG_REG_CHG_CNFG_06, &v);
++	if (ret)
++		return ret;
++	v = (v & ~MAX77843_CNFG06_WDTCLR_MASK) | MAX77843_CNFG06_WDTCLR;
++	return regmap_write(chg->regmap, MAX77843_CHG_REG_CHG_CNFG_06, v);
++}
++
++/* write one register field, read it back, retry once after re-unlock */
++static int max77843_chg_write_verify(struct max77843_charger *chg, u8 reg,
++				     const char *name, unsigned int val,
++				     unsigned int mask)
++{
++	unsigned int rb;
++	int i, ret;
++
++	for (i = 0; i < 2; i++) {
++		ret = regmap_write(chg->regmap, reg, val);
++		if (ret) {
++			dev_err(chg->dev,
++				"DSH-CHG W %s [0x%02x]=0x%02x failed: %d\n",
++				name, reg, val, ret);
++			return ret;
++		}
++		usleep_range(1000, 2000);
++		ret = regmap_read(chg->regmap, reg, &rb);
++		if (ret)
++			return ret;
++		if ((rb & mask) == (val & mask)) {
++			dev_info(chg->dev,
++				 "DSH-CHG W %s [0x%02x] = 0x%02x (readback 0x%02x) OK\n",
++				 name, reg, val, rb);
++			return 0;
++		}
++		dev_warn(chg->dev,
++			 "DSH-CHG W %s [0x%02x] wrote 0x%02x but read 0x%02x (try %d)\n",
++			 name, reg, val, rb, i + 1);
++		max77843_chg_unlock(chg);
++	}
++
++	dev_err(chg->dev,
++		"DSH-CHG W %s [0x%02x] verify failed (write protected?)\n",
++		name, reg);
++	return -EIO;
++}
++
++static int max77843_chg_disable(struct max77843_charger *chg)
++{
++	unsigned int v;
++	int ret;
++
++	ret = max77843_chg_unlock(chg);
++	if (ret)
++		return ret;
++
++	ret = regmap_read(chg->regmap, MAX77843_CHG_REG_CHG_CNFG_00, &v);
++	if (ret)
++		return ret;
++	v &= ~MAX77843_CNFG00_CHG;
++
++	ret = max77843_chg_write_verify(chg, MAX77843_CHG_REG_CHG_CNFG_00,
++					"CHG_CNFG_00 chg-off", v,
++					MAX77843_CNFG00_CHG);
++	if (ret)
++		return ret;
++
++	dev_info(chg->dev, "DSH-CHG charging DISABLED (CHG_EN=0)\n");
++	max77843_chg_dump_decoded(chg, "after-disable");
++	power_supply_changed(chg->psy);
++	return 0;
++}
++
++/*
++ * Apply the charging configuration and enable charging.
++ * force_full == false: safe bring-up (500 mA caps, or MUIC-type aware caps).
++ * force_full == true:  use the configured fast/input/float values (DCP only;
++ *                      a 500 mA-class MUIC type still gets capped for safety).
++ */
++static int max77843_chg_apply(struct max77843_charger *chg, bool force_full)
++{
++	int fast_ua = clamp(fast_chg_ma * 1000, 100000, 3150000);
++	int input_ua = clamp(input_limit_ma * 1000, 100000, 4000000);
++	int float_uv = clamp(float_mv * 1000, 3650000, 4700000);
++	bool cap500 = safe_bringup && !force_full;
++	int muic_type, ret;
++	unsigned int c00;
++
++	dev_info(chg->dev,
++		 "DSH-CHG apply start: charge_enable=%d force_full=%d safe_bringup=%d\n",
++		 charge_enable, force_full, safe_bringup);
++	max77843_chg_dump_decoded(chg, "before-apply");
++
++	muic_type = max77843_chg_muic_type(chg);
++	dev_info(chg->dev, "DSH-CHG MUIC charger type: %d(%s)\n", muic_type,
++		 (muic_type >= 0 &&
++		  muic_type < ARRAY_SIZE(max77843_muic_chg_name)) ?
++			max77843_muic_chg_name[muic_type] : "unknown");
++
++	/* DSH: 强制忽略 MUIC 限流时跳过下面所有 cap */
++	if (ignore_muic_cap) {
++		dev_warn(chg->dev,
++			 "DSH-CHG ignore_muic_cap=1: bypassing MUIC charger-type caps, using configured %d mA input\n",
++			 input_ua / 1000);
++		muic_type = MAX77843_MUIC_CHG_DEDICATED;
++	}
++
++	/* Never over-draw a host/PC USB port, whatever was configured */
++	if (muic_type < 0 || muic_type == MAX77843_MUIC_CHG_USB ||
++	    muic_type == MAX77843_MUIC_CHG_DOWNSTREAM ||
++	    muic_type == MAX77843_MUIC_CHG_SPECIAL_500MA ||
++	    muic_type == MAX77843_MUIC_CHG_NONE) {
++		if (force_full)
++			dev_warn(chg->dev,
++				 "DSH-CHG MUIC reports a 500mA-class/unknown port, capping to 500 mA\n");
++		cap500 = true;
++	} else if (muic_type == MAX77843_MUIC_CHG_SPECIAL_1A) {
++		fast_ua = min(fast_ua, MAX77843_SPECIAL_1A_FAST_UA);
++		input_ua = min(input_ua, MAX77843_SPECIAL_1A_INPUT_UA);
++		dev_info(chg->dev,
++			 "DSH-CHG MUIC SPECIAL-1A port, cap fast=%d mA input=%d mA\n",
++			 fast_ua / 1000, input_ua / 1000);
++	}
++
++	if (cap500) {
++		fast_ua = min(fast_ua, MAX77843_SAFE_FAST_UA);
++		input_ua = min(input_ua, MAX77843_SAFE_INPUT_UA);
++	}
++
++	dev_info(chg->dev,
++		 "DSH-CHG plan: input_limit=%d mA fast_chg=%d mA float=%d mV%s\n",
++		 input_ua / 1000, fast_ua / 1000, float_uv / 1000,
++		 cap500 ? " (SAFE 500 mA cap)" : "");
++
++	ret = max77843_chg_unlock(chg);
++	if (ret)
++		return ret;
++
++	/* Kick (and later disable) the charger watchdog: if it is enabled and
++	 * never kicked the MAX77843 suspends charging, which looks exactly
++	 * like "the phone does not charge". */
++	max77843_chg_kick_wdt(chg);
++
++	/* 1) input current limit first: never ask the source for too much */
++	ret = max77843_chg_write_verify(chg,
++					MAX77843_CHG_REG_CHG_CNFG_09,
++					"CHG_CNFG_09 input-limit",
++					max77843_chg_input_code(input_ua),
++					MAX77843_CHG_CHGIN_LIM_MASK);
++	if (ret)
++		return ret;
++
++	/* 2) fast charge current */
++	ret = max77843_chg_write_verify(chg,
++					MAX77843_CHG_REG_CHG_CNFG_02,
++					"CHG_CNFG_02 fast-charge",
++					max77843_chg_fast_code(fast_ua),
++					MAX77843_CHG_CC_MASK);
++	if (ret)
++		return ret;
++
++	/* 3) float voltage (keep MINVSYS bits) */
++	ret = max77843_chg_write_verify(chg,
++					MAX77843_CHG_REG_CHG_CNFG_04,
++					"CHG_CNFG_04 float-voltage",
++					max77843_chg_float_code(float_uv),
++					MAX77843_CHG_CC_MASK);
++	if (ret)
++		return ret;
++
++	/* 4) enable charging last: CHG_EN + BUCK, clear OTG/BOOST/WDTEN */
++	ret = regmap_read(chg->regmap, MAX77843_CHG_REG_CHG_CNFG_00, &c00);
++	if (ret)
++		return ret;
++	c00 |= MAX77843_CNFG00_CHG | MAX77843_CNFG00_BUCK;
++	c00 &= ~(MAX77843_CNFG00_OTG | MAX77843_CNFG00_BOOST |
++		 MAX77843_CNFG00_WDTEN);
++	ret = max77843_chg_write_verify(chg, MAX77843_CHG_REG_CHG_CNFG_00,
++					"CHG_CNFG_00 enable", c00,
++					MAX77843_CNFG00_MODE_MASK);
++	if (ret)
++		return ret;
++
++	/* give the charger a moment, then report what it actually does */
++	msleep(800);
++	max77843_chg_dump_regs(chg, "after-enable");
++	max77843_chg_dump_decoded(chg, "after-enable");
++	power_supply_changed(chg->psy);
++
++	dev_info(chg->dev,
++		 "DSH-CHG charging enabled: check that fuel-gauge current becomes positive and grows\n");
++	return 0;
++}
++
++/* ---- module parameters ------------------------------------------------ */
++
++static int max77843_chg_charge_enable_set(const char *val,
++					  const struct kernel_param *kp)
++{
++	bool enable;
++	int ret;
++
++	ret = kstrtobool(val, &enable);
++	if (ret)
++		return ret;
++
++	charge_enable = enable;
++	if (!enable) {
++		pr_info("max77843-charger: charge_enable=0 (no register write)\n");
++		return 0;
++	}
++
++	if (!dsh_chg) {
++		pr_info("max77843-charger: charge_enable=1 recorded, will apply at probe\n");
++		return 0;
++	}
++
++	ret = max77843_chg_apply(dsh_chg, false);
++	return ret;
++}
++
++static const struct kernel_param_ops max77843_chg_charge_enable_ops = {
++	.set = max77843_chg_charge_enable_set,
++	.get = param_get_bool,
++};
++
++static int max77843_chg_dump_set(const char *val,
++				 const struct kernel_param *kp)
++{
++	bool dump;
++	int ret;
++
++	ret = kstrtobool(val, &dump);
++	if (ret)
++		return ret;
++
++	dump_requested = dump;
++	if (dump && dsh_chg) {
++		max77843_chg_dump_regs(dsh_chg, "requested");
++		max77843_chg_dump_muic(dsh_chg, "requested");
++		max77843_chg_dump_decoded(dsh_chg, "requested");
++	}
++	return 0;
++}
++
++static const struct kernel_param_ops max77843_chg_dump_ops = {
++	.set = max77843_chg_dump_set,
++	.get = param_get_bool,
++};
++
++module_param_cb(charge_enable, &max77843_chg_charge_enable_ops,
++		&charge_enable, 0644);
++module_param_named(safe_bringup, safe_bringup, bool, 0644);
++module_param_named(ignore_muic_cap, ignore_muic_cap, bool, 0644);
++module_param_named(fast_chg_ma, fast_chg_ma, int, 0644);
++module_param_named(float_mv, float_mv, int, 0644);
++module_param_named(input_limit_ma, input_limit_ma, int, 0644);
++module_param_cb(dump, &max77843_chg_dump_ops, &dump_requested, 0644);
++
++/* ---- manual single-shot trigger (sysfs) ------------------------------ */
++
++static ssize_t charge_ctrl_store(struct device *dev,
++				 struct device_attribute *attr,
++				 const char *buf, size_t count)
++{
++	struct max77843_charger *chg = dsh_chg;
++	char cmd[24];
++	int ret = 0;
++
++	if (!chg)
++		return -ENODEV;
++
++	strscpy(cmd, buf, sizeof(cmd));
++	strim(cmd);
++	if (!cmd[0])
++		return -EINVAL;
++
++	if (!strcmp(cmd, "dump")) {
++		max77843_chg_dump_regs(chg, "cmd");
++		max77843_chg_dump_muic(chg, "cmd");
++		max77843_chg_dump_decoded(chg, "cmd");
++	} else if (!strcmp(cmd, "enable") || !strcmp(cmd, "safe")) {
++		ret = max77843_chg_apply(chg, false);
++	} else if (!strcmp(cmd, "full")) {
++		ret = max77843_chg_apply(chg, true);
++	} else if (!strcmp(cmd, "disable")) {
++		ret = max77843_chg_disable(chg);
++	} else if (!strcmp(cmd, "unlock")) {
++		ret = max77843_chg_unlock(chg);
++	} else if (!strcmp(cmd, "kick")) {
++		ret = max77843_chg_kick_wdt(chg);
++		dev_info(chg->dev, "DSH-CHG watchdog kicked: %d\n", ret);
++	} else {
++		dev_info(chg->dev,
++			 "DSH-CHG unknown command '%s' (dump|enable|safe|full|disable|unlock|kick)\n",
++			 cmd);
++		return -EINVAL;
++	}
++
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(charge_ctrl);
++
++static void max77843_chg_attr_cleanup(void *data)
++{
++	struct max77843_charger *chg = data;
++
++	if (chg->psy && !IS_ERR(chg->psy))
++		device_remove_file(&chg->psy->dev, &dev_attr_charge_ctrl);
++	dsh_chg = NULL;
++}
++
++/* ---- probe ------------------------------------------------------------ */
++
++static int max77843_chg_probe_common(struct device *dev,
++				     struct regmap *regmap,
++				     struct i2c_adapter *adapter)
++{
++	struct power_supply_desc *desc;
++	struct max77843_charger *chg;
++	int ret;
++	unsigned int reg;
++
++	chg = devm_kzalloc(dev, sizeof(*chg), GFP_KERNEL);
++	if (!chg)
++		return -ENOMEM;
++
++	chg->dev = dev;
++	chg->regmap = regmap;
++	dsh_chg = chg;
++
++	/* Sanity check: the charger block must answer at all */
++	ret = max77843_chg_read(chg, MAX77843_CHG_REG_CHG_INT_OK, &reg);
++	if (ret) {
++		dev_err(dev, "charger does not respond: %d\n", ret);
++		dsh_chg = NULL;
++		return -ENODEV;
++	}
++	dev_info(dev, "charger INT_OK=0x%02x\n", reg);
++
++	/* Optional MUIC client (0x25) for charger-type diagnostics */
++	max77843_chg_muic_init(chg, adapter);
++
++	desc = devm_kzalloc(dev, sizeof(*desc), GFP_KERNEL);
++	if (!desc)
++		return -ENOMEM;
++
++	desc->name = MAX77843_CHG_DRIVER_NAME;
++	desc->type = POWER_SUPPLY_TYPE_MAINS;
++	desc->properties = max77843_chg_props;
++	desc->num_properties = ARRAY_SIZE(max77843_chg_props);
++	desc->get_property = max77843_chg_get_property;
++
++	/*
++	 * DSH 2026-10-20 关键修复：必须传 drv_data！
++	 * 传 NULL 会让 psy->drv_data = NULL，get_property 里 chg->... 立即
++	 * NULL 解引用（实测在 power_supply_changed_work -> power_supply_update_leds
++	 * 路径启动 0.6 秒 Oops，并把 dwc3 gadget 断开一起带崩）。
++	 */
++	{
++		struct power_supply_config cfg = {
++			.drv_data = chg,
++		};
++
++		chg->psy = devm_power_supply_register(dev, desc, &cfg);
++	}
++	if (IS_ERR(chg->psy)) {
++		ret = PTR_ERR(chg->psy);
++		dev_err(dev, "failed to register power supply: %d\n", ret);
++		dsh_chg = NULL;
++		return ret;
++	}
++
++	/* Manual single-shot control via /sys/class/power_supply/.../charge_ctrl */
++	ret = device_create_file(&chg->psy->dev, &dev_attr_charge_ctrl);
++	if (ret) {
++		dev_warn(dev, "cannot create charge_ctrl attribute: %d\n", ret);
++	} else {
++		ret = devm_add_action_or_reset(dev, max77843_chg_attr_cleanup,
++					       chg);
++		if (ret)
++			return ret;
++	}
++
++	/* Read-only diagnostics: always safe, always printed */
++	max77843_chg_dump_regs(chg, "probe");
++	max77843_chg_dump_muic(chg, "probe");
++	max77843_chg_dump_decoded(chg, "probe");
++
++	if (charge_enable) {
++		dev_info(dev,
++			 "DSH-CHG charge_enable=1 (cmdline/module param): applying SAFE charging config\n");
++		max77843_chg_apply(chg, false);
++	}
++
++	dev_info(dev,
++		 "MAX77843 charger registered (read-only unless charge_enable=1)\n");
++	return 0;
++}
++
++/* ---------------------------------------------------------------------- */
++/* Binding (a): MAX77843 MFD cell / platform device                       */
++/* ---------------------------------------------------------------------- */
++
++static int max77843_chg_platform_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct max77693_dev *max77843;
++
++	if (!dev->parent)
++		return -ENODEV;
++
++	max77843 = dev_get_drvdata(dev->parent);
++	if (!max77843 || !max77843->regmap_chg)
++		return -EPROBE_DEFER;
++
++	return max77843_chg_probe_common(dev, max77843->regmap_chg,
++					 max77843->i2c ?
++						max77843->i2c->adapter : NULL);
++}
++
++static int max77843_chg_platform_remove(struct platform_device *pdev)
++{
++	return 0;
++}
++
++static const struct of_device_id max77843_chg_of_match[] = {
++	{ .compatible = "maxim,max77843-charger" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, max77843_chg_of_match);
++
++static struct platform_driver max77843_chg_platform_driver = {
++	.probe = max77843_chg_platform_probe,
++	.remove = max77843_chg_platform_remove,
++	.driver = {
++		.name = MAX77843_CHG_DRIVER_NAME,
++		.of_match_table = max77843_chg_of_match,
++	},
++};
++
++/* ---------------------------------------------------------------------- */
++/* Binding (b): direct I2C device ("charger@69")                          */
++/* ---------------------------------------------------------------------- */
++
++static const struct regmap_config max77843_chg_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = 0xff,
++};
++
++static int max77843_chg_i2c_probe(struct i2c_client *client)
++{
++	struct regmap *regmap;
++
++	regmap = devm_regmap_init_i2c(client, &max77843_chg_regmap_config);
++	if (IS_ERR(regmap))
++		return dev_err_probe(&client->dev, PTR_ERR(regmap),
++				     "failed to init regmap\n");
++
++	return max77843_chg_probe_common(&client->dev, regmap,
++					 client->adapter);
++}
++
++static const struct i2c_device_id max77843_chg_i2c_id[] = {
++	{ MAX77843_CHG_DRIVER_NAME, 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, max77843_chg_i2c_id);
++
++static struct i2c_driver max77843_chg_i2c_driver = {
++	.driver = {
++		.name = MAX77843_CHG_DRIVER_NAME,
++		.of_match_table = max77843_chg_of_match,
++	},
++	.probe = max77843_chg_i2c_probe,
++	.id_table = max77843_chg_i2c_id,
++};
++
++static int __init max77843_chg_init(void)
++{
++	int ret;
++
++	ret = platform_driver_register(&max77843_chg_platform_driver);
++	if (ret)
++		return ret;
++
++	ret = i2c_add_driver(&max77843_chg_i2c_driver);
++	if (ret)
++		platform_driver_unregister(&max77843_chg_platform_driver);
++
++	return ret;
++}
++module_init(max77843_chg_init);
++
++static void __exit max77843_chg_exit(void)
++{
++	i2c_del_driver(&max77843_chg_i2c_driver);
++	platform_driver_unregister(&max77843_chg_platform_driver);
++}
++module_exit(max77843_chg_exit);
++
++MODULE_AUTHOR("Samsung Electronics");
++MODULE_DESCRIPTION("MAX77843 charger driver (read-only by default, opt-in charging control)");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/power/supply/max77843_fuelgauge.c b/drivers/power/supply/max77843_fuelgauge.c
+new file mode 100644
+index 000000000..e0b466307
+--- /dev/null
++++ b/drivers/power/supply/max77843_fuelgauge.c
+@@ -0,0 +1,392 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Fuel gauge driver for the Maxim MAX77843 companion PMIC
++ *
++ * The MAX77843 fuel gauge block is register compatible with the MAX17050
++ * (ModelGauge m3) family, but it sits behind a *separate* I2C slave
++ * address (0x36) of the MAX77843.  The vendor 3.10 kernel created that
++ * I2C client from the MAX77843 MFD core; mainline never did, so this
++ * driver can bind either way:
++ *
++ *  a) as a platform driver on the MAX77843 MFD cell
++ *     ("max77843-fuelgauge", compatible "maxim,max77843-fuelgauge") and
++ *     create the 0x36 I2C client itself, or
++ *  b) directly as an I2C driver for a "fuelgauge@36" device node.
++ *
++ * All values are read on demand; no register is written, so this driver
++ * cannot disturb the charging configuration left by the bootloader.
++ *
++ * Register layout / data formats are taken from the Samsung universal7420
++ * 3.10 driver (drivers/battery/max77843_fuelgauge.c).
++ */
++
++#include <linux/i2c.h>
++#include <linux/mfd/core.h>
++#include <linux/mfd/max77693-common.h>
++#include <linux/mfd/max77843-private.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++
++#define MAX77843_FG_DRIVER_NAME	"max77843-fuelgauge"
++
++/* Voltage LSB: 78.125 uV */
++#define MAX77843_FG_VCELL_LSB_NV	78125
++/* Current LSB: 1.5625 uV / 0.01 Ohm = 156.25 uA */
++#define MAX77843_FG_CURRENT_LSB_NA	15625
++/* Full capacity LSB: 0.5 mAh = 500 uAh */
++#define MAX77843_FG_FULLCAP_LSB_UAH	500
++
++/**
++ * struct max77843_fg - fuel gauge device state
++ * @dev: device owning this instance (platform or i2c device)
++ * @client: I2C client of the fuel gauge block (address 0x36)
++ * @battery: registered power supply
++ * @lock: serializes register accesses
++ */
++struct max77843_fg {
++	struct device *dev;
++	struct i2c_client *client;
++	struct power_supply *battery;
++	struct mutex lock;
++};
++
++static int max77843_fg_read_word(struct max77843_fg *fg, u8 reg)
++{
++	int ret;
++
++	mutex_lock(&fg->lock);
++	ret = i2c_smbus_read_word_data(fg->client, reg);
++	mutex_unlock(&fg->lock);
++
++	if (ret < 0)
++		dev_err_ratelimited(fg->dev,
++				    "failed to read register 0x%02x: %d\n",
++				    reg, ret);
++	return ret;
++}
++
++/*
++ * The gauge returns 16-bit values in SMBus word order (LSB first), which is
++ * exactly what i2c_smbus_read_word_data() gives us.
++ */
++static int max77843_fg_read_vcell(struct max77843_fg *fg, int *val)
++{
++	int raw = max77843_fg_read_word(fg, MAX77843_FG_REG_VCELL);
++
++	if (raw < 0)
++		return raw;
++
++	*val = DIV_ROUND_CLOSEST((u64)raw * MAX77843_FG_VCELL_LSB_NV, 1000);
++	return 0;
++}
++
++static int max77843_fg_read_current(struct max77843_fg *fg, int *val)
++{
++	int raw = max77843_fg_read_word(fg, MAX77843_FG_REG_CURRENT);
++	s16 ichg;
++
++	if (raw < 0)
++		return raw;
++
++	ichg = (s16)raw;
++	*val = DIV_ROUND_CLOSEST((s64)ichg * MAX77843_FG_CURRENT_LSB_NA, 100);
++	return 0;
++}
++
++static int max77843_fg_read_avg_current(struct max77843_fg *fg, int *val)
++{
++	int raw = max77843_fg_read_word(fg, MAX77843_FG_REG_AVG_CURRENT);
++	s16 ichg;
++
++	if (raw < 0)
++		return raw;
++
++	ichg = (s16)raw;
++	*val = DIV_ROUND_CLOSEST((s64)ichg * MAX77843_FG_CURRENT_LSB_NA, 100);
++	return 0;
++}
++
++static int max77843_fg_read_temp(struct max77843_fg *fg, int *val)
++{
++	int raw = max77843_fg_read_word(fg, MAX77843_FG_REG_TEMP);
++	s16 temp;
++
++	if (raw < 0)
++		return raw;
++
++	/* 16-bit two's complement, LSB = 1/256 degC, result in 0.1 degC */
++	temp = (s16)raw;
++	*val = DIV_ROUND_CLOSEST((s64)temp * 10, 256);
++	return 0;
++}
++
++static int max77843_fg_read_soc(struct max77843_fg *fg, int *val)
++{
++	int raw = max77843_fg_read_word(fg, MAX77843_FG_REG_SOCREP);
++	int soc;
++
++	if (raw < 0)
++		return raw;
++
++	/* high byte = integer percent, low byte = 1/256 percent */
++	soc = DIV_ROUND_CLOSEST(raw, 256);
++	*val = clamp(soc, 0, 100);
++	return 0;
++}
++
++static int max77843_fg_read_fullcap(struct max77843_fg *fg, u8 reg, int *val)
++{
++	int raw = max77843_fg_read_word(fg, reg);
++
++	if (raw < 0)
++		return raw;
++
++	*val = raw * MAX77843_FG_FULLCAP_LSB_UAH;
++	return 0;
++}
++
++static int max77843_fg_get_status(struct max77843_fg *fg, int *val)
++{
++	struct power_supply *chg;
++	union power_supply_propval prop;
++	int ret, ichg;
++
++	/* Prefer the charger driver's view when it is available */
++	chg = power_supply_get_by_name("max77843-charger");
++	if (chg) {
++		ret = power_supply_get_property(chg,
++						POWER_SUPPLY_PROP_STATUS,
++						&prop);
++		power_supply_put(chg);
++		if (!ret) {
++			*val = prop.intval;
++			return 0;
++		}
++	}
++
++	/* Fallback: derive it from the measured current */
++	ret = max77843_fg_read_current(fg, &ichg);
++	if (ret)
++		return ret;
++
++	if (ichg > 100000)
++		*val = POWER_SUPPLY_STATUS_CHARGING;
++	else if (ichg < -100000)
++		*val = POWER_SUPPLY_STATUS_DISCHARGING;
++	else
++		*val = POWER_SUPPLY_STATUS_FULL;
++
++	return 0;
++}
++
++static int max77843_fg_get_property(struct power_supply *psy,
++				    enum power_supply_property psp,
++				    union power_supply_propval *val)
++{
++	struct max77843_fg *fg = power_supply_get_drvdata(psy);
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_STATUS:
++		return max77843_fg_get_status(fg, &val->intval);
++	case POWER_SUPPLY_PROP_PRESENT:
++		/*
++		 * The gauge only powers up with a battery attached (this
++		 * driver is running from that battery), so report present.
++		 */
++		val->intval = 1;
++		return 0;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
++		return 0;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		return max77843_fg_read_soc(fg, &val->intval);
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		return max77843_fg_read_vcell(fg, &val->intval);
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		return max77843_fg_read_current(fg, &val->intval);
++	case POWER_SUPPLY_PROP_CURRENT_AVG:
++		return max77843_fg_read_avg_current(fg, &val->intval);
++	case POWER_SUPPLY_PROP_TEMP:
++		return max77843_fg_read_temp(fg, &val->intval);
++	case POWER_SUPPLY_PROP_CHARGE_FULL:
++		return max77843_fg_read_fullcap(fg, MAX77843_FG_REG_FULLCAP,
++						&val->intval);
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		return max77843_fg_read_fullcap(fg,
++						MAX77843_FG_REG_FULLCAP_NOM,
++						&val->intval);
++	default:
++		return -EINVAL;
++	}
++}
++
++static enum power_supply_property max77843_fg_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_CURRENT_AVG,
++	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_CHARGE_FULL,
++	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++};
++
++static int max77843_fg_probe_common(struct device *dev,
++				    struct i2c_client *client)
++{
++	struct power_supply_desc *desc;
++	struct max77843_fg *fg;
++	int ret, raw;
++
++	fg = devm_kzalloc(dev, sizeof(*fg), GFP_KERNEL);
++	if (!fg)
++		return -ENOMEM;
++
++	fg->dev = dev;
++	fg->client = client;
++	mutex_init(&fg->lock);
++
++	/* Sanity check: the gauge must answer at all */
++	raw = max77843_fg_read_word(fg, MAX77843_FG_REG_STATUS);
++	if (raw < 0) {
++		dev_err(dev, "fuel gauge does not respond: %d\n", raw);
++		return -ENODEV;
++	}
++	dev_info(dev, "fuel gauge status=0x%04x\n", raw);
++
++	desc = devm_kzalloc(dev, sizeof(*desc), GFP_KERNEL);
++	if (!desc)
++		return -ENOMEM;
++
++	desc->name = MAX77843_FG_DRIVER_NAME;
++	desc->type = POWER_SUPPLY_TYPE_BATTERY;
++	desc->properties = max77843_fg_props;
++	desc->num_properties = ARRAY_SIZE(max77843_fg_props);
++	desc->get_property = max77843_fg_get_property;
++
++	/*
++	 * DSH 2026-10-20 关键修复：必须传 drv_data（同 charger 驱动）。
++	 * 传 NULL 会让 psy->drv_data 为 NULL，get_property 里 fg->... 
++	 * 立即 NULL 解引用（power_supply_changed_work → get_property 路径）。
++	 */
++	{
++		struct power_supply_config cfg = {
++			.drv_data = fg,
++		};
++
++		fg->battery = devm_power_supply_register(dev, desc, &cfg);
++	}
++	if (IS_ERR(fg->battery)) {
++		ret = PTR_ERR(fg->battery);
++		dev_err(dev, "failed to register power supply: %d\n", ret);
++		return ret;
++	}
++
++	dev_info(dev, "MAX77843 fuel gauge registered\n");
++	return 0;
++}
++
++/* ---------------------------------------------------------------------- */
++/* Binding (a): MAX77843 MFD cell / platform device                       */
++/* ---------------------------------------------------------------------- */
++
++static int max77843_fg_platform_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct max77693_dev *max77843;
++	struct i2c_client *client;
++
++	if (!dev->parent)
++		return -ENODEV;
++
++	max77843 = dev_get_drvdata(dev->parent);
++	if (!max77843 || !max77843->i2c)
++		return -EPROBE_DEFER;
++
++	/* The gauge block lives at its own I2C address on the same bus */
++	client = devm_i2c_new_dummy_device(dev, max77843->i2c->adapter,
++					   I2C_ADDR_FG);
++	if (IS_ERR(client))
++		return dev_err_probe(dev, PTR_ERR(client),
++				     "cannot create I2C client for FG block\n");
++
++	return max77843_fg_probe_common(dev, client);
++}
++
++static int max77843_fg_platform_remove(struct platform_device *pdev)
++{
++	return 0;
++}
++
++static const struct of_device_id max77843_fg_of_match[] = {
++	{ .compatible = "maxim,max77843-fuelgauge" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, max77843_fg_of_match);
++
++static struct platform_driver max77843_fg_platform_driver = {
++	.probe = max77843_fg_platform_probe,
++	.remove = max77843_fg_platform_remove,
++	.driver = {
++		.name = MAX77843_FG_DRIVER_NAME,
++		.of_match_table = max77843_fg_of_match,
++	},
++};
++
++/* ---------------------------------------------------------------------- */
++/* Binding (b): direct I2C device ("fuelgauge@36")                        */
++/* ---------------------------------------------------------------------- */
++
++static int max77843_fg_i2c_probe(struct i2c_client *client)
++{
++	return max77843_fg_probe_common(&client->dev, client);
++}
++
++static const struct i2c_device_id max77843_fg_i2c_id[] = {
++	{ MAX77843_FG_DRIVER_NAME, 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, max77843_fg_i2c_id);
++
++static struct i2c_driver max77843_fg_i2c_driver = {
++	.driver = {
++		.name = MAX77843_FG_DRIVER_NAME,
++		.of_match_table = max77843_fg_of_match,
++	},
++	.probe = max77843_fg_i2c_probe,
++	.id_table = max77843_fg_i2c_id,
++};
++
++static int __init max77843_fg_init(void)
++{
++	int ret;
++
++	ret = platform_driver_register(&max77843_fg_platform_driver);
++	if (ret)
++		return ret;
++
++	ret = i2c_add_driver(&max77843_fg_i2c_driver);
++	if (ret)
++		platform_driver_unregister(&max77843_fg_platform_driver);
++
++	return ret;
++}
++module_init(max77843_fg_init);
++
++static void __exit max77843_fg_exit(void)
++{
++	i2c_del_driver(&max77843_fg_i2c_driver);
++	platform_driver_unregister(&max77843_fg_platform_driver);
++}
++module_exit(max77843_fg_exit);
++
++MODULE_AUTHOR("Samsung Electronics");
++MODULE_DESCRIPTION("MAX77843 fuel gauge driver");
++MODULE_LICENSE("GPL v2");

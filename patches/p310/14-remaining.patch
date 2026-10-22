@@ -1,0 +1,1662 @@
+diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-gpio-test.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-gpio-test.dts
+new file mode 100644
+index 000000000..12ebc64c7
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-gpio-test.dts
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Diagnostic candidate A: PERIC1 oscillator bypass and an empty GPIO bus.
++ * No touchscreen or PMIC transaction is requested by this variant.
++ * CMU_PERIC1 accessibility itself still requires a hardware test.
++ */
++#include "exynos7420-zeroflte.dts"
++
++&clock_peric1 {
++	status = "okay";
++	/* Do not depend on disabled TOP0. Only the bus oscillator input
++	 * is exercised; UART/SPI/audio clocks remain unused in this test.
++	 */
++	clocks = <&fin_pll>, <&fin_pll>, <&fin_pll>, <&fin_pll>,
++		 <&fin_pll>, <&fin_pll>, <&fin_pll>, <&fin_pll>,
++		 <&fin_pll>, <&fin_pll>, <&fin_pll>, <&fin_pll>, <&fin_pll>;
++	assigned-clocks = <&clock_peric1 MOUT_ACLK_PERIC1_66_USER>;
++	assigned-clock-parents = <&fin_pll>;
++};
++
++/ {
++	tsp_gpio_test: i2c-tsp {
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpj1 0 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpj1 1 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		i2c-gpio,timeout-ms = <100>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		/* No default pinctrl state: existing get_sda/get_scl diagnostic
++		 * checkpoints run before GPIO direction changes touch GPJ1.
++		 */
++	};
++};
+diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-power-test.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-power-test.dts
+new file mode 100644
+index 000000000..081f97027
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-power-test.dts
+@@ -0,0 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Diagnostic candidate B: real supplies, without accessing GPJ1. */
++#include "exynos7420-zeroflte.dts"
++#include "exynos7420-zeroflte-touch-power.dtsi"
+diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-test.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-test.dts
+new file mode 100644
+index 000000000..e112fb2a2
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte-touch-test.dts
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Combined candidate, for use only after A and B have passed separately. */
++#include "exynos7420-zeroflte-touch-gpio-test.dts"
++#include "exynos7420-zeroflte-touch-power.dtsi"
++
++&tsp_gpio_test {
++	touchscreen@49 {
++		compatible = "st,stmfts";
++		reg = <0x49>;
++		interrupt-parent = <&gpa1>;
++		interrupts = <6 IRQ_TYPE_LEVEL_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&tsp_attn_pin>;
++		vdd-supply = <&tsp_io_ldo15>;
++		avdd-supply = <&tsp_avdd_ldo17>;
++		touchscreen-size-x = <4096>;
++		touchscreen-size-y = <4096>;
++	};
++};
+diff --git a/drivers/clk/clk.c b/drivers/clk/clk.c
+index 473563bc7..2b869fa79 100644
+--- a/drivers/clk/clk.c
++++ b/drivers/clk/clk.c
+@@ -3308,7 +3308,22 @@ static int clk_dump_show(struct seq_file *s, void *data)
+ }
+ DEFINE_SHOW_ATTRIBUTE(clk_dump);
+ 
+-#undef CLOCK_ALLOW_WRITE_DEBUGFS
++/*
++ * DSH 2026-10-23: 打开时钟 debugfs 写入能力（clk_rate / clk_parent /
++ * clk_prepare_enable 变为可写）。
++ *
++ * 上游这里是 #undef，注释写着 "This can be dangerous, therefore don't
++ * provide any real compile time configuration option for this feature.
++ * People who want to use this will need to modify the source code directly."
++ * 我们正是按它说的做法，在本树里直接改源码打开。
++ *
++ * 用途：Exynos7420 GPU 的 aclk_g3d 频率只能通过 CMU_G3D 的 PLL 改，
++ * 打开后可以用
++ *   echo 160000000 > /sys/kernel/debug/clk/aclk_g3d/clk_rate
++ * 做受控的频率实验，不需要额外的内核态调频驱动。
++ * 不写它就完全等同于上游行为。
++ */
++#define CLOCK_ALLOW_WRITE_DEBUGFS
+ #ifdef CLOCK_ALLOW_WRITE_DEBUGFS
+ /*
+  * This can be dangerous, therefore don't provide any real compile time
+diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch_timer.c
+index 7dd2c615b..a267b4dee 100644
+--- a/drivers/clocksource/arm_arch_timer.c
++++ b/drivers/clocksource/arm_arch_timer.c
+@@ -22,6 +22,7 @@
+ #include <linux/of_irq.h>
+ #include <linux/of_address.h>
+ #include <linux/io.h>
++#include <linux/math64.h>
+ #include <linux/slab.h>
+ #include <linux/sched/clock.h>
+ #include <linux/sched_clock.h>
+@@ -515,6 +516,57 @@ static const struct arch_timer_erratum_workaround ool_workarounds[] = {
+ 		.disable_compat_vdso = true,
+ 	},
+ #endif
++#ifdef CONFIG_ARM64
++	/*
++	 * DSH: Exynos7420 (SM-G9209 / zeroflte) -- broken firmware and CNTVOFF.
++	 *
++	 * The boot chain (S-Boot/secure monitor -> uniLoader -> kernel) enters
++	 * Linux at EL1 on every CPU and never programs CNTVOFF_EL2.  An arm64
++	 * kernel only clears CNTVOFF in __init_el2_timers (el2_setup.h), i.e.
++	 * when it is entered at EL2; CNTVOFF itself is writable only from EL2,
++	 * so at EL1 the kernel cannot fix it up.
++	 *
++	 * With mainline's "booted at EL1 -> use CNTVCT" policy every CPU then
++	 * reads a virtual counter carrying its own random offset (arm64
++	 * booting.rst requires CNTVOFF to be programmed with a consistent
++	 * value by the firmware when entering the kernel at EL1).
++	 *
++	 * Consequences: sched_clock()/printk timestamps differ per CPU, and
++	 * the timekeeper's global cycle_last is updated in one CPU's counter
++	 * domain while other CPUs read theirs, producing multi-second and
++	 * even 2^56-cycle time jumps (after which no hrtimer fires again).
++	 *
++	 * The vendor DT describes exactly this hardware: the arch timer is
++	 * "use-clocksource-only; use-physical-timer" and the MCT is
++	 * "use-clockevent-only".  The architected system counter read through
++	 * CNTPCT is global (the system counter is shared by all CPUs), so
++	 * pretending to be a counter-read erratum makes the OOL workaround
++	 * framework redirect the "virtual" read to CNTPCT, use the stable
++	 * (out-of-line) accessors and disable the vDSO fast path (see
++	 * arch_timer_enable_workaround(): it clears vdso_clock_mode whenever
++	 * ->read_cntvct_el0 is set, because the arm64 vDSO always reads
++	 * CNTVCT).
++	 *
++	 * Matching is done on the timer node itself (arch_timer_of_init() ->
++	 * arch_timer_check_ool_workaround(ate_match_dt, np)), so the property
++	 * has to live in the /timer node.  uniLoader already injects
++	 * "arm,cpu-registers-not-fw-configured" there and the zeroflte board
++	 * DTS sets it too; "use-physical-timer" is accepted as an alias so the
++	 * stock/vendor DTB keeps working unchanged.
++	 */
++	{
++		.match_type = ate_match_dt,
++		.id = "arm,cpu-registers-not-fw-configured",
++		.desc = "DSH: broken Exynos7420 firmware (CNTVOFF not configured)",
++		.read_cntvct_el0 = arch_counter_get_cntpct,
++	},
++	{
++		.match_type = ate_match_dt,
++		.id = "use-physical-timer",
++		.desc = "DSH: broken Exynos7420 firmware (CNTVOFF not configured)",
++		.read_cntvct_el0 = arch_counter_get_cntpct,
++	},
++#endif
+ };
+ 
+ typedef bool (*ate_match_fn_t)(const struct arch_timer_erratum_workaround *,
+@@ -1004,6 +1056,28 @@ static int arch_timer_starting_cpu(unsigned int cpu)
+ 	struct clock_event_device *clk = this_cpu_ptr(arch_timer_evt);
+ 	u32 flags;
+ 
++#ifdef CONFIG_ARM64
++	/*
++	 * DSH diagnostic (Exynos7420): S-Boot/secure monitor enters the
++	 * kernel at EL1 and never programs CNTVOFF_EL2, so (CNTVCT - CNTPCT)
++	 * is a per-CPU, essentially random offset -- the root cause of the
++	 * wild printk timestamps.  The workaround above makes the kernel
++	 * clock use the global CNTPCT, so these lines stay constant relative
++	 * to each other; the raw deltas are the proof of the broken virtual
++	 * offset.  Read-only registers, no functional effect.
++	 */
++	{
++		u64 vct = read_sysreg(cntvct_el0);
++		u64 pct = read_sysreg(cntpct_el0);
++		s64 off = (s64)(vct - pct);
++
++		pr_info("DSH: CPU%u CNTVCT=%llu CNTPCT=%llu CNTVOFF_implied=%lld ticks (~%lld ms)\n",
++			cpu, vct, pct, off,
++			arch_timer_rate > 1000 ?
++				div_s64(off, arch_timer_rate / 1000) : -1);
++	}
++#endif
++
+ 	__arch_timer_setup(ARCH_TIMER_TYPE_CP15, clk);
+ 
+ 	flags = check_ppi_trigger(arch_timer_ppi[arch_timer_uses_ppi]);
+diff --git a/drivers/clocksource/exynos_mct.c b/drivers/clocksource/exynos_mct.c
+index ef8cb1b71..cae590590 100644
+--- a/drivers/clocksource/exynos_mct.c
++++ b/drivers/clocksource/exynos_mct.c
+@@ -471,6 +471,10 @@ static int exynos4_mct_starting_cpu(unsigned int cpu)
+ 	evt->features = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT |
+ 			CLOCK_EVT_FEAT_PERCPU;
+ 	evt->rating = MCT_CLKEVENTS_RATING;
++	/* The stock zeroflte firmware uses MCT for clockevents. Prefer it to
++	 * the architectural timer (450) while retaining arch counter reads. */
++	if (of_machine_is_compatible("samsung,zeroflte"))
++		evt->rating = 500;
+ 
+ 	exynos4_mct_write(TICK_BASE_CNT, mevt->base + MCT_L_TCNTB_OFFSET);
+ 
+diff --git a/drivers/gpu/drm/exynos/exynos_drm_drv.h b/drivers/gpu/drm/exynos/exynos_drm_drv.h
+index 81d501efd..126904316 100644
+--- a/drivers/gpu/drm/exynos/exynos_drm_drv.h
++++ b/drivers/gpu/drm/exynos/exynos_drm_drv.h
+@@ -227,6 +227,19 @@ void exynos_drm_unregister_dma(struct drm_device *drm, struct device *dev,
+ 			       void **dma_priv);
+ void exynos_drm_cleanup_dma(struct drm_device *drm);
+ 
++#if IS_ENABLED(CONFIG_EXYNOS_IOMMU)
++void exynos_iommu_master_ready(struct device *master);
++int exynos_iommu_map_identity(struct device *master, phys_addr_t phys,
++			      size_t size);
++#else
++static inline void exynos_iommu_master_ready(struct device *master) { }
++static inline int exynos_iommu_map_identity(struct device *master,
++					    phys_addr_t phys, size_t size)
++{
++	return -ENODEV;
++}
++#endif
++
+ #ifdef CONFIG_DRM_EXYNOS_DPI
+ struct drm_encoder *exynos_dpi_probe(struct device *dev);
+ int exynos_dpi_remove(struct drm_encoder *encoder);
+diff --git a/drivers/gpu/drm/exynos/regs-decon7.h b/drivers/gpu/drm/exynos/regs-decon7.h
+index 5bc5f1db5..50c63e6a8 100644
+--- a/drivers/gpu/drm/exynos/regs-decon7.h
++++ b/drivers/gpu/drm/exynos/regs-decon7.h
+@@ -220,6 +220,9 @@
+ 
+ /* Interrupt control register */
+ #define VIDINTCON0				0x500
++/* DSH 2026-10-20: i80 命令模式中断使能（vendor regs-decon.h 同款位） */
++#define VIDINTCON0_INT_I80_EN		(1 << 17)
++
+ 
+ #define VIDINTCON0_WAKEUP_MASK			(0x3f << 26)
+ #define VIDINTCON0_INTEXTRAEN			(1 << 21)
+diff --git a/drivers/gpu/drm/tiny/simpledrm-g9209-copy.h b/drivers/gpu/drm/tiny/simpledrm-g9209-copy.h
+new file mode 100644
+index 000000000..acd5c5188
+--- /dev/null
++++ b/drivers/gpu/drm/tiny/simpledrm-g9209-copy.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef SIMPLEDRM_G9209_COPY_H
++#define SIMPLEDRM_G9209_COPY_H
++
++/* AArch64 general registers only: no kernel SIMD/FPSIMD state is touched.
++ * Both mappings must be Normal memory (including Normal-NC/write-combined
++ * framebuffer RAM), never Device MMIO. Pointers must be 32-bit aligned.
++ * Read each source pixel once and force opaque alpha while streaming to dst.
++ */
++static inline void simpledrm_g9209_xrgb_to_argb(void *dst, const void *src,
++					      unsigned int pixels)
++{
++	unsigned long blocks = pixels / 8, tail = pixels % 8;
++	unsigned long a, b, c, d;
++
++	asm volatile (
++		"cbz %[blocks], 2f\n"
++		".p2align 4\n"
++		"1:\n"
++		"ldp %[a], %[b], [%[src]], #16\n"
++		"ldp %[c], %[d], [%[src]], #16\n"
++		"orr %[a], %[a], #0xff000000ff000000\n"
++		"orr %[b], %[b], #0xff000000ff000000\n"
++		"orr %[c], %[c], #0xff000000ff000000\n"
++		"orr %[d], %[d], #0xff000000ff000000\n"
++		"stp %[a], %[b], [%[dst]], #16\n"
++		"stp %[c], %[d], [%[dst]], #16\n"
++		"subs %[blocks], %[blocks], #1\n"
++		"b.ne 1b\n"
++		"2:\n"
++		"cbz %[tail], 4f\n"
++		"3:\n"
++		"ldr %w[a], [%[src]], #4\n"
++		"orr %w[a], %w[a], #0xff000000\n"
++		"str %w[a], [%[dst]], #4\n"
++		"subs %[tail], %[tail], #1\n"
++		"b.ne 3b\n"
++		"4:\n"
++		: [dst] "+&r" (dst), [src] "+&r" (src),
++		  [blocks] "+&r" (blocks), [tail] "+&r" (tail),
++		  [a] "=&r" (a), [b] "=&r" (b), [c] "=&r" (c), [d] "=&r" (d)
++		:
++		: "cc", "memory");
++}
++#endif
+diff --git a/drivers/gpu/drm/tiny/simpledrm.c b/drivers/gpu/drm/tiny/simpledrm.c
+index 8ea120eb8..ba47765b8 100644
+--- a/drivers/gpu/drm/tiny/simpledrm.c
++++ b/drivers/gpu/drm/tiny/simpledrm.c
+@@ -18,6 +18,7 @@
+ #include <drm/drm_drv.h>
+ #include <drm/drm_fbdev_generic.h>
+ #include <drm/drm_format_helper.h>
++#include <drm/drm_framebuffer.h>
+ #include <drm/drm_gem_atomic_helper.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_gem_shmem_helper.h>
+@@ -26,6 +27,10 @@
+ #include <drm/drm_plane_helper.h>
+ #include <drm/drm_probe_helper.h>
+ 
++#if defined(CONFIG_ARM64) && !defined(CONFIG_CPU_BIG_ENDIAN)
++#include "simpledrm-g9209-copy.h"
++#endif
++
+ #define DRIVER_NAME	"simpledrm"
+ #define DRIVER_DESC	"DRM driver for simple-framebuffer platform devices"
+ #define DRIVER_DATE	"20200625"
+@@ -235,6 +240,7 @@ struct simpledrm_device {
+ 
+ 	/* memory management */
+ 	struct iosys_map screen_base;
++	bool g9209_fast_blit;
+ 
+ 	/* modesetting */
+ 	uint32_t formats[8];
+@@ -477,6 +483,46 @@ static const uint64_t simpledrm_primary_plane_format_modifiers[] = {
+ 	DRM_FORMAT_MOD_INVALID
+ };
+ 
++/* The G9209 firmware scans ARGB8888 RAM, while Mutter supplies XRGB8888.
++ * The generic helper stages and converts every line before memcpy_toio().
++ * Fuse these operations for this board's Normal-NC/WC framebuffer RAM; the
++ * opaque alpha is still required by the firmware's existing display setup.
++ */
++static bool simpledrm_g9209_blit(struct simpledrm_device *sdev,
++			       const struct iosys_map *dst,
++			       const struct iosys_map *src,
++			       const struct drm_framebuffer *fb,
++			       const struct drm_rect *clip)
++{
++#if defined(CONFIG_ARM64) && !defined(CONFIG_CPU_BIG_ENDIAN)
++	u8 *dst_line;
++	const u8 *src_line;
++	unsigned int y, width = drm_rect_width(clip);
++
++	if (!sdev->g9209_fast_blit || src->is_iomem ||
++	    fb->format->format != DRM_FORMAT_XRGB8888)
++		return false;
++
++	/* simpledrm maps this reserved DRAM using memremap_wc/ioremap_wc,
++	 * which are Normal memory on arm64. This must never target Device MMIO.
++	 */
++	dst_line = dst->is_iomem ? (__force void *)dst->vaddr_iomem : dst->vaddr;
++	src_line = src->vaddr + drm_fb_clip_offset(fb->pitches[0], fb->format, clip);
++	if (((unsigned long)dst_line | (unsigned long)src_line |
++	     sdev->pitch | fb->pitches[0]) & 3)
++		return false;
++
++	for (y = 0; y < drm_rect_height(clip); y++) {
++		simpledrm_g9209_xrgb_to_argb(dst_line, src_line, width);
++		dst_line += sdev->pitch;
++		src_line += fb->pitches[0];
++	}
++	return true;
++#else
++	return false;
++#endif
++}
++
+ static void simpledrm_primary_plane_helper_atomic_update(struct drm_plane *plane,
+ 							 struct drm_atomic_state *state)
+ {
+@@ -506,8 +552,9 @@ static void simpledrm_primary_plane_helper_atomic_update(struct drm_plane *plane
+ 			continue;
+ 
+ 		iosys_map_incr(&dst, drm_fb_clip_offset(sdev->pitch, sdev->format, &dst_clip));
+-		drm_fb_blit(&dst, &sdev->pitch, sdev->format->format, shadow_plane_state->data,
+-			    fb, &damage);
++		if (!simpledrm_g9209_blit(sdev, &dst, shadow_plane_state->data, fb, &damage))
++			drm_fb_blit(&dst, &sdev->pitch, sdev->format->format,
++				    shadow_plane_state->data, fb, &damage);
+ 	}
+ 
+ 	drm_dev_exit(idx);
+@@ -711,6 +758,10 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
+ 	sdev->mode = simpledrm_mode(width, height, width_mm, height_mm);
+ 	sdev->format = format;
+ 	sdev->pitch = stride;
++	sdev->g9209_fast_blit = of_machine_is_compatible("samsung,zeroflte") &&
++		format->format == DRM_FORMAT_ARGB8888;
++	if (sdev->g9209_fast_blit && IS_ENABLED(CONFIG_ARM64))
++		drm_info(dev, "G9209 fused XRGB8888-to-ARGB8888 framebuffer copy enabled\n");
+ 
+ 	drm_dbg(dev, "display mode={" DRM_MODE_FMT "}\n", DRM_MODE_ARG(&sdev->mode));
+ 	drm_dbg(dev, "framebuffer format=%p4cc, size=%dx%d, stride=%d byte\n",
+diff --git a/drivers/i2c/busses/i2c-gpio.c b/drivers/i2c/busses/i2c-gpio.c
+index e5a5b9e8b..fa0ebf85b 100644
+--- a/drivers/i2c/busses/i2c-gpio.c
++++ b/drivers/i2c/busses/i2c-gpio.c
+@@ -9,6 +9,7 @@
+ #include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c-algo-bit.h>
++#include <linux/dsh_diag.h>
+ #include <linux/i2c.h>
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+@@ -403,14 +404,17 @@ static int i2c_gpio_probe(struct platform_device *pdev)
+ 		gflags = GPIOD_OUT_HIGH;
+ 	else
+ 		gflags = GPIOD_OUT_HIGH_OPEN_DRAIN;
++	dsh_diag_note(0x71, "i2c-gpio:get_sda");   /* DSH 探针 */
+ 	priv->sda = i2c_gpio_get_desc(dev, "sda", 0, gflags);
+ 	if (IS_ERR(priv->sda))
+ 		return PTR_ERR(priv->sda);
++	dsh_diag_note(0x72, "i2c-gpio:sda_ok");
+ 
+ 	if (pdata->scl_is_open_drain || pdata->scl_has_no_pullup)
+ 		gflags = GPIOD_OUT_HIGH;
+ 	else
+ 		gflags = GPIOD_OUT_HIGH_OPEN_DRAIN;
++	dsh_diag_note(0x73, "i2c-gpio:get_scl");
+ 	priv->scl = i2c_gpio_get_desc(dev, "scl", 1, gflags);
+ 	if (IS_ERR(priv->scl))
+ 		return PTR_ERR(priv->scl);
+diff --git a/drivers/iommu/Kconfig b/drivers/iommu/Kconfig
+index 2b12b583e..0cecd7179 100644
+--- a/drivers/iommu/Kconfig
++++ b/drivers/iommu/Kconfig
+@@ -258,7 +258,7 @@ config TEGRA_IOMMU_SMMU
+ 	  SoCs (Tegra30 up to Tegra210).
+ 
+ config EXYNOS_IOMMU
+-	bool "Exynos IOMMU Support"
++	tristate "Exynos IOMMU Support"
+ 	depends on ARCH_EXYNOS || COMPILE_TEST
+ 	depends on !CPU_BIG_ENDIAN # revisit driver if we can enable big-endian ptes
+ 	select IOMMU_API
+diff --git a/drivers/iommu/exynos-iommu.c b/drivers/iommu/exynos-iommu.c
+index c275fe71c..8f59d7d6d 100644
+--- a/drivers/iommu/exynos-iommu.c
++++ b/drivers/iommu/exynos-iommu.c
+@@ -20,6 +20,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/sizes.h>
+ #include <linux/slab.h>
+ 
+ typedef u32 sysmmu_iova_t;
+@@ -234,6 +235,7 @@ struct exynos_iommu_owner {
+ 	struct list_head controllers;	/* list of sysmmu_drvdata.owner_node */
+ 	struct iommu_domain *domain;	/* domain this device is attached */
+ 	struct mutex rpm_lock;		/* for runtime pm of all sysmmus */
++	bool ready;			/* master uses IOVA-mapped buffers */
+ };
+ 
+ /*
+@@ -416,6 +418,37 @@ static const struct sysmmu_variant sysmmu_v7_vm_variant = {
+ 	.get_fault_info	= exynos_sysmmu_v7_get_fault_info,
+ };
+ 
++/*
++ * Quirk data for controllers which must not be probed at ->probe() time.
++ *
++ * On Exynos7420 the System MMU register block sits in the DISP power/clock
++ * domain and is only guaranteed to be accessible once the master (DECON) is
++ * powered up.  Reading REG_MMU_VERSION from ->probe() - which is what the
++ * generic path below does - is therefore the first (and fatal) MMIO access:
++ * an access to a powered-down/ungated IP block on this SoC never completes
++ * on the AXI bus, so the CPU hangs silently.  The vendor v6 driver avoids
++ * this by only clk_prepare()ing the clocks in ->probe() and never touching a
++ * register until the master is running (exynos-iommu-v6.c: __sysmmu_setup()
++ * -> __sysmmu_init_clock(), and __sysmmu_enable() which only programs the
++ * hardware when is_sysmmu_runtime_active()).
++ *
++ * Such controllers are selected through a dedicated DT compatible and get
++ * their version/variant from this table instead of the version register.
++ * The first real register access then happens in __sysmmu_enable(), which is
++ * only reachable after the master has powered the display (see
++ * exynos_iommu_master_ready()).
++ */
++struct exynos_sysmmu_desc {
++	unsigned int version;			/* hardware version to assume */
++	const struct sysmmu_variant *variant;	/* register layout to assume */
++};
++
++/* Exynos7420: SysMMU v6, register layout identical to v5 */
++static const struct exynos_sysmmu_desc exynos7420_sysmmu_desc = {
++	.version = MAKE_MMU_VER(6, 0),
++	.variant = &sysmmu_v5_variant,
++};
++
+ static struct exynos_iommu_domain *to_exynos_domain(struct iommu_domain *dom)
+ {
+ 	return container_of(dom, struct exynos_iommu_domain, domain);
+@@ -481,10 +514,16 @@ static void __sysmmu_set_ptbase(struct sysmmu_drvdata *data, phys_addr_t pgd)
+ 
+ static void __sysmmu_enable_clocks(struct sysmmu_drvdata *data)
+ {
++	pr_emerg("IOMMU: enable_clocks %s master=%s\n", dev_name(data->sysmmu),
++		 data->clk_master ? "yes" : "NULL");
+ 	BUG_ON(clk_prepare_enable(data->clk_master));
++	pr_emerg("IOMMU: enable_clocks %s clk\n", dev_name(data->sysmmu));
+ 	BUG_ON(clk_prepare_enable(data->clk));
++	pr_emerg("IOMMU: enable_clocks %s pclk\n", dev_name(data->sysmmu));
+ 	BUG_ON(clk_prepare_enable(data->pclk));
++	pr_emerg("IOMMU: enable_clocks %s aclk\n", dev_name(data->sysmmu));
+ 	BUG_ON(clk_prepare_enable(data->aclk));
++	pr_emerg("IOMMU: enable_clocks %s all on\n", dev_name(data->sysmmu));
+ }
+ 
+ static void __sysmmu_disable_clocks(struct sysmmu_drvdata *data)
+@@ -584,8 +623,14 @@ static irqreturn_t exynos_sysmmu_irq(int irq, void *dev_id)
+ 		ret = report_iommu_fault(&data->domain->domain, data->master,
+ 					 fault.addr, fault.type);
+ 	}
++	/*
++	 * The vendor display driver installs a fault handler that dumps the
++	 * DECON state and keeps running.  Do not panic here: a transient
++	 * fault during the bootloader->DRM framebuffer handover should not
++	 * wedge the whole system.
++	 */
+ 	if (ret)
+-		panic("Unrecoverable System MMU Fault!");
++		dev_err(data->sysmmu, "Unrecoverable System MMU Fault! (ignored)\n");
+ 
+ out:
+ 	writel(1 << itype, SYSMMU_REG(data, int_clear));
+@@ -645,6 +690,21 @@ static void __sysmmu_enable(struct sysmmu_drvdata *data)
+ {
+ 	unsigned long flags;
+ 
++	/*
++	 * Belt and braces: never program a SYSMMU whose clocks did not
++	 * resolve.  An MMIO access to an unclocked/unpowered block on
++	 * Exynos7420 does not fault, it hangs the AXI interconnect until the
++	 * SoC is reset.  Probe() guarantees aclk/pclk are present, but this
++	 * function is also reachable from runtime-resume and from
++	 * exynos_iommu_master_ready(), so verify again here.
++	 */
++	if (!data->aclk || !data->pclk) {
++		dev_err(data->sysmmu,
++			"refusing to enable: aclk/pclk not available\n");
++		return;
++	}
++
++	pr_emerg("IOMMU: __sysmmu_enable %s enter\n", dev_name(data->sysmmu));
+ 	__sysmmu_enable_clocks(data);
+ 
+ 	spin_lock_irqsave(&data->lock, flags);
+@@ -656,6 +716,13 @@ static void __sysmmu_enable(struct sysmmu_drvdata *data)
+ 	data->active = true;
+ 	spin_unlock_irqrestore(&data->lock, flags);
+ 
++	pr_emerg("IOMMU: __sysmmu_enable %s wrote ctrl\n",
++		 dev_name(data->sysmmu));
++	pr_emerg("IOMMU: __sysmmu_enable %s ctrl=%#x status=%#x\n",
++		 dev_name(data->sysmmu),
++		 readl(data->sfrbase + REG_MMU_CTRL),
++		 readl(data->sfrbase + REG_MMU_STATUS));
++
+ 	/*
+ 	 * SYSMMU driver keeps master's clock enabled only for the short
+ 	 * time, while accessing the registers. For performing address
+@@ -722,6 +789,7 @@ static const struct iommu_ops exynos_iommu_ops;
+ 
+ static int exynos_sysmmu_probe(struct platform_device *pdev)
+ {
++	const struct exynos_sysmmu_desc *desc;
+ 	int irq, ret;
+ 	struct device *dev = &pdev->dev;
+ 	struct sysmmu_drvdata *data;
+@@ -771,7 +839,29 @@ static int exynos_sysmmu_probe(struct platform_device *pdev)
+ 	data->sysmmu = dev;
+ 	spin_lock_init(&data->lock);
+ 
+-	__sysmmu_get_version(data);
++	/*
++	 * Do not touch the registers from ->probe() for controllers carrying
++	 * quirk data (Exynos7420).  The generic path reads REG_MMU_VERSION,
++	 * which is the first MMIO access of the driver and on this SoC it
++	 * happens while the block is still unpowered/ungated: the AXI
++	 * transaction never completes and the boot hangs silently.
++	 *
++	 * The version is taken from the DT match data instead and the first
++	 * register access is deferred to __sysmmu_enable(), which only runs
++	 * once the master has powered the block (exynos_iommu_master_ready()).
++	 * This mirrors the vendor v6 driver, whose probe only calls
++	 * clk_prepare() and never reads a register.
++	 */
++	desc = of_device_get_match_data(dev);
++	if (desc) {
++		data->version = desc->version;
++		data->variant = desc->variant;
++		pr_emerg("IOMMU: probe %s: fixed version %d.%d, no register read\n",
++			 dev_name(dev), MMU_MAJ_VER(data->version),
++			 MMU_MIN_VER(data->version));
++	} else {
++		__sysmmu_get_version(data);
++	}
+ 
+ 	ret = iommu_device_sysfs_add(&data->iommu, &pdev->dev, NULL,
+ 				     dev_name(data->sysmmu));
+@@ -809,13 +899,20 @@ static int exynos_sysmmu_probe(struct platform_device *pdev)
+ 
+ 	pm_runtime_enable(dev);
+ 
++	pr_emerg("IOMMU: probe %s before iommu_device_register\n",
++		 dev_name(dev));
+ 	ret = iommu_device_register(&data->iommu, &exynos_iommu_ops, dev);
++	pr_emerg("IOMMU: probe %s iommu_device_register ret=%d\n",
++		 dev_name(dev), ret);
+ 	if (ret)
+ 		goto err_dma_set_mask;
+ 
+ 	return 0;
+ 
+ err_dma_set_mask:
++	pm_runtime_disable(dev);
++	if (dma_dev == dev)
++		dma_dev = NULL;
+ 	iommu_device_sysfs_remove(&data->iommu);
+ 	return ret;
+ }
+@@ -829,7 +926,9 @@ static int __maybe_unused exynos_sysmmu_suspend(struct device *dev)
+ 		struct exynos_iommu_owner *owner = dev_iommu_priv_get(master);
+ 
+ 		mutex_lock(&owner->rpm_lock);
+-		if (data->domain) {
++		pr_emerg("IOMMU: sysmmu_suspend %s domain=%d active=%d\n",
++			 dev_name(dev), !!data->domain, data->active);
++		if (data->domain && data->active) {
+ 			dev_dbg(data->sysmmu, "saving state\n");
+ 			__sysmmu_disable(data);
+ 		}
+@@ -847,10 +946,22 @@ static int __maybe_unused exynos_sysmmu_resume(struct device *dev)
+ 		struct exynos_iommu_owner *owner = dev_iommu_priv_get(master);
+ 
+ 		mutex_lock(&owner->rpm_lock);
+-		if (data->domain) {
++		pr_emerg("IOMMU: sysmmu_resume %s domain=%d active=%d ready=%d\n",
++			 dev_name(dev), !!data->domain, data->active,
++			 owner->ready);
++		/*
++		 * Do not touch the SYSMMU until the master has told us that it
++		 * is scanning an IOVA-mapped buffer.  Bringing the SYSMMU up
++		 * earlier makes DECON fault on the bootloader's physical
++		 * framebuffer (and, with the master clock wired up, momentarily
++		 * gates the master's clock), which wedges the interconnect.
++		 */
++		if (data->domain && owner->ready && !data->active) {
+ 			dev_dbg(data->sysmmu, "restoring state\n");
+ 			__sysmmu_enable(data);
+ 		}
++		pr_emerg("IOMMU: sysmmu_resume %s done active=%d\n",
++			 dev_name(dev), data->active);
+ 		mutex_unlock(&owner->rpm_lock);
+ 	}
+ 	return 0;
+@@ -863,6 +974,12 @@ static const struct dev_pm_ops sysmmu_pm_ops = {
+ };
+ 
+ static const struct of_device_id sysmmu_of_match[] = {
++	/*
++	 * Exynos7420 (SysMMU v6): version/variant come from match data and
++	 * ->probe() must not access the registers (see exynos_sysmmu_desc).
++	 */
++	{ .compatible	= "samsung,exynos7420-sysmmu",
++	  .data		= &exynos7420_sysmmu_desc, },
+ 	{ .compatible	= "samsung,exynos-sysmmu", },
+ 	{ },
+ };
+@@ -1046,10 +1163,19 @@ static int exynos_iommu_attach_device(struct iommu_domain *iommu_domain,
+ 	owner->domain = iommu_domain;
+ 	spin_unlock_irqrestore(&domain->lock, flags);
+ 
++	pr_emerg("IOMMU: attach master=%s\n", dev_name(dev));
++
+ 	list_for_each_entry(data, &owner->controllers, owner_node) {
++		pr_emerg("IOMMU: attach sysmmu=%s active=%d domain=%d\n",
++			 dev_name(data->sysmmu),
++			 pm_runtime_active(data->sysmmu),
++			 !!data->domain);
+ 		pm_runtime_get_noresume(data->sysmmu);
+-		if (pm_runtime_active(data->sysmmu))
++		if (pm_runtime_active(data->sysmmu)) {
++			pr_emerg("IOMMU: attach enabling %s now\n",
++				 dev_name(data->sysmmu));
+ 			__sysmmu_enable(data);
++		}
+ 		pm_runtime_put(data->sysmmu);
+ 	}
+ 
+@@ -1061,6 +1187,68 @@ static int exynos_iommu_attach_device(struct iommu_domain *iommu_domain,
+ 	return 0;
+ }
+ 
++/*
++ * exynos_iommu_master_ready - let the IOMMU translate for the master
++ * @master: the master device (e.g. DECON) whose SYSMMUs should be enabled
++ *
++ * The master driver calls this once it is actually scanning a buffer that was
++ * mapped through this IOMMU domain.  Until then the SYSMMUs are left disabled,
++ * because enabling them while the hardware still scans a bootloader-provided
++ * physical framebuffer causes unrecoverable translation faults.
++ */
++void exynos_iommu_master_ready(struct device *master)
++{
++	struct exynos_iommu_owner *owner = dev_iommu_priv_get(master);
++	struct sysmmu_drvdata *data;
++
++	if (!owner)
++		return;
++
++	mutex_lock(&owner->rpm_lock);
++	if (!owner->ready) {
++		owner->ready = true;
++		list_for_each_entry(data, &owner->controllers, owner_node) {
++			if (data->domain && !data->active) {
++				pr_emerg("IOMMU: master_ready enabling %s\n",
++					 dev_name(data->sysmmu));
++				__sysmmu_enable(data);
++			}
++		}
++	}
++	mutex_unlock(&owner->rpm_lock);
++}
++EXPORT_SYMBOL_GPL(exynos_iommu_master_ready);
++
++/*
++ * exynos_iommu_map_identity - map a physical range one-to-one
++ * @master: master device whose IOMMU domain should be used
++ * @phys: physical address of the range
++ * @size: size of the range in bytes
++ *
++ * Used by the display driver to keep the bootloader's framebuffer readable
++ * after the SYSMMUs start translating.  Mirrors the vendor iovmm_map_oto().
++ */
++int exynos_iommu_map_identity(struct device *master, phys_addr_t phys,
++			      size_t size)
++{
++	struct exynos_iommu_owner *owner = dev_iommu_priv_get(master);
++	phys_addr_t start, end;
++	int ret;
++
++	if (!owner || !owner->domain)
++		return -ENODEV;
++
++	start = ALIGN_DOWN(phys, SZ_2M);
++	end = ALIGN(phys + size, SZ_2M);
++
++	ret = iommu_map(owner->domain, start, start, end - start,
++			IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
++	pr_emerg("IOMMU: map_identity %s phys=%pa start=%pa size=%#zx ret=%d\n",
++		 dev_name(master), &phys, &start, (size_t)(end - start), ret);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(exynos_iommu_map_identity);
++
+ static sysmmu_pte_t *alloc_lv2entry(struct exynos_iommu_domain *domain,
+ 		sysmmu_pte_t *sent, sysmmu_iova_t iova, short *pgcounter)
+ {
+@@ -1398,6 +1586,9 @@ static struct iommu_device *exynos_iommu_probe_device(struct device *dev)
+ 		data->link = device_link_add(dev, data->sysmmu,
+ 					     DL_FLAG_STATELESS |
+ 					     DL_FLAG_PM_RUNTIME);
++		pr_emerg("IOMMU: probe_device %s link=%s to %s\n",
++			 dev_name(dev), data->link ? "ok" : "NULL",
++			 dev_name(data->sysmmu));
+ 	}
+ 
+ 	/* There is always at least one entry, see exynos_iommu_of_xlate() */
+@@ -1445,8 +1636,10 @@ static int exynos_iommu_of_xlate(struct device *dev,
+ 	data = platform_get_drvdata(sysmmu);
+ 	if (!data) {
+ 		put_device(&sysmmu->dev);
+-		return -ENODEV;
++		return -EPROBE_DEFER;
+ 	}
++	pr_emerg("IOMMU: of_xlate master=%s sysmmu=%s\n", dev_name(dev),
++		 dev_name(&sysmmu->dev));
+ 
+ 	if (!owner) {
+ 		owner = kzalloc(sizeof(*owner), GFP_KERNEL);
+@@ -1471,6 +1664,7 @@ static int exynos_iommu_of_xlate(struct device *dev,
+ }
+ 
+ static const struct iommu_ops exynos_iommu_ops = {
++	.owner = THIS_MODULE,
+ 	.domain_alloc = exynos_iommu_domain_alloc,
+ 	.device_group = generic_device_group,
+ #ifdef CONFIG_ARM
+@@ -1515,7 +1709,9 @@ static int __init exynos_iommu_init(void)
+ 		goto err_zero_lv2;
+ 	}
+ 
++	pr_emerg("IOMMU: init enter\n");
+ 	ret = platform_driver_register(&exynos_sysmmu_driver);
++	pr_emerg("IOMMU: platform_driver_register ret=%d\n", ret);
+ 	if (ret) {
+ 		pr_err("%s: Failed to register driver\n", __func__);
+ 		goto err_reg_driver;
+@@ -1528,4 +1724,16 @@ static int __init exynos_iommu_init(void)
+ 	kmem_cache_destroy(lv2table_kmem_cache);
+ 	return ret;
+ }
+-core_initcall(exynos_iommu_init);
++
++static void __exit exynos_iommu_exit(void)
++{
++	platform_driver_unregister(&exynos_sysmmu_driver);
++	kmem_cache_free(lv2table_kmem_cache, zero_lv2_table);
++	kmem_cache_destroy(lv2table_kmem_cache);
++}
++
++module_init(exynos_iommu_init);
++module_exit(exynos_iommu_exit);
++
++MODULE_DESCRIPTION("Samsung Exynos IOMMU (System MMU) driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/pinctrl/samsung/pinctrl-exynos.c b/drivers/pinctrl/samsung/pinctrl-exynos.c
+index a8212fc12..6a8bfae79 100644
+--- a/drivers/pinctrl/samsung/pinctrl-exynos.c
++++ b/drivers/pinctrl/samsung/pinctrl-exynos.c
+@@ -527,6 +527,8 @@ static void exynos_irq_demux_eint16_31(struct irq_desc *desc)
+ __init int exynos_eint_wkup_init(struct samsung_pinctrl_drv_data *d)
+ {
+ 	struct device *dev = d->dev;
++	pr_debug("DSH-EINT: wkup_init called for %s, nr_banks=%u\n",
++		dev_name(dev), d->nr_banks);
+ 	struct device_node *wkup_np = NULL;
+ 	struct device_node *np;
+ 	struct samsung_pin_bank *bank;
+@@ -547,11 +549,17 @@ __init int exynos_eint_wkup_init(struct samsung_pinctrl_drv_data *d)
+ 			break;
+ 		}
+ 	}
+-	if (!wkup_np)
++	if (!wkup_np) {
++		pr_err("DSH-EINT: no wakeup-interrupt-controller child for %s\n",
++		       dev_name(dev));
+ 		return -ENODEV;
++	}
++	pr_debug("DSH-EINT: found wkup child %pOFn\n", wkup_np);
+ 
+ 	bank = d->pin_banks;
+ 	for (i = 0; i < d->nr_banks; ++i, ++bank) {
++		pr_debug("DSH-EINT: bank %s eint_type=%d pins=%u\n",
++			bank->name, bank->eint_type, bank->nr_pins);
+ 		if (bank->eint_type != EINT_TYPE_WKUP)
+ 			continue;
+ 
+@@ -574,6 +582,8 @@ __init int exynos_eint_wkup_init(struct samsung_pinctrl_drv_data *d)
+ 		if (!fwnode_property_present(bank->fwnode, "interrupts")) {
+ 			bank->eint_type = EINT_TYPE_WKUP_MUX;
+ 			++muxed_banks;
++			pr_debug("DSH-EINT: bank %s -> WKUP_MUX (no interrupts prop)\n",
++				bank->name);
+ 			continue;
+ 		}
+ 
+@@ -600,26 +610,33 @@ __init int exynos_eint_wkup_init(struct samsung_pinctrl_drv_data *d)
+ 		}
+ 	}
+ 
++	pr_debug("DSH-EINT: %s muxed_banks=%u\n", dev_name(dev), muxed_banks);
+ 	if (!muxed_banks) {
+ 		of_node_put(wkup_np);
++		pr_warn("DSH-EINT: no muxed banks, chained handler NOT registered\n");
+ 		return 0;
+ 	}
+ 
+ 	irq = irq_of_parse_and_map(wkup_np, 0);
+ 	of_node_put(wkup_np);
+ 	if (!irq) {
+-		dev_err(dev, "irq number for muxed EINTs not found\n");
++		dev_err(dev, "DSH-EINT: irq number for muxed EINTs not found\n");
+ 		return 0;
+ 	}
++	pr_debug("DSH-EINT: parent chained IRQ = %d\n", irq);
+ 
+ 	muxed_data = devm_kzalloc(dev, sizeof(*muxed_data)
+ 		+ muxed_banks*sizeof(struct samsung_pin_bank *), GFP_KERNEL);
+ 	if (!muxed_data)
+ 		return -ENOMEM;
+ 
+-	irq_set_chained_handler_and_data(irq, exynos_irq_demux_eint16_31,
+-					 muxed_data);
+-
++	/*
++	 * DSH 2026-10-20: 先填好 muxed_data 再注册 chained handler。
++	 * 原代码把 irq_set_chained_handler_and_data() 放在填充 banks[] 之前，
++	 * 注册瞬间 muxed_data->nr_banks 还是 0 —— 如果这个窗口里有 EINT 触发，
++	 * exynos_irq_demux_eint16_31() 会因为 nr_banks==0 什么都不做，
++	 * 中断源永远不被清除 → 中断风暴 / EINT 卡死（触摸和按键都受影响）。
++	 */
+ 	bank = d->pin_banks;
+ 	idx = 0;
+ 	for (i = 0; i < d->nr_banks; ++i, ++bank) {
+@@ -630,6 +647,10 @@ __init int exynos_eint_wkup_init(struct samsung_pinctrl_drv_data *d)
+ 	}
+ 	muxed_data->nr_banks = muxed_banks;
+ 
++	irq_set_chained_handler_and_data(irq, exynos_irq_demux_eint16_31,
++					 muxed_data);
++	pr_debug("DSH-EINT: chained handler registered, %u banks\n", muxed_banks);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/pmdomain/samsung/exynos-pm-domains.c b/drivers/pmdomain/samsung/exynos-pm-domains.c
+index 9b502e875..563d0b719 100644
+--- a/drivers/pmdomain/samsung/exynos-pm-domains.c
++++ b/drivers/pmdomain/samsung/exynos-pm-domains.c
+@@ -19,9 +19,45 @@
+ #include <linux/of_address.h>
+ #include <linux/pm_runtime.h>
+ 
++enum exynos_pd_block {
++	PD_BLK_TOP0,
++	PD_BLK_DISP,
++	PD_BLK_VPP,
++	PD_BLK_PMU,
++	PD_NUM_BLKS,
++};
++
++/* RMW descriptor for the Exynos7420 power-up/down register sequences */
++struct exynos_pd_seq {
++	u8 blk;
++	u16 off;
++	u32 set;
++	u32 clr;
++};
++
+ struct exynos_pm_domain_config {
+ 	/* Value for LOCAL_PWR_CFG and STATUS fields for each domain */
+ 	u32 local_pwr_cfg;
++	/* Value written to the OPTION register (base + 0x8); 0 = skip */
++	u32 local_pwr_option;
++	/*
++	 * Keep the domain powered for ever (GENPD_FLAG_ALWAYS_ON).
++	 *
++	 * Used on Exynos7420 G3D for now: the vendor power-on sequence also
++	 * has to touch CMU_TOP0/TOPC1 registers that hang the bus on this
++	 * board, so a proper power cycle is not implemented yet.  Keeping the
++	 * domain in its bootloader/initial state lets panfrost use the GPU
++	 * (its own runtime suspend only gates the GPU-internal power, which
++	 * is safe) instead of crashing with an SError on the first resume
++	 * after genpd switched the domain off.  See
++	 * 文档/05-专项/GPU加速-20261020.md.
++	 */
++	bool always_on;
++	/* Optional pre/post power sequences (Exynos7420 DISP) */
++	const struct exynos_pd_seq *pre;
++	unsigned int n_pre;
++	const struct exynos_pd_seq *post;
++	unsigned int n_post;
+ };
+ 
+ /*
+@@ -31,8 +67,43 @@ struct exynos_pm_domain {
+ 	void __iomem *base;
+ 	struct generic_pm_domain pd;
+ 	u32 local_pwr_cfg;
++	u32 local_pwr_option;
++	void __iomem *blk[PD_NUM_BLKS];
++	const struct exynos_pd_seq *pre;
++	unsigned int n_pre;
++	const struct exynos_pd_seq *post;
++	unsigned int n_post;
++};
++
++static const resource_size_t exynos7420_pd_blk_addr[PD_NUM_BLKS] = {
++	[PD_BLK_TOP0] = 0x105d0000,
++	[PD_BLK_DISP] = 0x13ad0000,
++	[PD_BLK_VPP] = 0x13ed0000,
++	[PD_BLK_PMU] = 0x105c0000,
+ };
+ 
++static void exynos_pd_apply_seq(struct exynos_pm_domain *pd,
++				const struct exynos_pd_seq *seq,
++				unsigned int n, bool power_on)
++{
++	unsigned int i;
++
++	for (i = 0; i < n; i++, seq++) {
++		void __iomem *base = pd->blk[seq->blk];
++		u32 set = power_on ? seq->set : seq->clr;
++		u32 clr = power_on ? seq->clr : seq->set;
++		u32 v;
++
++		if (!base)
++			continue;
++
++		v = readl_relaxed(base + seq->off);
++		v |= set;
++		v &= ~clr;
++		writel_relaxed(v, base + seq->off);
++	}
++}
++
+ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
+ {
+ 	struct exynos_pm_domain *pd;
+@@ -44,6 +115,14 @@ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
+ 	base = pd->base;
+ 
+ 	pwr = power_on ? pd->local_pwr_cfg : 0;
++
++	/* Exynos7420: bring up top/async clocks + PMU sys_pwr before power */
++	if (power_on)
++		exynos_pd_apply_seq(pd, pd->pre, pd->n_pre, true);
++
++	if (power_on && pd->local_pwr_option)
++		writel_relaxed(pd->local_pwr_option, base + 0x8);
++
+ 	writel_relaxed(pwr, base);
+ 
+ 	/* Wait max 1ms */
+@@ -60,6 +139,9 @@ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
+ 		usleep_range(80, 100);
+ 	}
+ 
++	if (power_on)
++		exynos_pd_apply_seq(pd, pd->post, pd->n_post, true);
++
+ 	return 0;
+ }
+ 
+@@ -81,13 +163,75 @@ static const struct exynos_pm_domain_config exynos5433_cfg = {
+ 	.local_pwr_cfg		= 0xf,
+ };
+ 
++/*
++ * Exynos7420 DISP power sequence, ported from the vendor kernel
++ * (arch/arm/mach-exynos/pm_domains-exynos7420.c + -cal.h). The generic
++ * sequence is not enough on this SoC: top-to-local clocks, async-bridge
++ * clocks and the PMU sys_pwr registers must be programmed around the local
++ * power switch, and the OPTION register has to be written.
++ */
++static const struct exynos_pd_seq exynos7420_disp_pre[] = {
++	{ PD_BLK_TOP0, 0x080c, BIT(28), 0 },
++	{ PD_BLK_TOP0, 0x0a20, BIT(28) | BIT(24) | BIT(20) | BIT(16) | BIT(12), 0 },
++	{ PD_BLK_VPP, 0x0800, 0xf, 0 },
++	{ PD_BLK_PMU, 0x1450, 0, BIT(0) },
++	{ PD_BLK_PMU, 0x1490, 0, BIT(0) },
++	{ PD_BLK_PMU, 0x14d0, 0, BIT(0) },
++	{ PD_BLK_PMU, 0x1510, 0, BIT(0) },
++	{ PD_BLK_PMU, 0x1550, 0, BIT(9) | BIT(8) | BIT(5) | BIT(4) | BIT(1) | BIT(0) },
++	{ PD_BLK_PMU, 0x1590, 0, BIT(0) },
++};
++
++static const struct exynos_pd_seq exynos7420_disp_post[] = {
++	{ PD_BLK_DISP, 0x0800, BIT(31) | BIT(30) | BIT(29) | BIT(28), 0 },
++};
++
++static const struct exynos_pm_domain_config exynos7420_disp_cfg = {
++	.local_pwr_cfg		= 0xf,
++	.local_pwr_option	= 0x0102,
++	.pre			= exynos7420_disp_pre,
++	.n_pre			= ARRAY_SIZE(exynos7420_disp_pre),
++	.post			= exynos7420_disp_post,
++	.n_post			= ARRAY_SIZE(exynos7420_disp_post),
++};
++
++/*
++ * Exynos7420 G3D power domain.
++ *
++ * The vendor power-up sequence needs, besides the LOCAL_PWR_CFG switch:
++ *   - CMU_TOP0/TOPC1 "top-to-local" clock gate (ENABLE_SCLK_TOPC1 @ 0x10570A04),
++ *   - seven PMU SYS_PWR registers for CMU_G3D (CLKRUN/CLKSTOP/DISABLE_PLL/
++ *     RESET_LOGIC/MEMORY[1:0]/RESET_CMU),
++ *   - the pd-option value 0x1101 (LOCAL_PWR_OPTION register base + 0x8),
++ *   - save/restore of CMU_G3D + GPU SFRs around power transitions.
++ *
++ * CMU_TOP0/TOPC1 registers hang the AXI bus when accessed on this board
++ * (see board DTS), so the full sequence cannot be implemented safely yet.
++ * Instead keep the domain exactly in the state the bootloader left it in
++ * (GPU is accessible there - panfrost probes and renders fine) and never
++ * power it off.  panfrost's own runtime suspend/resume only touches the
++ * GPU-internal power registers, which does not need a PMU power cycle.
++ */
++static const struct exynos_pm_domain_config exynos7420_g3d_cfg = {
++	.local_pwr_cfg		= 0xf,
++	/* vendor DT: pd-g3d has "pd-option = <0x1101>" (ctc_stock.dts:5806) */
++	.local_pwr_option	= 0x1101,
++	.always_on		= true,
++};
++
+ static const struct of_device_id exynos_pm_domain_of_match[] = {
+ 	{
+ 		.compatible = "samsung,exynos4210-pd",
+ 		.data = &exynos4210_cfg,
++	}, {
++		.compatible = "samsung,exynos7420-g3d-pd",
++		.data = &exynos7420_g3d_cfg,
+ 	}, {
+ 		.compatible = "samsung,exynos5433-pd",
+ 		.data = &exynos5433_cfg,
++	}, {
++		.compatible = "samsung,exynos7420-pd",
++		.data = &exynos7420_disp_cfg,
+ 	},
+ 	{ },
+ };
+@@ -128,10 +272,45 @@ static int exynos_pd_probe(struct platform_device *pdev)
+ 	pd->pd.power_off = exynos_pd_power_off;
+ 	pd->pd.power_on = exynos_pd_power_on;
+ 	pd->local_pwr_cfg = pm_domain_cfg->local_pwr_cfg;
++	pd->local_pwr_option = pm_domain_cfg->local_pwr_option;
++	pd->pre = pm_domain_cfg->pre;
++	pd->n_pre = pm_domain_cfg->n_pre;
++	pd->post = pm_domain_cfg->post;
++	pd->n_post = pm_domain_cfg->n_post;
++
++	/* Exynos7420: map the clock/PMU register windows used by the seqs */
++	if (pd->n_pre || pd->n_post) {
++		int i;
++
++		for (i = 0; i < PD_NUM_BLKS; i++) {
++			pd->blk[i] = devm_ioremap(dev,
++						  exynos7420_pd_blk_addr[i],
++						  0x1000);
++			if (!pd->blk[i])
++				dev_warn(dev, "failed to map block %d\n", i);
++		}
++	}
+ 
+ 	on = readl_relaxed(pd->base + 0x4) & pd->local_pwr_cfg;
+ 
+ 	pm_genpd_init(&pd->pd, NULL, !on);
++
++	/*
++	 * Must be set after pm_genpd_init(): the latter refuses an always-on
++	 * domain that starts out powered off (-EINVAL).  If the domain is
++	 * already on (the expected case on this board, the bootloader leaves
++	 * G3D powered) genpd will never call exynos_pd_power_on() again and
++	 * therefore never power it off either.  If it happens to start off,
++	 * genpd powers it on once at the first runtime resume and keeps it on
++	 * from then on.
++	 */
++	if (pm_domain_cfg->always_on) {
++		if (!on)
++			dev_warn(dev, "%s: always-on domain starts powered off\n",
++				 pd->pd.name);
++		pd->pd.flags |= GENPD_FLAG_ALWAYS_ON;
++	}
++
+ 	ret = of_genpd_add_provider_simple(np, &pd->pd);
+ 
+ 	if (ret == 0 && of_parse_phandle_with_args(np, "power-domains",
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index 965d4f0c1..70b7a624e 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -1284,6 +1284,15 @@ config REGULATOR_S2MPA01
+ 	 This driver controls Samsung S2MPA01 voltage output regulator
+ 	 via I2C bus. S2MPA01 has 10 Bucks and 26 LDO outputs.
+ 
++config REGULATOR_S2MPB02
++	tristate "Samsung S2MPB02 LDO17 regulator"
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  Support the LDO17 output of the Samsung S2MPB02 PMIC. This output
++	  supplies the touchscreen analog rail on the Galaxy S6 SM-G9209.
++	  Other regulators, interrupts and flash LEDs are not supported.
++
+ config REGULATOR_S2MPS11
+ 	tristate "Samsung S2MPS11/13/14/15/S2MPU02 voltage regulator"
+ 	depends on MFD_SEC_CORE || COMPILE_TEST
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index 23074714a..1210fac31 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -150,6 +150,7 @@ obj-$(CONFIG_REGULATOR_RTQ2134) += rtq2134-regulator.o
+ obj-$(CONFIG_REGULATOR_RTQ6752)	+= rtq6752-regulator.o
+ obj-$(CONFIG_REGULATOR_RTQ2208) += rtq2208-regulator.o
+ obj-$(CONFIG_REGULATOR_S2MPA01) += s2mpa01.o
++obj-$(CONFIG_REGULATOR_S2MPB02) += s2mpb02-regulator.o
+ obj-$(CONFIG_REGULATOR_S2MPS11) += s2mps11.o
+ obj-$(CONFIG_REGULATOR_S5M8767) += s5m8767.o
+ obj-$(CONFIG_REGULATOR_SC2731) += sc2731-regulator.o
+diff --git a/drivers/regulator/s2mpb02-regulator.c b/drivers/regulator/s2mpb02-regulator.c
+new file mode 100644
+index 000000000..78e4a02dc
+--- /dev/null
++++ b/drivers/regulator/s2mpb02-regulator.c
+@@ -0,0 +1,112 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* S2MPB02 LDO17 support, based on Samsung's universal7420 register map. */
++
++#include <linux/bits.h>
++#include <linux/i2c.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/regmap.h>
++#include <linux/regulator/driver.h>
++
++#define S2MPB02_REG_ID		0x00
++#define S2MPB02_REG_L17CTRL	0x2e
++#define S2MPB02_LDO_VSEL_MASK	GENMASK(6, 0)
++#define S2MPB02_LDO_ENABLE_MASK	BIT(7)
++
++static bool s2mpb02_readable_reg(struct device *dev, unsigned int reg)
++{
++	return reg == S2MPB02_REG_ID || reg == S2MPB02_REG_L17CTRL;
++}
++
++static bool s2mpb02_writeable_reg(struct device *dev, unsigned int reg)
++{
++	return reg == S2MPB02_REG_L17CTRL;
++}
++
++static const struct regmap_config s2mpb02_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = S2MPB02_REG_L17CTRL,
++	.readable_reg = s2mpb02_readable_reg,
++	.writeable_reg = s2mpb02_writeable_reg,
++	.cache_type = REGCACHE_NONE,
++};
++
++static const struct regulator_ops s2mpb02_ldo_ops = {
++	.list_voltage = regulator_list_voltage_linear,
++	.map_voltage = regulator_map_voltage_linear,
++	.get_voltage_sel = regulator_get_voltage_sel_regmap,
++	.set_voltage_sel = regulator_set_voltage_sel_regmap,
++	.is_enabled = regulator_is_enabled_regmap,
++	.enable = regulator_enable_regmap,
++	.disable = regulator_disable_regmap,
++};
++
++static const struct regulator_desc s2mpb02_ldo17 = {
++	.name = "LDO17",
++	.of_match = "ldo17",
++	.regulators_node = "regulators",
++	.id = 17,
++	.ops = &s2mpb02_ldo_ops,
++	.type = REGULATOR_VOLTAGE,
++	.owner = THIS_MODULE,
++	.min_uV = 600000,
++	.uV_step = 25000,
++	.n_voltages = 128,
++	.vsel_reg = S2MPB02_REG_L17CTRL,
++	.vsel_mask = S2MPB02_LDO_VSEL_MASK,
++	.enable_reg = S2MPB02_REG_L17CTRL,
++	.enable_mask = S2MPB02_LDO_ENABLE_MASK,
++	.enable_time = 180,
++};
++
++static int s2mpb02_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct regulator_config config = { .dev = dev };
++	struct regulator_dev *rdev;
++	struct regmap *regmap;
++	unsigned int id;
++	int ret;
++
++	regmap = devm_regmap_init_i2c(client, &s2mpb02_regmap_config);
++	if (IS_ERR(regmap))
++		return dev_err_probe(dev, PTR_ERR(regmap), "failed to create regmap\n");
++
++	ret = regmap_read(regmap, S2MPB02_REG_ID, &id);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to read chip ID\n");
++
++	config.regmap = regmap;
++	rdev = devm_regulator_register(dev, &s2mpb02_ldo17, &config);
++	if (IS_ERR(rdev))
++		return dev_err_probe(dev, PTR_ERR(rdev), "failed to register LDO17\n");
++
++	dev_info(dev, "S2MPB02 ID %02x; LDO17 regulator registered\n", id);
++	return 0;
++}
++
++static const struct of_device_id s2mpb02_of_match[] = {
++	{ .compatible = "samsung,s2mpb02" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, s2mpb02_of_match);
++
++static const struct i2c_device_id s2mpb02_i2c_id[] = {
++	{ "s2mpb02-regulator", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, s2mpb02_i2c_id);
++
++static struct i2c_driver s2mpb02_driver = {
++	.driver = {
++		.name = "s2mpb02-regulator",
++		.of_match_table = s2mpb02_of_match,
++	},
++	.probe = s2mpb02_probe,
++	.id_table = s2mpb02_i2c_id,
++};
++module_i2c_driver(s2mpb02_driver);
++
++MODULE_DESCRIPTION("Samsung S2MPB02 LDO17 regulator driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/regulator/s2mps11.c b/drivers/regulator/s2mps11.c
+index 570b61420..a89faf2dd 100644
+--- a/drivers/regulator/s2mps11.c
++++ b/drivers/regulator/s2mps11.c
+@@ -1202,8 +1202,9 @@ static int s2mps11_pmic_probe(struct platform_device *pdev)
+ 						&regulators[i], &config);
+ 		if (IS_ERR(regulator)) {
+ 			ret = PTR_ERR(regulator);
+-			dev_err(&pdev->dev, "regulator init failed for %d\n",
+-				i);
++			dev_err(&pdev->dev,
++				"regulator init failed for %d (%s) err=%d\n",
++				i, regulators[i].name, ret);
+ 			goto out;
+ 		}
+ 
+diff --git a/drivers/tty/tty_io.c b/drivers/tty/tty_io.c
+index 8a94e5a43..25e1114f2 100644
+--- a/drivers/tty/tty_io.c
++++ b/drivers/tty/tty_io.c
+@@ -75,6 +75,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/tty.h>
+ #include <linux/tty_driver.h>
++#include <linux/dsh_diag.h>
+ #include <linux/tty_flip.h>
+ #include <linux/devpts_fs.h>
+ #include <linux/file.h>
+@@ -3142,6 +3143,23 @@ int tty_put_char(struct tty_struct *tty, unsigned char ch)
+ }
+ EXPORT_SYMBOL_GPL(tty_put_char);
+ 
++static bool dsh_trace_vt_driver(const struct tty_driver *driver)
++{
++	return driver->type == TTY_DRIVER_TYPE_CONSOLE &&
++	       driver->major == TTY_MAJOR && driver->minor_start == 1;
++}
++
++/* Every completed step is also a progress heartbeat.  Preserve the tty
++ * index in the stage so a slow 63-device registration stays distinguishable
++ * from one device stuck in allocation, driver core, cdev, or uevent work.
++ */
++static void dsh_trace_vt_device(const struct tty_driver *driver,
++			      unsigned int index, unsigned long phase)
++{
++	if (dsh_trace_vt_driver(driver))
++		dsh_mark(0x460000UL | ((unsigned long)index << 8) | phase);
++}
++
+ static int tty_cdev_add(struct tty_driver *driver, dev_t dev,
+ 		unsigned int index, unsigned int count)
+ {
+@@ -3231,6 +3249,7 @@ struct device *tty_register_device_attr(struct tty_driver *driver,
+ 	else
+ 		tty_line_name(driver, index, name);
+ 
++	dsh_trace_vt_device(driver, index, 1);
+ 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+ 	if (!dev)
+ 		return ERR_PTR(-ENOMEM);
+@@ -3245,7 +3264,9 @@ struct device *tty_register_device_attr(struct tty_driver *driver,
+ 
+ 	dev_set_uevent_suppress(dev, 1);
+ 
++	dsh_trace_vt_device(driver, index, 2);
+ 	retval = device_register(dev);
++	dsh_trace_vt_device(driver, index, 3);
+ 	if (retval)
+ 		goto err_put;
+ 
+@@ -3260,13 +3281,17 @@ struct device *tty_register_device_attr(struct tty_driver *driver,
+ 			kfree(tp);
+ 		}
+ 
++		dsh_trace_vt_device(driver, index, 4);
+ 		retval = tty_cdev_add(driver, devt, index, 1);
++		dsh_trace_vt_device(driver, index, 5);
+ 		if (retval)
+ 			goto err_del;
+ 	}
+ 
+ 	dev_set_uevent_suppress(dev, 0);
++	dsh_trace_vt_device(driver, index, 6);
+ 	kobject_uevent(&dev->kobj, KOBJ_ADD);
++	dsh_trace_vt_device(driver, index, 7);
+ 
+ 	return dev;
+ 
+@@ -3416,6 +3441,10 @@ int tty_register_driver(struct tty_driver *driver)
+ 	int i;
+ 	dev_t dev;
+ 	struct device *d;
++	bool trace_vt = dsh_trace_vt_driver(driver);
++
++	if (trace_vt)
++		dsh_mark(0x4600);
+ 
+ 	if (!driver->major) {
+ 		error = alloc_chrdev_region(&dev, driver->minor_start,
+@@ -3430,6 +3459,8 @@ int tty_register_driver(struct tty_driver *driver)
+ 	}
+ 	if (error < 0)
+ 		goto err;
++	if (trace_vt)
++		dsh_mark(0x4601);
+ 
+ 	if (driver->flags & TTY_DRIVER_DYNAMIC_ALLOC) {
+ 		error = tty_cdev_add(driver, dev, 0, driver->num);
+@@ -3437,9 +3468,15 @@ int tty_register_driver(struct tty_driver *driver)
+ 			goto err_unreg_char;
+ 	}
+ 
++	if (trace_vt)
++		dsh_mark(0x4602);
+ 	mutex_lock(&tty_mutex);
++	if (trace_vt)
++		dsh_mark(0x4603);
+ 	list_add(&driver->tty_drivers, &tty_drivers);
+ 	mutex_unlock(&tty_mutex);
++	if (trace_vt)
++		dsh_mark(0x4604);
+ 
+ 	if (!(driver->flags & TTY_DRIVER_DYNAMIC_DEV)) {
+ 		for (i = 0; i < driver->num; i++) {
+@@ -3450,7 +3487,11 @@ int tty_register_driver(struct tty_driver *driver)
+ 			}
+ 		}
+ 	}
++	if (trace_vt)
++		dsh_mark(0x4605);
+ 	proc_tty_register_driver(driver);
++	if (trace_vt)
++		dsh_mark(0x4606);
+ 	driver->flags |= TTY_DRIVER_INSTALLED;
+ 	return 0;
+ 
+@@ -3617,25 +3658,33 @@ static struct ctl_table tty_table[] = {
+  */
+ int __init tty_init(void)
+ {
++	extern void dsh_mark(unsigned long);
++	dsh_mark(0x4410);
+ 	register_sysctl_init("dev/tty", tty_table);
++	dsh_mark(0x4411);
+ 	cdev_init(&tty_cdev, &tty_fops);
+ 	if (cdev_add(&tty_cdev, MKDEV(TTYAUX_MAJOR, 0), 1) ||
+ 	    register_chrdev_region(MKDEV(TTYAUX_MAJOR, 0), 1, "/dev/tty") < 0)
+ 		panic("Couldn't register /dev/tty driver\n");
++	dsh_mark(0x4412);
+ 	device_create(&tty_class, NULL, MKDEV(TTYAUX_MAJOR, 0), NULL, "tty");
++	dsh_mark(0x4413);
+ 
+ 	cdev_init(&console_cdev, &console_fops);
+ 	if (cdev_add(&console_cdev, MKDEV(TTYAUX_MAJOR, 1), 1) ||
+ 	    register_chrdev_region(MKDEV(TTYAUX_MAJOR, 1), 1, "/dev/console") < 0)
+ 		panic("Couldn't register /dev/console driver\n");
++	dsh_mark(0x4414);
+ 	consdev = device_create_with_groups(&tty_class, NULL,
+ 					    MKDEV(TTYAUX_MAJOR, 1), NULL,
+ 					    cons_dev_groups, "console");
+ 	if (IS_ERR(consdev))
+ 		consdev = NULL;
++	dsh_mark(0x4415);
+ 
+ #ifdef CONFIG_VT
+ 	vty_init(&console_fops);
+ #endif
++	dsh_mark(0x4417);
+ 	return 0;
+ }
+diff --git a/drivers/tty/vt/vt.c b/drivers/tty/vt/vt.c
+index 5c47f7780..b390eb918 100644
+--- a/drivers/tty/vt/vt.c
++++ b/drivers/tty/vt/vt.c
+@@ -75,6 +75,7 @@
+ #include <linux/types.h>
+ #include <linux/sched/signal.h>
+ #include <linux/tty.h>
++#include <linux/dsh_diag.h>
+ #include <linux/tty_flip.h>
+ #include <linux/kernel.h>
+ #include <linux/string.h>
+@@ -3529,6 +3530,7 @@ ATTRIBUTE_GROUPS(vt_dev);
+ 
+ int __init vty_init(const struct file_operations *console_fops)
+ {
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4301); }	/* vty_init 入口 */
+ 	cdev_init(&vc0_cdev, console_fops);
+ 	if (cdev_add(&vc0_cdev, MKDEV(TTY_MAJOR, 0), 1) ||
+ 	    register_chrdev_region(MKDEV(TTY_MAJOR, 0), 1, "/dev/vc/0") < 0)
+@@ -3539,26 +3541,35 @@ int __init vty_init(const struct file_operations *console_fops)
+ 	if (IS_ERR(tty0dev))
+ 		tty0dev = NULL;
+ 
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4302); }	/* /dev/tty0 注册完成 */
+ 	vcs_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4306); }
+ 
+ 	console_driver = tty_alloc_driver(MAX_NR_CONSOLES, TTY_DRIVER_REAL_RAW |
+ 			TTY_DRIVER_RESET_TERMIOS);
+ 	if (IS_ERR(console_driver))
+ 		panic("Couldn't allocate console driver\n");
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4303); }	/* tty_alloc_driver 成功 */
+ 
+ 	console_driver->name = "tty";
+ 	console_driver->name_base = 1;
+ 	console_driver->major = TTY_MAJOR;
+ 	console_driver->minor_start = 1;
+ 	console_driver->type = TTY_DRIVER_TYPE_CONSOLE;
++	dsh_mark(0x4310);
+ 	console_driver->init_termios = tty_std_termios;
++	dsh_mark(0x4311);
+ 	if (default_utf8)
+ 		console_driver->init_termios.c_iflag |= IUTF8;
+ 	tty_set_operations(console_driver, &con_ops);
++	dsh_mark(0x4307);
+ 	if (tty_register_driver(console_driver))
+ 		panic("Couldn't register console driver\n");
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4304); }	/* tty_register_driver 成功 */
+ 	kbd_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4308); }
+ 	console_map_init();
++	{ extern void dsh_mark(unsigned long); dsh_mark(0x4305); }	/* ★ vty_init 全部完成 */
+ #ifdef CONFIG_MDA_CONSOLE
+ 	mda_console_init();
+ #endif
+diff --git a/include/dt-bindings/clock/exynos7-clk.h b/include/dt-bindings/clock/exynos7-clk.h
+index fce33c705..d64446b13 100644
+--- a/include/dt-bindings/clock/exynos7-clk.h
++++ b/include/dt-bindings/clock/exynos7-clk.h
+@@ -48,7 +48,16 @@
+ #define CLK_SCLK_I2S1			14
+ #define CLK_ACLK_PERIC0_66		15
+ #define CLK_ACLK_PERIC1_66		16
+-#define TOP0_NR_CLK			17
++#define CLK_MOUT_ACLK_DISP_400		17
++#define CLK_DOUT_ACLK_DISP_400		18
++#define CLK_ACLK_DISP_400		19
++#define CLK_MOUT_SCLK_DECON_INT_ECLK	20
++#define CLK_DOUT_SCLK_DECON_INT_ECLK	21
++#define CLK_SCLK_DECON_INT_ECLK		22
++#define CLK_MOUT_SCLK_DECON_VCLK	23
++#define CLK_DOUT_SCLK_DECON_VCLK	24
++#define CLK_SCLK_DECON_VCLK		25
++#define TOP0_NR_CLK			26
+ 
+ /* TOP1 */
+ #define DOUT_ACLK_FSYS1_200		1
+@@ -117,7 +126,8 @@
+ #define SCLK_I2S1			25
+ #define SCLK_PCM1			26
+ #define SCLK_SPDIF			27
+-#define PERIC1_NR_CLK			28
++#define MOUT_ACLK_PERIC1_66_USER		28
++#define PERIC1_NR_CLK			29
+ 
+ /* PERIS */
+ #define PCLK_CHIPID			1
+@@ -125,7 +135,8 @@
+ #define PCLK_WDT			3
+ #define PCLK_TMU			4
+ #define SCLK_TMU			5
+-#define PERIS_NR_CLK			6
++#define PCLK_MCT			6
++#define PERIS_NR_CLK			7
+ 
+ /* FSYS0 */
+ #define ACLK_MMC2			1
+@@ -200,5 +211,35 @@
+ #define PCLK_I2S			3
+ #define PCLK_PCM			4
+ #define ACLK_ADMA			5
+-#define AUD_NR_CLK			6
++#define PCLK_UART			6
++#define SCLK_UART			7
++#define AUD_NR_CLK			8
++
++/* G3D */
++#define CLK_FOUT_G3D_PLL		1
++#define CLK_MOUT_ACLK_G3D_400		2
++#define CLK_DIV_ACLK_G3D		3
++#define CLK_DIV_PCLK_G3D		4
++#define CLK_ACLK_G3D			5
++#define CLK_PCLK_SYSREG_G3D		6
++#define CLK_PCLK_PMU_G3D		7
++#define G3D_NR_CLK			8
++
++/* DISP */
++#define CLK_FOUT_DISP_PLL			1
++#define CLK_MOUT_SUB_SCLK_DECON_INT_ECLK	2
++#define CLK_MOUT_SUB_SCLK_DECON_INT_VCLK	3
++#define CLK_DOUT_PCLK_DISP			4
++#define CLK_DOUT_SUB_SCLK_DECON_INT_ECLK	5
++#define CLK_DOUT_SUB_SCLK_DECON_INT_VCLK	6
++#define CLK_ACLK_DECON0				7
++#define CLK_PCLK_DECON0				8
++#define CLK_SCLK_DECON0_ECLK			9
++#define CLK_SCLK_DECON0_VCLK			10
++#define CLK_PCLK_DSIM0				11
++#define CLK_ACLK_DISP_RO_SYSMMU			12
++#define CLK_ACLK_DISP_RW_SYSMMU			13
++#define CLK_PCLK_DISP_RO_SYSMMU			14
++#define CLK_PCLK_DISP_RW_SYSMMU			15
++#define DISP_NR_CLK				16
+ #endif /* _DT_BINDINGS_CLOCK_EXYNOS7_H */
+diff --git a/include/linux/dsh_diag.h b/include/linux/dsh_diag.h
+new file mode 100644
+index 000000000..a6cf9b675
+--- /dev/null
++++ b/include/linux/dsh_diag.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_DSH_DIAG_H
++#define _LINUX_DSH_DIAG_H
++
++#define DSH_DIAG_MAGIC		0x4453484449414731UL
++#define DSH_DIAG_VERSION		1UL
++#define DSH_DIAG_RECORD_BYTES	608UL
++#define DSH_DIAG_TEXT_BYTES	512
++
++/* Board-local ARM64 ABI shared with the diagnostic loader.  Checksum is
++ * FNV-1a64 over all 608 bytes, treating the checksum field itself as zero.
++ * Keep the fields as 64-bit unsigned long words in the declared order.
++ */
++struct dsh_diag_record {
++	unsigned long magic;
++	unsigned long version;
++	unsigned long bytes;
++	unsigned long build_id;
++	unsigned long run_id;
++	unsigned long sequence;
++	unsigned long stage;
++	unsigned long initcall;
++	unsigned long caller;
++	unsigned long fmt;
++	unsigned long text_len;
++	unsigned long checksum;
++	char text[DSH_DIAG_TEXT_BYTES];
++};
++
++extern struct dsh_diag_record dsh_diag;
++
++void dsh_mark(unsigned long value);
++void dsh_diag_note(unsigned long stage, const char *message);
++void dsh_diag_panic(const char *message, unsigned long fmt,
++		    unsigned long caller);
++void dsh_diag_early_guard(void);
++
++#endif /* _LINUX_DSH_DIAG_H */

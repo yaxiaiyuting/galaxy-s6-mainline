@@ -1,5 +1,5 @@
 diff --git a/arch/arm64/boot/dts/exynos/exynos7.dtsi b/arch/arm64/boot/dts/exynos/exynos7.dtsi
-index 54ed5167d..ad8aad12d 100644
+index 54ed5167d..63f7a5be3 100644
 --- a/arch/arm64/boot/dts/exynos/exynos7.dtsi
 +++ b/arch/arm64/boot/dts/exynos/exynos7.dtsi
 @@ -25,18 +25,15 @@ aliases {
@@ -27,7 +27,7 @@ index 54ed5167d..ad8aad12d 100644
  
  	fin_pll: clock {
  		/* XXTI */
-@@ -49,18 +46,43 @@ cpus {
+@@ -49,18 +46,44 @@ cpus {
  		#address-cells = <1>;
  		#size-cells = <0>;
  
@@ -50,6 +50,7 @@ index 54ed5167d..ad8aad12d 100644
 +				core3 { cpu = <&cpu_apollo3>; };
 +			};
 +		};
++
 +
 +		/*
 +		 * Cortex-A57 (atlas) cluster.  Power-up is handled by
@@ -77,7 +78,7 @@ index 54ed5167d..ad8aad12d 100644
  		};
  
  		cpu_atlas1: cpu@1 {
-@@ -68,13 +90,14 @@ cpu_atlas1: cpu@1 {
+@@ -68,13 +91,14 @@ cpu_atlas1: cpu@1 {
  			compatible = "arm,cortex-a57";
  			reg = <0x1>;
  			enable-method = "psci";
@@ -98,7 +99,7 @@ index 54ed5167d..ad8aad12d 100644
  		};
  
  		cpu_atlas2: cpu@2 {
-@@ -82,13 +105,14 @@ cpu_atlas2: cpu@2 {
+@@ -82,13 +106,14 @@ cpu_atlas2: cpu@2 {
  			compatible = "arm,cortex-a57";
  			reg = <0x2>;
  			enable-method = "psci";
@@ -119,7 +120,7 @@ index 54ed5167d..ad8aad12d 100644
  		};
  
  		cpu_atlas3: cpu@3 {
-@@ -96,13 +120,14 @@ cpu_atlas3: cpu@3 {
+@@ -96,13 +121,14 @@ cpu_atlas3: cpu@3 {
  			compatible = "arm,cortex-a57";
  			reg = <0x3>;
  			enable-method = "psci";
@@ -140,7 +141,7 @@ index 54ed5167d..ad8aad12d 100644
  		};
  
  		atlas_l2: l2-cache0 {
-@@ -113,6 +138,76 @@ atlas_l2: l2-cache0 {
+@@ -113,6 +139,76 @@ atlas_l2: l2-cache0 {
  			cache-line-size = <64>;
  			cache-sets = <2048>;
  		};
@@ -217,7 +218,7 @@ index 54ed5167d..ad8aad12d 100644
  	};
  
  	psci {
-@@ -133,6 +228,29 @@ chipid@10000000 {
+@@ -133,6 +229,29 @@ chipid@10000000 {
  			reg = <0x10000000 0x100>;
  		};
  
@@ -247,7 +248,7 @@ index 54ed5167d..ad8aad12d 100644
  		gic: interrupt-controller@11001000 {
  			compatible = "arm,gic-400";
  			#interrupt-cells = <3>;
-@@ -319,6 +437,16 @@ serial_3: serial@14c40000 {
+@@ -319,6 +438,16 @@ serial_3: serial@14c40000 {
  			status = "disabled";
  		};
  
@@ -264,7 +265,7 @@ index 54ed5167d..ad8aad12d 100644
  		pinctrl_alive: pinctrl@10580000 {
  			compatible = "samsung,exynos7-pinctrl";
  			reg = <0x10580000 0x1000>;
-@@ -378,6 +506,12 @@ pinctrl_bus1: pinctrl@14870000 {
+@@ -378,6 +507,12 @@ pinctrl_bus1: pinctrl@14870000 {
  			interrupts = <GIC_SPI 384 IRQ_TYPE_LEVEL_HIGH>;
  		};
  
@@ -277,7 +278,7 @@ index 54ed5167d..ad8aad12d 100644
  		hsi2c_0: i2c@13640000 {
  			compatible = "samsung,exynos7-hsi2c";
  			reg = <0x13640000 0x1000>;
-@@ -430,6 +564,22 @@ hsi2c_3: i2c@14e70000 {
+@@ -430,6 +565,22 @@ hsi2c_3: i2c@14e70000 {
  			status = "disabled";
  		};
  
@@ -300,7 +301,7 @@ index 54ed5167d..ad8aad12d 100644
  		hsi2c_4: i2c@13660000 {
  			compatible = "samsung,exynos7-hsi2c";
  			reg = <0x13660000 0x1000>;
-@@ -539,6 +689,35 @@ pmu_system_controller: system-controller@105c0000 {
+@@ -539,6 +690,35 @@ pmu_system_controller: system-controller@105c0000 {
  			reg = <0x105c0000 0x5000>;
  		};
  
@@ -336,7 +337,7 @@ index 54ed5167d..ad8aad12d 100644
  		rtc: rtc@10590000 {
  			compatible = "samsung,s3c6410-rtc";
  			reg = <0x10590000 0x100>;
-@@ -559,6 +738,110 @@ watchdog: watchdog@101d0000 {
+@@ -559,6 +739,110 @@ watchdog: watchdog@101d0000 {
  			status = "disabled";
  		};
  
@@ -447,7 +448,7 @@ index 54ed5167d..ad8aad12d 100644
  		gpu: gpu@14ac0000 {
  			compatible = "samsung,exynos5433-mali", "arm,mali-t760";
  			reg = <0x14ac0000 0x5000>;
-@@ -566,8 +849,11 @@ gpu: gpu@14ac0000 {
+@@ -566,8 +850,11 @@ gpu: gpu@14ac0000 {
  				     <GIC_SPI 242 IRQ_TYPE_LEVEL_HIGH>,
  				     <GIC_SPI 240 IRQ_TYPE_LEVEL_HIGH>;
  			interrupt-names = "job", "mmu", "gpu";
@@ -460,7 +461,7 @@ index 54ed5167d..ad8aad12d 100644
  		};
  
  		mmc_0: mmc@15740000 {
-@@ -655,10 +941,31 @@ ufs: ufs@15570000 {
+@@ -655,10 +942,31 @@ ufs: ufs@15570000 {
  				<&clock_fsys1 SCLK_UFSUNIPRO20_USER>;
  			clock-names = "core_clk", "sclk_unipro_main";
  			freq-table-hz = <0 0>, <0 0>;
@@ -494,7 +495,7 @@ index 54ed5167d..ad8aad12d 100644
  			status = "disabled";
  		};
  
-@@ -722,12 +1029,11 @@ atlas_thermal: cluster0-thermal {
+@@ -722,12 +1030,11 @@ atlas_thermal: cluster0-thermal {
  
  	timer {
  		compatible = "arm,armv8-timer";

@@ -1,0 +1,344 @@
+diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
+index 5a57c3279..a729803ad 100644
+--- a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
+@@ -152,6 +152,37 @@ reg_tsp_avdd: regulator-tsp-avdd {
+ 		regulator-always-on;
+ 	};
+ 
++	/*
++	 * DSH 2026-10-21: 音频 codec (WM1840/CS47L85) 的两路供电。
++	 *
++	 * 它们实际是 S2MPS15 PMIC 的 LDO16 (1.8V) / LDO26 (1.2V)，
++	 * 但 s2mps11 mainline 驱动在本板 probe 失败（regmap -ENXIO），
++	 * 所以**不能**用 PMIC regulator 节点（会让依赖它的设备卡在
++	 * waiting_for_supplier，触摸屏就是这么被搞死的）。
++	 *
++	 * 这里用 regulator-fixed 占位，让 codec 驱动能拿到 supply：
++	 *   - LDO16 实测 S-Boot 已经打开（always-on, boot-on 即可）
++	 *   - LDO26 开机后由用户态 i2cset 打开：
++	 *       i2cset -y -f 1 0x66 0x4d 0xfc
++	 *     （0x4d = LDO26 CTRL，bit[7:6]=11 = 输出使能）
++	 */
++	ldo16_reg: regulator-codec-1v8 {
++		compatible = "regulator-fixed";
++		regulator-name = "VCC_1.8V_CODEC_PMIC";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		regulator-always-on;
++		regulator-boot-on;
++	};
++
++	ldo26_reg: regulator-codec-1v2 {
++		compatible = "regulator-fixed";
++		regulator-name = "VDD_1.2V_CODEC";
++		regulator-min-microvolt = <1200000>;
++		regulator-max-microvolt = <1200000>;
++		regulator-boot-on;
++	};
++
+ /* DSH: 触摸屏（P1）。风险控制：p90 曾挂死，但那时 IOMMU 还没关；
+  * 现在 CONFIG_EXYNOS_IOMMU=n。启动时用 loader 的 watchdog arm 兜底。 */
+ 	/* DSH p117: i2c-tsp 节点临时移除 —— 验证"访问 GPJ1 会挂总线"。
+@@ -448,7 +479,12 @@ touchkey@20 {
+ 			interrupts = <0 IRQ_TYPE_EDGE_FALLING>;
+ 			pinctrl-names = "default";
+ 			pinctrl-0 = <&touchkey_irq_pins>;
+-			vdd-supply = <&touchkey_ldo21>;
++			/*
++			 * DSH: LDO21 (vtouch_3.3v) 的 PMIC regulator 暂时不可用，
++			 * 改由 /etc/rc 或 systemd 服务用 i2cset 直接写
++			 * PMIC 0x66 寄存器 0x48 = 0xfc 上电（实测 0x20 立刻 ACK）。
++			 */
++			/* vdd-supply = <&touchkey_ldo21>; */
+ 			linux,keycodes = <KEY_MENU KEY_BACK>;
+ 		};
+ 	};
+@@ -485,6 +521,17 @@ touchkey_irq_pins: touchkey-irq-pins {
+ &decon {
+ 	status = "okay";
+ 
++	/*
++	 * DSH 2026-10-23: 第二个 reg 是 DSIM0（0x13900000），亮度/熄屏通道。
++	 *
++	 * mainline 的 exynos7.dtsi 里没有 dsi 节点，samsung-dsim 从未 probe，
++	 * DSIM 一直是 S-Boot 配好的"孤儿"（PLL/PHY/lane 全由 S-Boot 设定）。
++	 * 所以 DCS 亮度(0x51)/熄屏(0x28) 只能由 exynos7_drm_decon.c 直接往
++	 * DSIM 的 SFR FIFO 塞包 —— 见 文档/05-专项/背光控制实现方案-20261023.md。
++	 */
++	reg = <0x13930000 0x10000>, <0x13900000 0x1000>;
++	dsh,dsim-backlight;
++
+ 	/*
+ 	 * DSH 2026-10-20: 必须有 i80-if-timings 子节点！
+ 	 *
+@@ -790,7 +837,21 @@ &ufs {
+  *   - s2mps15 (0x66) / s2mpb02 (0x59) 能否 probe
+  *   - tsp_io(1.85V) / tsp_avdd(3.3V) 能否真的被打开
+  */
+-#include "exynos7420-zeroflte-touch-power.dtsi"
++/*
++ * DSH 2026-10-21: 暂时停用 touch-power.dtsi。
++ *
++ * 原因：该 dtsi 用 S2MPS15 PMIC 节点（i2c-gpio gpg3-0/1）重新定义了
++ * tsp_io(LDO15)/tsp_avdd/LDO16/LDO26/LDO21，并 /delete-node/ 掉了
++ * 原来能工作的 fixed-regulator。
++ * 但 s2mps11 驱动在本板 probe 失败 → 这些 regulator 永远注册不上
++ * → 触摸屏节点 4-0049 卡在 waiting_for_supplier → 触摸完全失效
++ * （实测 p253 刷入后 /dev/input 只剩 gpio-keys）。
++ *
++ * 现在暂时回到 p250 的可用状态（fixed-regulator + i2cset 上电）。
++ * 音频/触摸键的 PMIC 供电后续用「用户态 i2cset + 单独 fixed-regulator」
++ * 的方式实现，不再依赖 s2mps11 驱动。
++ */
++/* #include "exynos7420-zeroflte-touch-power.dtsi" */
+ 
+ /*
+  * ============================================================
+@@ -828,6 +889,22 @@ hsi2c7_clk: clock-hsi2c7 {
+ 		clock-frequency = <133000000>;
+ 		clock-output-names = "sclk_hsi2c7";
+ 	};
++
++	/*
++	 * DSH 2026-10-21: MAX77838 PMIC 的 i2c 时钟。
++	 * 触摸屏 tsp_io/tsp_avdd 由 MAX77838 的 LDO2/LDO4 供电
++	 * （vendor zero_common.dtsi:698-731），而不是 S2MPS15。
++	 * 这条总线（hsi2c_5 @0x13670000）原本 status="disabled"，
++	 * 导致我们从来没能给触摸屏上电 —— 冷启动后触摸芯片没电，
++	 * i2c 0x49 不 ACK，stmfts probe 报 -110。
++	 * 时钟同样用 fixed-clock 顶替（CMU_PERIC0 未启用）。
++	 */
++	hsi2c5_clk: clock-hsi2c5 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <133000000>;
++		clock-output-names = "sclk_hsi2c5";
++	};
+ };
+ 
+ /*
+@@ -846,6 +923,104 @@ hsi2c7_clk: clock-hsi2c7 {
+  *
+  * 供电：tsp_io=1850mV(LDO15)、tsp_avdd=3300mV(LDO17) 均已实测使能。
+  */
++/*
++ * DSH 2026-10-21: 启用 MAX77838 PMIC 所在的 hsi2c_5 (0x13670000)。
++ *
++ * 触摸屏供电真相（vendor zero_common.dtsi:698-731）：
++ *   max77838@60 on hsi2c@13670000
++ *     LDO2 -> "tsp_io"   1.85V
++ *     LDO4 -> "tsp_avdd" 3.30V
++ * 之前把 reg_tsp_io/reg_tsp_avdd 写成 regulator-fixed 是**错的**，
++ * 那两个 LDO 实际由 MAX77838 控制，fixed regulator 不会去碰它。
++ * 冷启动时 MAX77838 的 LDO 默认关闭 → 触摸芯片没电 → i2c 超时。
++ *
++ * mainline 没有 max77838 驱动，所以这里只把 i2c 总线打开，
++ * 由 systemd 的 g9209-touch-power.service 用 i2cset 直接写寄存器：
++ *   0x60 0x11 = 0x32  (LDO2 = 1.85V)
++ *   0x60 0x13 = 0x6c  (LDO4 = 3.30V)
++ *   0x60 0x03 = 0x0a  (使能 LDO2 + LDO4)
++ */
++/*
++ * DSH 2026-10-21 v2: 用 i2c-gpio 而不是 hsi2c_5。
++ *
++ * 原因：hsi2c_5 的 pinctrl (hs_i2c5_bus) 在 pinctrl@14CE0000 死区，
++ * 而 S-Boot 没有 mux 这组引脚（它不用这条总线），所以硬件 i2c 控制器
++ * 发不出波形 → 0x60 读 0xff。
++ *
++ * 但同一组引脚 gpg3-2/3 用 i2c-gpio（纯 GPIO 位操作）是**可用的**：
++ * touch-power.dtsi 里用同样的方法成功读到了 S2MPB02 (0x59)。
++ *
++ * 所以这里额外挂一条 i2c-gpio，让用户态能摸到 MAX77838 (0x60)，
++ * 由 g9209-touch-power.service 用 i2cset 打开 LDO2/LDO4。
++ */
++/ {
++	/*
++	 * S2MPB02 PMIC @ gpg3-2/3 (i2c-gpio)。
++	 *
++	 * 实测（TWRP + mainline 双向验证）：
++	 *   S2MPB02 i2c 地址 0x59，LDO17(reg0x2e) 控制 tsp_avdd 3.3V。
++	 *   已知正确值 = 0xec（VSEL=0x6c + 使能位）。
++	 * 这条总线上还能摸到（在某些 boot 状态下）MAX77838 的 0x60，
++	 * 但 mainline 实测只有 0x59 稳定 ACK。
++	 */
++	i2c_max77838: i2c-s2mpb02 {
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpg3 2 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpg3 3 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		i2c-gpio,timeout-ms = <100>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "okay";
++
++		/*
++		 * S2MPB02 只用到 LDO17（tsp_avdd）。mainline 有
++		 * drivers/regulator/s2mpb02-regulator.c，但只支持 LDO17。
++		 * 这里不挂驱动节点 —— 用用户态 i2cset 写，避免驱动
++		 * probe 失败导致整个总线设备注册中断。
++		 */
++	};
++
++	/*
++	 * DSH 2026-10-21: S2MPS15 PMIC @ gpg3-0/1 (i2c-gpio)。
++	 *
++	 * 这是**触摸屏真正的供电**来源！从 TWRP（vendor 3.10 内核，
++	 * 触摸可用）读到的已知正确状态：
++	 *   S2MPS15 @ i2c-4 (hsi2c@13660000), addr 0x66, ID(reg0x00)=0x12
++	 *     reg0x42 (LDO15) = 0xee  → tsp_io 1.85V ENABLED  ★
++	 *     reg0x48 (LDO21) = 0x3c  → vtouch_3.3v disabled（触摸键不用）
++	 *     reg0x4d (LDO26) = 0x3c  → VDD_1.2V_CODEC disabled
++	 *     reg0x41 = 0xe8          → VCC_1.8V_CODEC_PMIC enabled
++	 *
++	 * 编码规则（s2mps15.h）：
++	 *   VSEL   = bit[5:0]，范围 0.7V..2.275V，步进 25mV
++	 *            VSEL = (V - 700000) / 25000
++	 *   ENABLE = bit[7:6]，0b11 = 开
++	 *   1.85V → VSEL = 46 = 0x2e → 0xee
++	 *   1.20V → VSEL = 20 = 0x14 → 0xd4
++	 *   3.30V(LDO21 是宽压档) → 0xfc（触摸键 subagent 实测有效）
++	 *
++	 * mainline 之前一直读不到它，因为我们没有这条总线
++	 * （hsi2c@13660000 的 pinctrl 在死区），而 gpg3-0/1 的
++	 * i2c-gpio 位操作是可行的（gpg3-2/3 上的 S2MPB02 已经证明了）。
++	 */
++	i2c_s2mps15: i2c-s2mps15 {
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpg3 0 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpg3 1 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		i2c-gpio,timeout-ms = <100>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "okay";
++	};
++};
++
++&hsi2c_5 {
++	/* 保留但不用（pinctrl 在死区）；用上面的 i2c-gpio 顶替 */
++	status = "disabled";
++};
++
+ &hsi2c_7 {
+ 	reg = <0x14e10000 0x1000>;
+ 	interrupts = <GIC_SPI 462 IRQ_TYPE_LEVEL_HIGH>;
+@@ -865,8 +1040,8 @@ touchscreen@49 {
+ 		interrupts = <6 IRQ_TYPE_LEVEL_LOW>;
+ 		pinctrl-names = "default";
+ 		pinctrl-0 = <&tsp_attn_pin>;
+-		vdd-supply = <&tsp_io_ldo15>;
+-		avdd-supply = <&tsp_avdd_ldo17>;
++		vdd-supply = <&reg_tsp_io>;
++		avdd-supply = <&reg_tsp_avdd>;
+ 		/*
+ 		 * DSH 2026-10-21: **必须保持 4096x4096**，不要改成 1440x2560！
+ 		 *
+@@ -1095,6 +1270,107 @@ &gpu {
+ 	 * 仅在 p211 出问题时回退用。回退方法：把下面一行取消注释。
+ 	 */
+ 	/delete-property/ power-domains;
++
++	/*
++	 * DSH 2026-10-23: GPU 变频所需的三个额外时钟句柄。
++	 *
++	 * CMU_G3D 的 GPU 核心时钟路径（vendor clk-exynos7420.c）：
++	 *   g3d_pll(PLL1452X) --\
++	 *                        mux(MUX_SEL_G3D.bit8) -> aclk_g3d(gate) -> GPU
++	 *   fin_pll(24MHz)    --/
++	 *
++	 * panfrost 只用 clocks[0] 当 "core"，但安全变频必须能自己动 mux：
++	 *   ① 把 mux 切到 fin_pll（ GPU 先跑 24MHz，拿到干净时钟）
++	 *   ② 改 fout_g3d_pll
++	 *   ③ 把 mux 切回 fout_g3d_pll
++	 * 这是 vendor gpu_set_clock() 的唯一验证过的序列
++	 * （los20/.../platform/exynos/gpu_exynos7420.c:302-352）。
++	 *
++	 * 注意：property 是整体覆盖，所以 core/bus 必须重写一遍。
++	 */
++	clocks = <&cmu_g3d CLK_ACLK_G3D>,
++		 <&cmu_g3d CLK_PCLK_SYSREG_G3D>,
++		 <&cmu_g3d CLK_MOUT_ACLK_G3D_400>,
++		 <&cmu_g3d CLK_FOUT_G3D_PLL>,
++		 <&fin_pll>;
++	clock-names = "core", "bus", "g3d-mux", "g3d-pll", "g3d-safe";
++
++	/* devfreq：频率表 + 电压（全档 900mV，见 gpu_opp_table 注释） */
++	operating-points-v2 = <&gpu_opp_table>;
++	mali-supply = <&reg_gpu_vdd>;
++
++	/*
++	 * 可选：probe 时用同一套安全序列把 PLL 一次性设到 700MHz。
++	 * 用来单独验证"700MHz 本身能不能跑"，不掺 devfreq 的动态切换。
++	 * 默认注释；验证流程见 文档/05-专项/GPU-DVFS实现方案-20261023.md 第 4 步。
++	 */
++	/* samsung,g3d-fixed-rate-hz = <700000000>; */
++};
++
++/*
++ * DSH 2026-10-23: Mali-T760 MP8 的 OPP 表。
++ *
++ * 频率来源：
++ *   vendor gpu_dvfs_table_default[]（los20/.../t7xx/r12p0/platform/exynos/
++ *   gpu_exynos7420.c:56-64）：772 / 700 / 600 / 544 / 420 / 350 / 266 MHz
++ *   vendor table_g3d[]（drivers/clk/samsung/clk-exynos7420.c:674-684）：
++ *     {772M, P6 M193 S0} {700M, P6 M175 S0} {600M, P3 M75 S0}
++ *     {544M, P3 M68 S0} {420M, P3 M105 S1} {350M, P6 M175 S1}
++ *     {266M, P6 M133 S1}
++ *
++ * 电压：vendor 表里**每个频点都是 900000µV**（GPU_DEFAULT_VOLTAGE = 900000，
++ * gpu_exynos7420.c:88），266MHz 与 700MHz 同压，所以升频失败不可能是"欠压"。
++ *
++ * 上限只到 700MHz：vendor GPU_MAX_CLOCK_LIMIT = 700（同文件:78）。
++ * 772MHz 档存在但被 vendor 自己限制掉，这里不放。
++ */
++/ {
++	gpu_opp_table: opp-table-gpu {
++		compatible = "operating-points-v2";
++
++		/*
++		 * 100MHz：本次新增的最低档，PLL 能精确整出来（M=100/P=6/S=2，
++		 * fout = 100*24/(6<<2) = 100MHz），但 **vendor 没有这一档**
++		 * （GPU_MIN_CLOCK = 266）。默认关闭：devfreq 的 simple_ondemand
++		 * 会把 freq_table[0] 当空闲档，一个没验证过的低档会在第一次
++		 * 空闲时就把 GPU 挂掉，把整个 DVFS 实验搅浑。
++		 * 要试就取消注释，并先把 min_freq 钉在 100MHz 单点验证。
++		 */
++		/* opp-100000000 { opp-hz = /bits/ 64 <100000000>; opp-microvolt = <900000>; }; */
++
++		opp-266000000 {
++			opp-hz = /bits/ 64 <266000000>;
++			opp-microvolt = <900000>;
++		};
++		opp-420000000 {
++			opp-hz = /bits/ 64 <420000000>;
++			opp-microvolt = <900000>;
++		};
++		opp-544000000 {
++			opp-hz = /bits/ 64 <544000000>;
++			opp-microvolt = <900000>;
++		};
++		opp-700000000 {
++			opp-hz = /bits/ 64 <700000000>;
++			opp-microvolt = <900000>;
++		};
++	};
++
++	/*
++	 * GPU 供电占位：vendor 用 regulator_get(NULL, "vdd_g3d")
++	 * （gpu_exynos7420.c:610），每个频点都 set 到 900mV。
++	 * mainline 没有可用的 s2mps15 regulator 驱动，所以用 fixed 表示
++	 * "恒 900mV、不可调"这一硬件事实——它同时也告诉 OPP core：
++	 * 不需要为变频做任何电压动作。
++	 */
++	reg_gpu_vdd: regulator-gpu-vdd {
++		compatible = "regulator-fixed";
++		regulator-name = "vdd_g3d";
++		regulator-min-microvolt = <900000>;
++		regulator-max-microvolt = <900000>;
++		regulator-always-on;
++		regulator-boot-on;
++	};
+ };
+ 
+ /*

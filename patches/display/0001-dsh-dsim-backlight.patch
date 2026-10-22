@@ -1,0 +1,403 @@
+diff --git a/drivers/gpu/drm/exynos/exynos7_drm_decon.c b/drivers/gpu/drm/exynos/exynos7_drm_decon.c
+--- a/drivers/gpu/drm/exynos/exynos7_drm_decon.c
++++ b/drivers/gpu/drm/exynos/exynos7_drm_decon.c
+@@ -7,6 +7,7 @@
+  *	Ajay Kumar <ajaykumar.rs@samsung.com>
+  */
+ 
++#include <linux/backlight.h>
+ #include <linux/clk.h>
+ #include <linux/component.h>
+ #include <linux/delay.h>
+@@ -17,6 +18,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ 
++#include <video/mipi_display.h>
+ #include <video/of_display_timing.h>
+ #include <video/of_videomode.h>
+ 
+@@ -53,6 +55,63 @@
+ #define TRIGCON_HWTRIGMASK_DISPIF1	(1 << 5)
+ #define TRIGCON_HWTRIG_AUTO_MASK	(1 << 6)
+ #endif
++
++/*
++ * DSH 2026-10-23: 面板侧亮度 / 熄屏通道 —— 直接往 DSIM 的 SFR FIFO 塞 DCS 包。
++ *
++ * 现状（证据：文档/05-专项/背光控制调研-20261023.md）：
++ *   S-Boot 把 DSIM0(0x13900000) 初始化成 command 模式，DECON 走 i80 把每帧推给
++ *   DSIM，DSIM 再打到 S6E3HF2。mainline 里 **没有任何驱动绑定 DSIM**
++ *   （exynos7.dtsi 没有 dsi 节点，samsung-dsim 从未 probe），所以 PLL / PHY /
++ *   lane / CONFIG 全是 S-Boot 留下的状态。本文件只做一件事：往 SFR FIFO 写
++ *   DCS 短包/长包，其它寄存器一概不碰。
++ *
++ * 为什么不会挂总线：
++ *   - DSIM 的 APB 时钟门控 CLK_PCLK_DSIM0 带 CLK_IGNORE_UNUSED
++ *     (drivers/clk/samsung/clk-exynos7.c:1564)，bootargs 另有 clk_ignore_unused，
++ *     且 DISP 电源域由运行中的 DECON 保持 —— 寄存器访问不会 AXI 无应答。
++ *   - DCS 包走 SFR header/payload FIFO，DECON 的 i80 帧数据走 i80 FIFO
++ *     （FIFOCTRL bit23/21/22/20 vs bit19/17/18/16），两条通路独立。
++ *   - 不写 FIFOCTRL / DSIM_CONFIG / PLL / PHY，S-Boot 的链路配置原样保留。
++ *
++ * 面板侧命令（vendor drivers/video/exynos/decon_7420/panels/s6e3hf2_wqhd_param.h）：
++ *   SEQ_DISPLAY_ON  = { 0x29 } (:138)，SEQ_DISPLAY_OFF = { 0x28 } (:142)
++ *   vendor 用 0xCA gamma 表 + 0xB6 ELVSS + 0xF4 VINT 做亮度（Smart Dimming），
++ *   这里先用 MIPI 标准的 0x53(BCTRL) + 0x51(DBV)；这颗 DDI 是否支持 0x51
++ *   待设备验证，不支持的退化情况 = 只有开/关，见实现方案文档 §6。
++ */
++/* DSIM 寄存器（offset 取自 vendor drivers/video/exynos/decon_7420/regs-dsim.h） */
++#define DSIM_STATUS			0x004
++#define DSIM_PKTHDR			0x03c
++#define DSIM_PAYLOAD			0x040
++#define DSIM_FIFOCTRL			0x04c
++
++#define DSIM_PKTHDR_ID(x)		((x) & 0x3f)
++#define DSIM_PKTHDR_DATA0(x)		(((x) & 0xff) << 8)
++#define DSIM_PKTHDR_DATA1(x)		(((x) & 0xff) << 16)
++
++/* DSIM_FIFOCTRL 状态位（同 samsung-dsim.c:157-168） */
++#define DSIM_SFR_HEADER_EMPTY		BIT(22)
++#define DSIM_SFR_PAYLOAD_EMPTY		BIT(20)
++
++/* MIPI DSI 包数据类型（mipi_display.h 只定义 DCS 命令号） */
++#define DSH_DSI_DCS_SHORT_WRITE		0x05
++#define DSH_DSI_DCS_SHORT_WRITE_PARAM	0x15
++#define DSH_DSI_DCS_LONG_WRITE		0x39
++
++/*
++ * DSH 2026-10-23: DSIM 亮度开关。
++ *   backlight=0  → 完全不碰 DSIM（与打补丁前行为一致，回滚用）
++ *   bl_dump=1    → 只在 probe 读一次 DSIM_STATUS/FIFOCTRL，不注册 backlight、
++ *                  不发任何 DCS 包（上机第一步用这个）
++ *   bl_level     → 初始亮度（0..255）
++ */
++bool dsh_disp_bl = true;
++module_param_named(backlight, dsh_disp_bl, bool, 0644);
++bool dsh_disp_bl_dump;
++module_param_named(bl_dump, dsh_disp_bl_dump, bool, 0644);
++unsigned int dsh_disp_bl_level = 160;
++module_param_named(bl_level, dsh_disp_bl_level, uint, 0644);
+ 
+ /* DSH 2026-10-20: bootloader framebuffer geometry, parsed from /chosen DT. */
+ struct dsh_boot_fb {
+@@ -111,6 +170,12 @@
+ 
+ 	/* DSH: bootloader framebuffer info (from /chosen/framebuffer@...) */
+ 	struct dsh_boot_fb boot_fb;
++
++	/* DSH: DSIM DCS 亮度/熄屏通道（S-Boot 配好的孤儿 DSIM） */
++	void __iomem			*dsim_regs;
++	struct backlight_device		*bl_dev;
++	bool				panel_off;
++	bool				bctrl;
+ };
+ 
+ static const struct of_device_id decon_driver_dt_match[] = {
+@@ -749,6 +814,12 @@
+ 	pr_err(DSH_DISP_TAG " decon: atomic_enable done\n");
+ 
+ 	ctx->suspended = false;
++
++	/* DSH: 唤醒 / DPMS on —— 让面板重新发光并恢复亮度 */
++	if (ctx->bl_dev) {
++		dsh_dsim_display(ctx, true);
++		dsh_dsim_set_level(ctx, ctx->bl_dev->props.brightness);
++	}
+ }
+ 
+ static void decon_atomic_disable(struct exynos_drm_crtc *crtc)
+@@ -758,6 +829,12 @@
+ 
+ 	if (ctx->suspended)
+ 		return;
++
++	/*
++	 * DSH: DPMS off —— 先让面板停止发光（DCS 0x28），再去关 window。
++	 * 以前只关 DECON 的扫描，面板仍按最后一帧发光，所以熄屏只省 6mA。
++	 */
++	dsh_dsim_display(ctx, false);
+ 
+ 	/*
+ 	 * We need to make sure that all windows are disabled before we
+@@ -923,6 +1000,241 @@
+ 	       &ctx->boot_fb.base, ctx->boot_fb.size);
+ }
+ 
++/* ---------------- DSH: DSIM DCS 通道（亮度 / 熄屏） ---------------- */
++
++static int dsh_dsim_wait_empty(struct decon_context *ctx, u32 mask, int usec)
++{
++	while (usec-- > 0) {
++		if ((readl(ctx->dsim_regs + DSIM_FIFOCTRL) & mask) == mask)
++			return 0;
++		udelay(1);
++	}
++
++	return -ETIME;
++}
++
++static int dsh_dsim_write_short(struct decon_context *ctx, u8 data_id,
++				u8 p0, u8 p1)
++{
++	u32 val = DSIM_PKTHDR_ID(data_id) | DSIM_PKTHDR_DATA0(p0) |
++		  DSIM_PKTHDR_DATA1(p1);
++	int ret;
++
++	ret = dsh_dsim_wait_empty(ctx, DSIM_SFR_HEADER_EMPTY, 2000);
++	if (ret)
++		return ret;
++
++	writel(val, ctx->dsim_regs + DSIM_PKTHDR);
++
++	/* header FIFO 排空 == 包已经发到 lane 上 */
++	return dsh_dsim_wait_empty(ctx, DSIM_SFR_HEADER_EMPTY, 20000);
++}
++
++static int dsh_dsim_write_long(struct decon_context *ctx, const u8 *buf, int len)
++{
++	int i, ret;
++
++	ret = dsh_dsim_wait_empty(ctx, DSIM_SFR_HEADER_EMPTY |
++					 DSIM_SFR_PAYLOAD_EMPTY, 2000);
++	if (ret)
++		return ret;
++
++	/* payload 先进 PL FIFO，每 32bit 一个 word，尾端补 0 */
++	for (i = 0; i < len; i += 4) {
++		u32 word = 0;
++		int j;
++
++		for (j = 0; j < 4 && i + j < len; j++)
++			word |= (u32)buf[i + j] << (8 * j);
++
++		writel(word, ctx->dsim_regs + DSIM_PAYLOAD);
++	}
++
++	/* 长包 header：ID | WC_LSB | WC_MSB，WC = payload 字节数 */
++	writel(DSIM_PKTHDR_ID(DSH_DSI_DCS_LONG_WRITE) | ((u32)len << 8),
++	       ctx->dsim_regs + DSIM_PKTHDR);
++
++	ret = dsh_dsim_wait_empty(ctx, DSIM_SFR_HEADER_EMPTY, 20000);
++	if (ret)
++		return ret;
++
++	return dsh_dsim_wait_empty(ctx, DSIM_SFR_PAYLOAD_EMPTY, 20000);
++}
++
++static int dsh_dsim_dcs_write(struct decon_context *ctx, const u8 *buf, int len)
++{
++	if (!ctx->dsim_regs)
++		return -ENODEV;
++
++	if (len <= 0)
++		return -EINVAL;
++
++	if (len == 1)
++		return dsh_dsim_write_short(ctx, DSH_DSI_DCS_SHORT_WRITE,
++					    buf[0], 0);
++	if (len == 2)
++		return dsh_dsim_write_short(ctx, DSH_DSI_DCS_SHORT_WRITE_PARAM,
++					    buf[0], buf[1]);
++
++	return dsh_dsim_write_long(ctx, buf, len);
++}
++
++/*
++ * 亮度：先置 0x53(BCTRL)=1 打开 MIPI 亮度控制，再写 0x51(DBV)。
++ * 这是 MIPI 标准路径；vendor 走的是 0xCA gamma 表，两者可以并存，
++ * 但 gamma 路径需要 Smart-Dimming 表 + MTP 读取，留到阶段 2（文档 §6）。
++ */
++static int dsh_dsim_set_level(struct decon_context *ctx, unsigned int level)
++{
++	u8 seq[2];
++	int ret;
++
++	if (!ctx->dsim_regs || !ctx->bl_dev)
++		return 0;
++
++	if (level > ctx->bl_dev->props.max_brightness)
++		level = ctx->bl_dev->props.max_brightness;
++
++	if (!ctx->bctrl) {
++		seq[0] = MIPI_DCS_WRITE_CONTROL_DISPLAY;
++		seq[1] = 0x20;			/* BIT(5) = BCTRL */
++		ret = dsh_dsim_dcs_write(ctx, seq, 2);
++		if (ret) {
++			pr_err(DSH_DISP_TAG " decon: DCS BCTRL failed (%d)\n", ret);
++			return ret;
++		}
++		ctx->bctrl = true;
++	}
++
++	seq[0] = MIPI_DCS_SET_DISPLAY_BRIGHTNESS;
++	seq[1] = (u8)level;
++
++	return dsh_dsim_dcs_write(ctx, seq, 2);
++}
++
++/*
++ * 熄屏 = DCS 0x28(display off)：面板停止发光，这是 -346mA 里最大的那一块。
++ * 刻意不发 0x10(sleep in)：进 sleep 要 0x11 + 完整初始化序列才能回来，
++ * 而 mainline 手里没有 s6e3hf2 的初始化序列（那是 S-Boot 做的）。
++ */
++static int dsh_dsim_display(struct decon_context *ctx, bool on)
++{
++	u8 cmd = on ? MIPI_DCS_SET_DISPLAY_ON : MIPI_DCS_SET_DISPLAY_OFF;
++	int ret;
++
++	if (!ctx->dsim_regs || !ctx->bl_dev)
++		return 0;
++
++	ret = dsh_dsim_dcs_write(ctx, &cmd, 1);
++	if (ret) {
++		pr_err(DSH_DISP_TAG " decon: DCS 0x%02x failed (%d)\n", cmd, ret);
++		return ret;
++	}
++
++	ctx->panel_off = !on;
++	pr_err(DSH_DISP_TAG " decon: panel display %s\n", on ? "ON" : "OFF");
++
++	return 0;
++}
++
++static int dsh_bl_get_brightness(struct backlight_device *bl)
++{
++	return bl->props.brightness;
++}
++
++static int dsh_bl_update_status(struct backlight_device *bl)
++{
++	struct decon_context *ctx = bl_get_data(bl);
++
++	/* DPMS off 期间只记住亮度，绝不把面板点亮 */
++	if (ctx->panel_off)
++		return 0;
++
++	return dsh_dsim_set_level(ctx, bl->props.brightness);
++}
++
++static const struct backlight_ops dsh_bl_ops = {
++	.get_brightness	= dsh_bl_get_brightness,
++	.update_status	= dsh_bl_update_status,
++};
++
++static void dsh_bl_register(struct decon_context *ctx)
++{
++	struct device *dev = ctx->dev;
++	struct backlight_device *bl;
++	struct backlight_properties props;
++	u32 status;
++
++	if (!of_property_read_bool(dev->of_node, "dsh,dsim-backlight"))
++		return;
++	if (!dsh_disp_bl)
++		return;
++
++	ctx->dsim_regs = of_iomap(dev->of_node, 1);
++	if (!ctx->dsim_regs) {
++		dev_warn(dev, "no DSIM reg window, backlight disabled\n");
++		return;
++	}
++
++	/*
++	 * 死活判定：DISP 域没电时 AXI 根本不会应答（直接挂死），能读到全 1
++	 * 说明总线活着但 IP 状态不对 —— 这种情况立刻停手，别往里写包。
++	 */
++	status = readl(ctx->dsim_regs + DSIM_STATUS);
++	if (status == 0xffffffff) {
++		pr_err(DSH_DISP_TAG " decon: DSIM not responding (STATUS=0x%08x), backlight disabled\n",
++		       status);
++		iounmap(ctx->dsim_regs);
++		ctx->dsim_regs = NULL;
++		return;
++	}
++
++	/* 诊断模式：只读状态、不注册、不发包 */
++	if (dsh_disp_bl_dump) {
++		pr_err(DSH_DISP_TAG " decon: DSIM STATUS=%08x FIFOCTRL=%08x (dump only)\n",
++		       status, readl(ctx->dsim_regs + DSIM_FIFOCTRL));
++		iounmap(ctx->dsim_regs);
++		ctx->dsim_regs = NULL;
++		return;
++	}
++
++	props = (struct backlight_properties) {
++		.type		= BACKLIGHT_PLATFORM,
++		.max_brightness	= 255,
++		.brightness	= min_t(unsigned int, dsh_disp_bl_level, 255),
++		.power		= FB_BLANK_UNBLANK,
++	};
++
++	bl = backlight_device_register("s6e3hf2", dev, ctx, &dsh_bl_ops, &props);
++	if (IS_ERR(bl)) {
++		dev_err(dev, "failed to register backlight (%ld)\n", PTR_ERR(bl));
++		iounmap(ctx->dsim_regs);
++		ctx->dsim_regs = NULL;
++		return;
++	}
++
++	ctx->bl_dev = bl;
++
++	pr_err(DSH_DISP_TAG " decon: backlight registered (level=%u, DSIM STATUS=%08x)\n",
++	       bl->props.brightness, status);
++
++	/* 立刻下发一次，确认 DCS 通道是否真的通（看 dmesg 有无失败打印） */
++	dsh_dsim_set_level(ctx, bl->props.brightness);
++}
++
++static void dsh_bl_unregister(struct decon_context *ctx)
++{
++	if (ctx->bl_dev) {
++		backlight_device_unregister(ctx->bl_dev);
++		ctx->bl_dev = NULL;
++	}
++
++	if (ctx->dsim_regs) {
++		iounmap(ctx->dsim_regs);
++		ctx->dsim_regs = NULL;
++	}
++}
++
+ static int decon_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -993,6 +1305,8 @@
+ 	atomic_set(&ctx->wait_vsync_event, 0);
+ 
+ 	platform_set_drvdata(pdev, ctx);
++
++	dsh_bl_register(ctx);
+ 
+ 	ctx->encoder = exynos_dpi_probe(dev);
+ 	if (IS_ERR(ctx->encoder)) {
+@@ -1026,6 +1340,8 @@
+ 	struct decon_context *ctx = dev_get_drvdata(&pdev->dev);
+ 
+ 	pm_runtime_disable(&pdev->dev);
++
++	dsh_bl_unregister(ctx);
+ 
+ 	iounmap(ctx->regs);
+ 
+diff --git a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
+--- a/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
++++ b/arch/arm64/boot/dts/exynos/exynos7420-zeroflte.dts
+@@ -520,6 +520,17 @@
+  */
+ &decon {
+ 	status = "okay";
++
++	/*
++	 * DSH 2026-10-23: 第二个 reg 是 DSIM0（0x13900000），亮度/熄屏通道。
++	 *
++	 * mainline 的 exynos7.dtsi 里没有 dsi 节点，samsung-dsim 从未 probe，
++	 * DSIM 一直是 S-Boot 配好的"孤儿"（PLL/PHY/lane 全由 S-Boot 设定）。
++	 * 所以 DCS 亮度(0x51)/熄屏(0x28) 只能由 exynos7_drm_decon.c 直接往
++	 * DSIM 的 SFR FIFO 塞包 —— 见 文档/05-专项/背光控制实现方案-20261023.md。
++	 */
++	reg = <0x13930000 0x10000>, <0x13900000 0x1000>;
++	dsh,dsim-backlight;
+ 
+ 	/*
+ 	 * DSH 2026-10-20: 必须有 i80-if-timings 子节点！
