@@ -1,0 +1,16 @@
+[Unit]
+Description=G9209 ensure hci0 is UP and discoverable
+After=g9209-bluetooth.service bluetooth.service
+Wants=g9209-bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=oneshot
+# 内核里没有 CONFIG_RFKILL 时 btmgmt power on 之后 hci0 仍是 DOWN；
+# 加上 rfkill 后也可能因为时序问题停在 DOWN INIT 状态。
+# 这里兜底：确保 hci0 UP + Powered + Discoverable + Pairable。
+ExecStart=/bin/sh -c 'sleep 6; hciconfig hci0 up 2>/dev/null; sleep 1; bluetoothctl --timeout 5 power on 2>/dev/null; bluetoothctl --timeout 5 discoverable on 2>/dev/null; bluetoothctl --timeout 5 pairable on 2>/dev/null; true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
