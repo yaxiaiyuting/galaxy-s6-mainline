@@ -1,0 +1,13 @@
+# G9209 实体按键重映射
+#
+# 内核 gpio-keys 上报的原始 keycode：
+#   Power    = KEY_POWER(116)      → logind/powerkeyd 处理，不用改
+#   VolUp    = KEY_VOLUMEUP(115)   → GNOME 原生处理
+#   VolDown  = KEY_VOLUMEDOWN(114) → GNOME 原生处理
+#   Home     = KEY_HOMEPAGE(172)   → ★ GNOME 不绑定，按了没反应
+#
+# 把 Home 重映射成 KEY_LEFTMETA（Super），按 Home 相当于按 Super，
+# 打开 GNOME 概览 / 应用切换，符合"主页"的语义。
+# hwdb 的 scancode 用 keycode 的十六进制小写：172 = 0xac
+evdev:name:gpio-keys:*
+ KEYBOARD_KEY_ac=leftmeta

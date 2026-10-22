@@ -1,0 +1,25 @@
+[Unit]
+Description=G9209 rebind gpio-keys (workaround: IRQs not registered at boot)
+After=g9209-touch-power.service systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+# 问题：gpio-keys 在 boot 早期 probe 时，Exynos EINT 的 irq domain
+# 还没就绪（或 pinctrl 的 EINT mux 尚未生效），导致
+# devm_request_threaded_irq() 静默失败 —— /proc/interrupts 里
+# IRQ 60/61/62/63 计数永远是 0，所有实体按键（电源/音量/Home）
+# 都不响应。input 设备却正常创建了（"input: gpio-keys as ..."）。
+#
+# 实测：手动 unbind/bind 一次之后，电源键 IRQ 立刻有计数（0→6）。
+# 所以这里在系统起来后自动重绑一次。
+ExecStart=/bin/sh -c 'sleep 8; \
+  echo gpio-keys > /sys/bus/platform/drivers/gpio-keys/unbind 2>/dev/null; \
+  sleep 1; \
+  echo gpio-keys > /sys/bus/platform/drivers/gpio-keys/bind 2>/dev/null; \
+  sleep 1; \
+  echo "gpio-keys rebound"'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
