@@ -1,0 +1,7 @@
+{
+  "uuid": "keyboard-size@dsh",
+  "name": "G9209 Keyboard Size",
+  "description": "放大屏幕键盘按键：覆盖 _relayout 的高度计算（竖屏 monitor.height/4 → /2.2）。不修改系统文件，禁用即恢复。",
+  "shell-version": ["43"],
+  "version": 1
+}
