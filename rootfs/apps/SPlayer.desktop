@@ -1,11 +1,20 @@
 [Desktop Entry]
 Name=SPlayer
 Comment=简约的跨平台音乐播放器
-# G9209: 必须走 X11(Xwayland) + 软件渲染，否则 Electron 会在 render node 上
-# 调 DRM_IOCTL_MODE_CREATE_DUMB（modeset 类 ioctl，render node 不允许）
-# → EPERM 反复重试 → mutter 的 MetaDisplay 被销毁
-# → "meta_later_add: assertion 'display' failed" → 整个 GNOME 会话崩溃 → 系统重启
-Exec=/opt/SPlayer/SPlayer --no-sandbox --disable-gpu --disable-gpu-compositing --use-gl=swiftshader --disable-dev-shm-usage --disable-features=Vulkan,UseSkiaRenderer %U
+# G9209 关键：--render-node-override=/dev/dri/card0
+#
+# 默认 Electron 会用 /dev/dri/renderD129（exynos-drm 的 render node），
+# 但 DRM_IOCTL_MODE_CREATE_DUMB 在 mainline 里的 flags = 0
+# （见 drivers/gpu/drm/drm_ioctl.c:680），没有 DRM_RENDER_ALLOW，
+# 于是 drm_ioctl_permit() 对 render client 直接返回 -EACCES：
+#     if (!(flags & DRM_RENDER_ALLOW) && drm_is_render_client(file_priv))
+#             return -EACCES;
+# Electron 的 GPU 进程反复重试 → mutter 的 MetaDisplay 被销毁
+# → "meta_later_add: assertion 'display' failed" → 整个会话崩溃。
+#
+# 改用 card0（primary node）后，drm_is_render_client() 为假，检查不触发，
+# dumb buffer 能正常创建，桌面不再崩。
+Exec=/opt/SPlayer/SPlayer --no-sandbox --ozone-platform=wayland --render-node-override=/dev/dri/card0 --disable-gpu-sandbox --disable-dev-shm-usage %U
 Terminal=false
 Type=Application
 Icon=SPlayer
