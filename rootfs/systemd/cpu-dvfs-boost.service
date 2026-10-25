@@ -1,0 +1,12 @@
+[Unit]
+Description=G9209 CPU DVFS boost (raise BUCK2 then switch to performance)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/cpu-dvfs-boost.sh
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

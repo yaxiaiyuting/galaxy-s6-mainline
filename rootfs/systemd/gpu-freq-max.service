@@ -1,0 +1,16 @@
+[Unit]
+Description=G9209 GPU min_freq=700MHz (always max when active)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# simple_ondemand 在 7420 上不会自动升频（实测长时间停在 266MHz），
+# 而 266MHz 合成 1440x2560 太慢 —— 加了 dma-buf fence 等待后，
+# 合成器会真正等 GPU 渲染完成，于是 266MHz 直接表现为"特别卡"。
+# 把 min_freq 拉到 700MHz：GPU 有任务就满频，空闲时 GPU 会 runtime suspend，
+# 所以静态功耗不受影响。
+ExecStart=/bin/sh -c 'echo 700000000 > /sys/class/devfreq/14ac0000.gpu/min_freq && cat /sys/class/devfreq/14ac0000.gpu/cur_freq'
+
+[Install]
+WantedBy=multi-user.target
