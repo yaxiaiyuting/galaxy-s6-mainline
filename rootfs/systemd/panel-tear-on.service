@@ -1,0 +1,12 @@
+[Unit]
+Description=G9209 panel SET_TEAR_ON (0x35) after boot
+After=gdm.service graphical.target
+Wants=gdm.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/panel-tear-on.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical.target
